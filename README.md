@@ -1,4 +1,4 @@
-# ST Explorer
+# Silly Tavern Explorer
 
 A desktop application for browsing, editing, and managing SillyTavern character cards. It provides a visual library for character card PNG files with embedded JSON metadata (V2/V3 spec) and Lorebooks.
 
