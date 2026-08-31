@@ -723,6 +723,8 @@ class LibraryTab(QWidget):
         self._duplicate_btn.setEnabled(True)
         self._open_folder_btn.setEnabled(True)
         self._fav_btn.setEnabled(True)
+        self._collections_btn.setEnabled(True)
+        self._gen_tags_btn.setEnabled(True)
         self._fav_btn.setChecked(bool(entry.get('is_favorite')))
         self._detail_rating.setEnabled(True)
         try:

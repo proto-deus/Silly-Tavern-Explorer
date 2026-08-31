@@ -57,6 +57,25 @@ def _sanitize_filename(name: str) -> str:
 sanitize_filename = _sanitize_filename  # public alias for reuse
 
 
+def filename_matches_name(source_path: str | Path, name: str) -> bool:
+    """True when a card file name already reflects *name*.
+
+    The library convention is ``{sanitize_filename(name)}_{8-hex}{ext}``;
+    a file named exactly ``{sanitize_filename(name)}{ext}`` (no suffix) also
+    counts, so bulk fixes don't churn already-correct files.
+    """
+    p = Path(str(source_path or ''))
+    if not p.stem:
+        return False
+    safe = _sanitize_filename(name)
+    stem = p.stem
+    if stem == safe:
+        return True
+    if not stem.startswith(safe + '_'):
+        return False
+    return bool(re.fullmatch(r'[0-9a-f]{8}', stem[len(safe) + 1:]))
+
+
 def group_duplicate_rows(rows: list[dict]) -> list[list[dict]]:
     """Group card rows by (name, creator) case-insensitively.
 
@@ -521,12 +540,89 @@ class LibraryDatabase:
             row = conn.execute('SELECT * FROM characters WHERE id = ?', (char_id,)).fetchone()
             return dict(row) if row else None
 
+    def _rename_card_files(
+        self, entry: dict, new_name: str,
+    ) -> tuple[str, Optional[str]]:
+        """Rename a card's library file (and its thumbnail) to match *new_name*.
+
+        The random suffix is preserved when it already follows the 8-hex
+        convention (``Aria_abc12345.png`` -> ``Aria Vale_abc12345.png``) and
+        regenerated otherwise, keeping filenames unique. Returns the new
+        (source_path, thumbnail_path); unchanged values are returned when
+        there is nothing to rename (missing file, no thumbnail, ...).
+        """
+        source = entry.get('source_path') or ''
+        src_path = Path(source)
+        if not source or not src_path.exists():
+            logger.warning(
+                "Cannot rename file for card '%s': source missing (%s)",
+                new_name, source or '<none>',
+            )
+            return source, entry.get('thumbnail_path')
+
+        safe_name = _sanitize_filename(new_name)
+        match = re.search(r'_([0-9a-f]{8})$', src_path.stem)
+        suffix = match.group(1) if match else uuid.uuid4().hex[:8]
+        new_path = src_path.parent / f"{safe_name}_{suffix}{src_path.suffix}"
+        # A genuinely different existing file forces a fresh suffix; a
+        # case-only difference renames in place (same file).
+        while new_path.exists() and os.path.normcase(str(new_path)) != os.path.normcase(source):
+            suffix = uuid.uuid4().hex[:8]
+            new_path = src_path.parent / f"{safe_name}_{suffix}{src_path.suffix}"
+        if os.path.normcase(str(new_path)) != os.path.normcase(source):
+            src_path.rename(new_path)
+            logger.info("Renamed card file %s -> %s", src_path.name, new_path.name)
+
+        new_thumb = None
+        old_thumb = entry.get('thumbnail_path')
+        if old_thumb and Path(old_thumb).exists():
+            thumb_path = Path(old_thumb)
+            new_thumb_path = thumb_path.parent / f"{new_path.stem}_thumb.png"
+            while (
+                new_thumb_path.exists()
+                and os.path.normcase(str(new_thumb_path)) != os.path.normcase(old_thumb)
+            ):
+                new_thumb_path = thumb_path.parent / f"{new_path.stem}_{uuid.uuid4().hex[:4]}_thumb.png"
+            if os.path.normcase(str(new_thumb_path)) != os.path.normcase(old_thumb):
+                thumb_path.rename(new_thumb_path)
+            new_thumb = str(new_thumb_path)
+
+        return str(new_path), new_thumb
+
+    def rename_card_files(self, char_id: int) -> bool:
+        """Rename a card's file + thumbnail to match its stored name.
+
+        Applies the standard naming convention to cards whose file no
+        longer reflects their name (e.g. renamed before the rename-on-save
+        feature existed). No-op when the file already conforms or is
+        missing. Returns True when a file was renamed.
+        """
+        entry = self.get_by_id(char_id)
+        if entry is None:
+            return False
+        source = entry.get('source_path') or ''
+        name = entry.get('name') or ''
+        if not source or filename_matches_name(source, name):
+            return False
+        new_source, new_thumb = self._rename_card_files(entry, name)
+        if new_source == source:
+            return False
+        with self._conn() as conn:
+            conn.execute(
+                'UPDATE characters SET source_path = ?, thumbnail_path = ? WHERE id = ?',
+                (new_source, new_thumb, char_id),
+            )
+            conn.commit()
+        logger.info("Aligned card file name for ID %s ('%s')", char_id, name)
+        return True
+
     def update_card(
         self,
         char_id: int,
         card: CharacterCard,
         regen_thumbnail: bool = False,
         skip_file_write: bool = False,
+        rename_file_on_name_change: bool = False,
     ) -> None:
         """Update a card's metadata and (optionally) its source PNG.
 
@@ -534,6 +630,13 @@ class LibraryDatabase:
         used by the SillyTavern pull operation which copies the ST PNG
         directly (avoiding a re-serialization that would break the
         content-hash baseline).
+
+        When *rename_file_on_name_change* is True and the card's name
+        changed, the library file and thumbnail are renamed to match the
+        new name (source_path/thumbnail_path are updated in place). The
+        database row keeps its id, so chat sessions, links and sync
+        state are unaffected. A failed rename is logged and does not
+        abort the save.
         """
         entry = self.get_by_id(char_id)
         if entry is None:
@@ -547,21 +650,34 @@ class LibraryDatabase:
             else:
                 logger.warning("Source file missing for card ID %s, skipping file write", char_id)
 
+        # Rename the backing files when the (editable) name changed.
+        new_source = source
+        new_thumb = entry.get('thumbnail_path')
+        renamed = False
+        if rename_file_on_name_change and card.name and card.name != entry.get('name', ''):
+            try:
+                new_source, new_thumb = self._rename_card_files(entry, card.name)
+                renamed = new_source != source
+            except OSError as e:
+                # The content was already written to the old file — keep
+                # the old paths so the save still succeeds.
+                logger.error("Failed to rename card file for ID %s: %s", char_id, e)
+
         if regen_thumbnail:
-            thumb_path = entry.get('thumbnail_path', '')
-            if thumb_path and source and Path(source).exists():
-                save_thumbnail(source, thumb_path)
+            thumb_path = new_thumb
+            if thumb_path and new_source and Path(new_source).exists():
+                save_thumbnail(new_source, thumb_path)
 
         with self._conn() as conn:
-            conn.execute('''
+            sets = '''
                 UPDATE characters SET
                     name = ?, tags = ?, creator = ?,
                     description_preview = ?, creator_notes = ?,
                     token_count = ?,
                     spec_version = ?, is_favorite = ?,
                     date_modified = CURRENT_TIMESTAMP
-                WHERE id = ?
-            ''', (
+            '''
+            params: list = [
                 card.name,
                 json.dumps(card.tags, ensure_ascii=False),
                 card.creator,
@@ -570,8 +686,13 @@ class LibraryDatabase:
                 card.token_count,
                 card.spec_version,
                 int(card.fav),
-                char_id,
-            ))
+            ]
+            if renamed:
+                sets += ', source_path = ?, thumbnail_path = ?'
+                params.extend([new_source, new_thumb])
+            sets += ' WHERE id = ?'
+            params.append(char_id)
+            conn.execute(sets, params)
             conn.commit()
         logger.info("Updated card ID %s ('%s')", char_id, card.name)
 

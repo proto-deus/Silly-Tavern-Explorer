@@ -945,9 +945,13 @@ class EditTab(QWidget):
         card = self._gather_card()
         card.token_count = count_card_tokens(card)
         try:
-            self.db.update_card(self._current_id, card)
+            self.db.update_card(self._current_id, card, rename_file_on_name_change=True)
             self._dirty_state.clear()
             self.status_message.emit(f"'{card.name}' saved", 4000)
+            # Reload from disk so the editor (header, file path, in-memory
+            # card) reflects the saved state, including a renamed file when
+            # the character name changed.
+            self._load_card()
             self.card_updated.emit(self._current_id)
             return True
         except Exception as e:
