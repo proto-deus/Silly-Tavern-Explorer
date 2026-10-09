@@ -207,22 +207,6 @@ All shortcuts are defined in a central registry (`src/ui/shortcuts.py`) and appe
 | Ctrl+Shift+L | Sync Library with SillyTavern |
 | Ctrl+Shift+W | Sync Lorebooks (world info) with SillyTavern |
 | Ctrl+, | Settings |
-| File > Export as JSON | Export selected card as JSON |
-| File > Backup Now | Create a manual database backup |
-| File > Backup Library... | Zip the entire library (DB + cards + sessions + thumbnails) |
-| File > Restore Library... | Restore a library backup zip (prompts restart) |
-| File > Check Library... | Library integrity check ("Doctor") with automatic fixes |
-| View > Font Size... | Set the application font size |
-| View > Find Duplicates | Duplicate scanner dialog |
-| View > Statistics | Library statistics dashboard |
-| SillyTavern > Configure | Configure SillyTavern directory |
-| SillyTavern > Push Selected | Push the selected card to ST |
-| SillyTavern > Pull Selected | Pull the selected card's ST version |
-| SillyTavern > Push All to SillyTavern | Bulk-push all new/changed cards to ST |
-| SillyTavern > Pull All from SillyTavern | Bulk-pull all new/changed cards from ST |
-| SillyTavern > Refresh ST Status | Re-scan ST directory |
-| Help > About | About ST Explorer |
-| Help > View Log | View Application Log |
 
 ## Character Card Format
 
