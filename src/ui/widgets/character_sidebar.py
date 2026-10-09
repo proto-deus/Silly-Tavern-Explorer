@@ -13,7 +13,12 @@ from PyQt6.QtWidgets import (
 )
 
 from src.database import LibraryDatabase
+from src.ui.widgets.async_image import cancel_pending_image_loads
 from src.ui.widgets.card_thumbnail import CardThumbnail
+
+# Owner tag for this list's queued thumbnail loads, so cancelling a rebuild of
+# the Library grid's loads leaves the sidebar's alone (and vice versa).
+SIDEBAR_LOADER_OWNER = 'sidebar'
 
 
 class CharacterSidebar(QWidget):
@@ -38,7 +43,7 @@ class CharacterSidebar(QWidget):
         layout.setContentsMargins(8, 8, 4, 8)
 
         left_label = QLabel('Characters')
-        left_label.setStyleSheet('font-size: 14px; font-weight: bold; color: #e0e0e0; padding: 4px;')
+        left_label.setStyleSheet('font-weight: bold; color: #e0e0e0; padding: 4px;')
         layout.addWidget(left_label)
 
         self._search_box = QLineEdit()
@@ -61,7 +66,7 @@ class CharacterSidebar(QWidget):
         layout.addWidget(self._thumb_scroll, 1)
 
         self._favorites_check = QCheckBox('Favorites only')
-        self._favorites_check.setStyleSheet('font-size: 12px; color: #ccc;')
+        self._favorites_check.setStyleSheet('color: #ccc;')
         self._favorites_check.toggled.connect(self._on_favorites_toggled)
         layout.addWidget(self._favorites_check)
 
@@ -69,6 +74,10 @@ class CharacterSidebar(QWidget):
 
     def load_cards(self) -> None:
         """Rebuild the thumbnail list from the DB, honouring the favorites filter."""
+        # Drop this list's queued image loads so a rebuild doesn't leave stale
+        # decodes competing for the pool (the Library grid tags its own loads
+        # separately and is unaffected).
+        cancel_pending_image_loads(SIDEBAR_LOADER_OWNER)
         for w in self._thumb_widgets:
             w.hide()
             w.setParent(None)
@@ -76,6 +85,14 @@ class CharacterSidebar(QWidget):
         self._thumb_widgets.clear()
 
         entries = self.db.get_all(favorites_only=self._favorites_only)
+
+        # Drop a selection that no longer exists (or is filtered out of view).
+        # Keeping it left the sidebar highlighting a deleted card, which the
+        # Edit tab then loaded (with Save enabled) and Push/Pull targeted.
+        ids = {entry['id'] for entry in entries}
+        if self._current_id is not None and self._current_id not in ids:
+            self._current_id = None
+
         for entry in entries:
             thumb = CardThumbnail(
                 char_id=entry['id'],
@@ -83,6 +100,7 @@ class CharacterSidebar(QWidget):
                 thumb_path=entry.get('thumbnail_path', ''),
                 is_favorite=bool(entry.get('is_favorite')),
                 token_count=entry.get('token_count', 0),
+                loader_owner=SIDEBAR_LOADER_OWNER,
             )
             thumb.clicked.connect(self._on_thumb_clicked)
             thumb.double_clicked.connect(self._on_thumb_double_clicked)

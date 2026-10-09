@@ -35,7 +35,7 @@ class TagFilterDialog(QDialog):
         layout = QVBoxLayout(self)
 
         header = QLabel('Select tags to filter by:')
-        header.setStyleSheet('font-size: 12px; font-weight: bold; color: #ccc;')
+        header.setStyleSheet('font-weight: bold; color: #ccc;')
         layout.addWidget(header)
 
         btn_row = QHBoxLayout()

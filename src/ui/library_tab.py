@@ -28,6 +28,11 @@ from src.card_models import CharacterCard
 from src.card_parser import read_card_data
 from src.database import LibraryDatabase, sanitize_filename
 from src.settings_manager import load_font_size
+from src.ui.dialog_helper import exec_dialog, exec_dialog_with
+from src.ui.widgets.async_image import (
+    THUMBNAIL_LOADER_OWNER,
+    cancel_pending_image_loads,
+)
 from src.ui.widgets.card_thumbnail import CardThumbnail
 from src.ui.widgets.flow_layout import FlowLayout
 from src.ui.widgets.rating_widget import RatingWidget
@@ -238,7 +243,7 @@ class LibraryTab(QWidget):
         # squashed when the window is narrow).
         filter_row = QHBoxLayout()
         sort_label = QLabel('Sort:')
-        sort_label.setStyleSheet('font-size: 12px; color: #ccc;')
+        sort_label.setStyleSheet('color: #ccc;')
         filter_row.addWidget(sort_label)
         self._sort_combo = QComboBox()
         for label in self._SORT_LABELS:
@@ -247,7 +252,7 @@ class LibraryTab(QWidget):
         filter_row.addWidget(self._sort_combo)
 
         self._favorites_only_cb = QCheckBox('Favorites only')
-        self._favorites_only_cb.setStyleSheet('font-size: 12px; color: #ccc;')
+        self._favorites_only_cb.setStyleSheet('color: #ccc;')
         self._favorites_only_cb.toggled.connect(self._apply_filters)
         filter_row.addWidget(self._favorites_only_cb)
 
@@ -537,11 +542,14 @@ class LibraryTab(QWidget):
         from src.ui.widgets.collections_dialog import CollectionsManagerDialog
 
         dlg = CollectionsManagerDialog(self.db, self)
-        dlg.exec()
-        if dlg.changed:
+        changed = exec_dialog_with(dlg, lambda d: d.changed)
+        if changed:
             self._refresh_collection_combo()
-            if self._collection_combo.currentData() is not None:
-                self._apply_filters()
+            # Re-apply unconditionally: deleting the collection currently being
+            # filtered by leaves currentData() as None (the combo falls back to
+            # "All Cards"), so the old guard skipped the re-filter and the grid
+            # kept showing the deleted collection's results.
+            self._apply_filters()
 
     def _on_assign_collections(self) -> None:
         from src.ui.widgets.collections_dialog import CollectionAssignDialog
@@ -551,17 +559,29 @@ class LibraryTab(QWidget):
         entry = self.db.get_by_id(self._selected_id)
         name = entry.get('name', '') if entry else ''
         dlg = CollectionAssignDialog(self.db, self._selected_id, name, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.db.set_card_collections(self._selected_id, dlg.selected_collection_ids())
+        chosen = exec_dialog_with(
+            dlg,
+            lambda d: d.selected_collection_ids()
+            if d.result() == QDialog.DialogCode.Accepted else None,
+        )
+        if chosen is not None:
+            self.db.set_card_collections(self._selected_id, chosen)
             self._refresh_collection_combo()
-            if self._collection_combo.currentData() is not None:
-                self._apply_filters()
+            self._apply_filters()
             self.status_message.emit('Collections updated', 2000)
 
     def _on_rating_changed(self, value: int) -> None:
         if self._selected_id is None:
             return
-        self.db.set_rating(self._selected_id, value)
+        try:
+            self.db.set_rating(self._selected_id, value)
+        except Exception as e:
+            # An exception escaping a slot aborts the process; a locked DB is
+            # an ordinary, recoverable condition.
+            logger.exception("Failed to set rating for card %s", self._selected_id)
+            QMessageBox.critical(self, 'Error', f"Failed to save rating: {e}")
+            self._update_detail()
+            return
         msg = f'Rated {value}/5 stars' if value else 'Rating cleared'
         self.status_message.emit(msg, 2000)
 
@@ -571,6 +591,11 @@ class LibraryTab(QWidget):
             thumb.setParent(None)
             thumb.deleteLater()
         self._thumbnails.clear()
+        # Cancel queued thumbnail loads. The pool queue is global and
+        # unbounded, so without this every refresh (import, sync, filter
+        # change, bulk favourite) piled up a full set of decodes whose results
+        # were then thrown away with the widgets.
+        cancel_pending_image_loads(THUMBNAIL_LOADER_OWNER)
         while self._grid_layout.count():
             self._grid_layout.takeAt(0)
 
@@ -767,7 +792,7 @@ class LibraryTab(QWidget):
             self._summary_scroll.setVisible(False)
             self._detail_text.clear()
             self._detail_rating.set_rating(0)
-            self.status_message.emit(f"{count} cards selected", 0)
+            self.status_message.emit(f"{count} cards selected", 3000)
 
     def _refresh_selection_highlights(self) -> None:
         selected = set(self._selection.selected_ids)
@@ -833,20 +858,41 @@ class LibraryTab(QWidget):
         self._update_selection_ui()
 
     def select_card(self, char_id: int) -> None:
-        """Select a single card in the grid (for cross-tab sync from the Edit tab)."""
+        """Select a single card in the grid (for cross-tab sync from the Edit tab).
+
+        The thumbnail is scrolled into view via a deferred singleShot, which
+        captures both ``parent`` and ``thumb`` by reference. A grid rebuild
+        between the scheduling and the callback (``deleteLater`` pending) would
+        therefore make the lambda call into a destroyed widget, so the values
+        are bound now and the callback verifies the widget is still alive.
+        """
         if char_id not in self._all_ids:
             return
         self._selection.clear()
         self._selection.select_single(char_id)
         self._update_selection_ui()
         for thumb in self._thumbnails:
-            if thumb.char_id == char_id:
-                parent = thumb.parent()
-                while parent and not isinstance(parent, QScrollArea):
-                    parent = parent.parent()
-                if isinstance(parent, QScrollArea):
-                    QTimer.singleShot(0, lambda: parent.ensureWidgetVisible(thumb))
+            if thumb.char_id != char_id:
+                continue
+            parent = thumb.parent()
+            while parent and not isinstance(parent, QScrollArea):
+                parent = parent.parent()
+            if not isinstance(parent, QScrollArea):
                 break
+            self._ensure_visible_later(parent, thumb)
+            break
+
+    @staticmethod
+    def _ensure_visible_later(parent: QScrollArea, thumb) -> None:
+        """Scroll *thumb* into view on the next event-loop turn, if still alive."""
+        from src.ui.widgets.chat_image_loader import _widget_alive
+
+        def _reveal() -> None:
+            if not _widget_alive(thumb) or not _widget_alive(parent):
+                return
+            parent.ensureWidgetVisible(thumb)
+
+        QTimer.singleShot(0, _reveal)
 
     def _on_bulk_delete(self) -> None:
         selected = self._selection.selected_ids
@@ -903,6 +949,7 @@ class LibraryTab(QWidget):
                         name=entry['name'],
                         thumb_path=entry.get('thumbnail_path', ''),
                         is_favorite=bool(entry.get('is_favorite')),
+                        token_count=entry.get('token_count', 0),
                     )
         word = 'Favorited' if favorite else 'Unfavorited'
         self.status_message.emit(f"{word} {len(selected)} card(s).", 4000)
@@ -915,7 +962,7 @@ class LibraryTab(QWidget):
         dest_dir = QFileDialog.getExistingDirectory(self, 'Export Selected PNGs to Folder')
         if not dest_dir:
             return
-        import shutil
+        from src import vault
         from src.database import sanitize_filename
         exported = 0
         errors: list[str] = []
@@ -930,7 +977,7 @@ class LibraryTab(QWidget):
             dest_name = f"{sanitize_filename(entry['name'])}_{char_id}{Path(source).suffix}"
             dest = Path(dest_dir) / dest_name
             try:
-                shutil.copy2(source, str(dest))
+                vault.copy_out(source, dest)
                 exported += 1
             except OSError as e:
                 errors.append(f"{entry['name']}: {e}")
@@ -1174,7 +1221,14 @@ class LibraryTab(QWidget):
         )
         if reply == QMessageBox.StandardButton.Yes:
             deleted_id = self._selected_id
-            self.db.remove_card(deleted_id, delete_files=True)
+            try:
+                self.db.remove_card(deleted_id, delete_files=True)
+            except Exception as e:
+                # An exception escaping a slot aborts the process; a locked
+                # file or a busy database must show an error instead.
+                logger.exception("Delete of card %s failed", deleted_id)
+                QMessageBox.critical(self, 'Delete Character', f'Could not delete the card: {e}')
+                return
             self._remove_thumbnail_in_place(deleted_id)
             self._selected_id = None
             self._update_selection_ui()
@@ -1199,8 +1253,8 @@ class LibraryTab(QWidget):
         if not dest:
             return
         try:
-            import shutil
-            shutil.copy2(source, dest)
+            from src import vault
+            vault.copy_out(source, dest)
             self.status_message.emit(f"Exported PNG to {Path(dest).name}", 4000)
         except OSError as e:
             logger.exception("PNG export failed")
@@ -1311,8 +1365,7 @@ class LibraryTab(QWidget):
         """Open the duplicate scanner dialog (toolbar / menu entry)."""
         from src.ui.widgets.duplicate_scanner import DuplicateScannerDialog
         dlg = DuplicateScannerDialog(self.db, self)
-        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        dlg.exec()
+        exec_dialog(dlg)
         # Card data may have changed; refresh the grid.
         self.load_cards()
 
@@ -1320,8 +1373,7 @@ class LibraryTab(QWidget):
         """Open the statistics dashboard dialog (toolbar / menu entry)."""
         from src.ui.widgets.stats_dialog import StatsDialog
         dlg = StatsDialog(self.db, self)
-        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        dlg.exec()
+        exec_dialog(dlg)
 
     def _on_settings_requested(self) -> None:
         self.settings_requested.emit()
@@ -1372,7 +1424,6 @@ class LibraryTab(QWidget):
             QMessageBox.warning(self, 'Duplicate', 'Source file not found.')
             return
 
-        import shutil
         import uuid
         from src.card_models import build_duplicate_card
         from src.database import _get_library_dir, sanitize_filename
@@ -1393,7 +1444,8 @@ class LibraryTab(QWidget):
         # process under PyQt6).
         dest_path = lib_dir / f"{sanitize_filename(clone.name)[:60]}_{uuid.uuid4().hex[:8]}{ext}"
         try:
-            shutil.copy2(source, str(dest_path))
+            from src import vault
+            vault.import_external(source, str(dest_path))
             clone.source_path = str(dest_path)
             new_id = self.db.add_card(clone)
             self.status_message.emit(f"Duplicated as '{clone.name}'", 4000)

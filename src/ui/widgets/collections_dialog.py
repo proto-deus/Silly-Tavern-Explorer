@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -17,6 +19,8 @@ from PyQt6.QtWidgets import (
 )
 
 from src.database import LibraryDatabase
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_collection_name(name: str) -> str:
@@ -121,7 +125,12 @@ class CollectionsManagerDialog(QDialog):
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
-        self.db.delete_collection(col_id)
+        try:
+            self.db.delete_collection(col_id)
+        except Exception as e:
+            logger.exception("Failed to delete collection %s", col_id)
+            QMessageBox.critical(self, 'Error', f"Failed to delete collection: {e}")
+            return
         self.changed = True
         self._refresh()
 

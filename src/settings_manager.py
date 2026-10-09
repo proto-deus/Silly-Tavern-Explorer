@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import base64
 import ctypes
 import ctypes.wintypes
 import json
 import logging
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -47,11 +49,24 @@ def _provider_prefix(name: str) -> str:
 
 
 def _read_api_key(s: QSettings, prefix: str) -> str:
+    """Return the stored API key, or '' if none can be recovered.
+
+    A decryption failure must be distinguishable from "no key saved": the
+    dialog needs to tell the user their key could not be read, otherwise
+    saving settings writes an empty key over the ciphertext and the real key
+    is lost irrecoverably.
+    """
     encrypted = s.value(prefix + 'api_key_encrypted', '')
     if encrypted:
         decrypted = _decrypt_secret(encrypted)
         if decrypted is not None:
             return decrypted
+        logger.error(
+            "The saved API key for '%s' could not be decrypted. It has been "
+            "left untouched - re-enter it to replace it.", prefix.strip('/'),
+        )
+        _record_undecryptable_key(prefix.strip('/'))
+        return ''
     plaintext = s.value(prefix + 'api_key', '')
     if plaintext:
         logger.warning(
@@ -61,24 +76,51 @@ def _read_api_key(s: QSettings, prefix: str) -> str:
     return plaintext
 
 
+# Providers whose stored key could not be decrypted in this session. Saving
+# while one of these is unresolved would destroy the ciphertext.
+_UNDECRYPTABLE_KEYS: set[str] = set()
+
+
+def _record_undecryptable_key(provider: str) -> None:
+    _UNDECRYPTABLE_KEYS.add(provider)
+
+
+def undecryptable_api_key_providers() -> list[str]:
+    """Providers whose saved API key could not be decrypted (see :func:`_read_api_key`)."""
+    return sorted(_UNDECRYPTABLE_KEYS)
+
+
+def clear_undecryptable_api_key_providers() -> None:
+    """Forget the undecryptable-key warnings (after the user re-enters keys)."""
+    _UNDECRYPTABLE_KEYS.clear()
+
+
 def _write_api_key(s: QSettings, prefix: str, api_key: str) -> None:
     if api_key:
         encrypted = _encrypt_secret(api_key)
         if encrypted is not None:
             s.setValue(prefix + 'api_key_encrypted', encrypted)
             s.remove(prefix + 'api_key')
-        else:
-            # Encryption unavailable (missing cryptography package on
-            # macOS/Linux or a failed OS call): the documented fallback
-            # stores the key in plain text. Warn loudly so users on shared
-            # machines know.
-            logger.warning(
-                "Storing API key for '%s' in plain text (encryption unavailable)",
-                prefix.strip('/'),
-            )
-            s.setValue(prefix + 'api_key', api_key)
-            s.remove(prefix + 'api_key_encrypted')
+            _UNDECRYPTABLE_KEYS.discard(prefix.strip('/'))
+            return
+        # Encryption unavailable (missing cryptography package on macOS/Linux
+        # or a failed OS call). Fall back to plain text, but never destroy the
+        # ciphertext that may still be recoverable: a transient DPAPI failure
+        # would otherwise silently downgrade the key *and* discard the good
+        # copy, leaving the user with a plaintext key and no way back.
+        logger.warning(
+            "Storing API key for '%s' in plain text (encryption unavailable); "
+            "the previous encrypted copy is kept", prefix.strip('/'),
+        )
+        s.setValue(prefix + 'api_key', api_key)
     else:
+        if prefix.strip('/') in _UNDECRYPTABLE_KEYS:
+            # Refuse to wipe a key we merely failed to read.
+            logger.error(
+                "Refusing to clear the unreadable API key for '%s'; re-enter it "
+                "to replace it.", prefix.strip('/'),
+            )
+            return
         s.remove(prefix + 'api_key')
         s.remove(prefix + 'api_key_encrypted')
 
@@ -99,22 +141,32 @@ def _safe_int(value, default: int) -> int:
         return default
 
 
+def _clamp(value, low, high, default):
+    """Constrain *value* to [low, high], falling back to *default*."""
+    return max(low, min(high, value))
+
+
 def _read_config(s: QSettings, prefix: str, name: str = '') -> dict:
+    # Values are clamped here, not just in the dialog: QSettings is a plain
+    # registry/INI file that can be hand-edited or corrupted, and an
+    # out-of-range retry count turns the client's retry loop unbounded.
     result: dict = {
         'preset_name': name or s.value(prefix + 'preset_name', ''),
         'base_url': s.value(prefix + 'base_url', ''),
         'api_key': _read_api_key(s, prefix),
         'model': s.value(prefix + 'model', ''),
-        'temperature': _safe_float(s.value(prefix + 'temperature', 1.0), 1.0),
-        'max_tokens': _safe_int(s.value(prefix + 'max_tokens', 2048), 2048),
-        'top_p': _safe_float(s.value(prefix + 'top_p', 1.0), 1.0),
-        'top_k': _safe_int(s.value(prefix + 'top_k', 0), 0),
-        'min_p': _safe_float(s.value(prefix + 'min_p', 0.0), 0.0),
-        'context_size': _safe_int(s.value(prefix + 'context_size', 8192), 8192),
-        'frequency_penalty': _safe_float(s.value(prefix + 'frequency_penalty', 0.0), 0.0),
-        'presence_penalty': _safe_float(s.value(prefix + 'presence_penalty', 0.0), 0.0),
+        'temperature': _clamp(_safe_float(s.value(prefix + 'temperature', 1.0), 1.0), 0.0, 2.0, 1.0),
+        'max_tokens': _clamp(_safe_int(s.value(prefix + 'max_tokens', 2048), 2048), 1, 1_000_000, 2048),
+        'top_p': _clamp(_safe_float(s.value(prefix + 'top_p', 1.0), 1.0), 0.0, 1.0, 1.0),
+        'top_k': _clamp(_safe_int(s.value(prefix + 'top_k', 0), 0), 0, 10_000, 0),
+        'min_p': _clamp(_safe_float(s.value(prefix + 'min_p', 0.0), 0.0), 0.0, 1.0, 0.0),
+        'context_size': _clamp(_safe_int(s.value(prefix + 'context_size', 8192), 8192), 256, 10_000_000, 8192),
+        'frequency_penalty': _clamp(_safe_float(s.value(prefix + 'frequency_penalty', 0.0), 0.0), -2.0, 2.0, 0.0),
+        'presence_penalty': _clamp(_safe_float(s.value(prefix + 'presence_penalty', 0.0), 0.0), -2.0, 2.0, 0.0),
         'seed': _safe_int(s.value(prefix + 'seed', -1), -1),
-        'retry_attempts': _safe_int(s.value(prefix + 'retry_attempts', 2), 2),
+        # Matches the Settings spinbox range so a corrupted value can't produce
+        # an effectively infinite retry loop.
+        'retry_attempts': _clamp(_safe_int(s.value(prefix + 'retry_attempts', 2), 2), 0, 5, 2),
     }
     return result
 
@@ -156,7 +208,12 @@ def _migrate_legacy_settings(s: QSettings) -> None:
     for key in _LEGACY_KEYS:
         s.remove('api/' + key)
     s.remove('api/api_key')
-    s.remove('api/api_key_encrypted')
+    if 'api' not in _UNDECRYPTABLE_KEYS:
+        # Only drop the legacy ciphertext once it has been read and re-stored
+        # under the provider prefix. If decryption failed the copy may still
+        # be recoverable later (e.g. after restoring an old machine profile) -
+        # deleting it here would be exactly the loss _write_api_key refuses.
+        s.remove('api/api_key_encrypted')
 
 
 def save_api_settings(
@@ -173,6 +230,7 @@ def save_api_settings(
     frequency_penalty: float = 0.0,
     presence_penalty: float = 0.0,
     seed: int = -1,
+    retry_attempts: int = 2,
 ) -> None:
     save_provider_settings(preset_name, {
         'base_url': base_url,
@@ -187,23 +245,75 @@ def save_api_settings(
         'frequency_penalty': frequency_penalty,
         'presence_penalty': presence_penalty,
         'seed': seed,
+        # Was omitted, so every caller silently reset the user's retry count
+        # to the default.
+        'retry_attempts': retry_attempts,
     })
     set_active_provider(preset_name)
 
 
-def save_active_sampling(temperature: float, min_p: float) -> None:
-    """Persist Temp/Min-P into the active provider's saved settings.
+def save_active_sampling(
+    temperature: float,
+    min_p: float,
+    *,
+    model: str | None = None,
+    context_size: int | None = None,
+) -> None:
+    """Persist Test-tab chat overrides into the active provider's settings.
 
-    The Test tab's sampling spinboxes write through here so they stay in
-    sync with the LLM tab of the settings dialog (both read/write the
-    same provider store).
+    The Test tab's sampling/model/context widgets write through here so they
+    stay in sync with the settings dialog (both read/write the same provider
+    store).  ``model``/``context_size`` of ``None`` leave those keys untouched.
     """
     config = load_api_settings()
     config['temperature'] = float(temperature)
     config['min_p'] = float(min_p)
+    if model is not None:
+        config['model'] = str(model)
+    if context_size is not None:
+        config['context_size'] = int(context_size)
     save_provider_settings(
         config.get('preset_name') or load_active_provider(), config,
     )
+
+
+def save_provider_models(name: str, models: list[str], source_url: str = '') -> None:
+    """Cache the model list fetched from provider *name*'s endpoint.
+
+    The list is stored separately from :data:`_PROVIDER_KEYS` so it survives
+    settings saves and is available without re-fetching; ``source_url`` records
+    which endpoint produced it so a changed base URL invalidates the cache.
+    """
+    s = _get_settings()
+    prefix = _provider_prefix(name)
+    s.setValue(prefix + 'models', json.dumps([str(m) for m in (models or []) if m]))
+    s.setValue(prefix + 'models_source_url', (source_url or '').rstrip('/'))
+
+
+def load_provider_models(name: str, base_url: str | None = None) -> list[str]:
+    """Return the cached model list for provider *name*.
+
+    When *base_url* is given and it differs from the endpoint the cache was
+    fetched from, the stale list is discarded (returns ``[]``).
+    """
+    s = _get_settings()
+    prefix = _provider_prefix(name)
+    if base_url is not None:
+        source = s.value(prefix + 'models_source_url', '')
+        if not isinstance(source, str):
+            source = ''
+        if source.rstrip('/') != (base_url or '').rstrip('/'):
+            return []
+    raw = s.value(prefix + 'models', '')
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed if x]
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("Corrupted model cache for '%s'; resetting", name)
+    return []
 
 
 def load_api_settings() -> dict:
@@ -350,7 +460,12 @@ def load_st_auto_detect_done() -> bool:
 
 
 def clear_st_settings() -> None:
-    """Remove all SillyTavern integration settings."""
+    """Remove all SillyTavern integration settings.
+
+    Offered as "Forget SillyTavern setup" in the ST config dialog: the cards
+    keep their ``st_avatar_url`` links, so only the local paths are cleared and
+    the user can re-point at a moved install without re-linking everything.
+    """
     s = _get_settings()
     s.remove('st/characters_path')
     s.remove('st/worlds_path')
@@ -488,6 +603,16 @@ def _fernet_key_path() -> Path:
     return data_dir() / 'secret.key'
 
 
+def _is_fernet_key(key: bytes) -> bool:
+    """True when *key* is a well-formed 32-byte urlsafe-base64 Fernet key."""
+    if len(key) != 44:
+        return False
+    try:
+        return len(base64.urlsafe_b64decode(key)) == 32
+    except (ValueError, TypeError):
+        return False
+
+
 def _load_or_create_fernet():
     """Return a Fernet instance backed by a local key file, or ``None``.
 
@@ -511,22 +636,55 @@ def _load_or_create_fernet():
     except OSError:
         pass
 
+    if key and not _is_fernet_key(key):
+        # A truncated/garbled key file (crash or disk-full mid-write) can never
+        # decrypt anything. Regenerating would orphan every stored ciphertext,
+        # so refuse instead: the user keeps their recoverable key material.
+        logger.error(
+            "Encryption key %s is corrupt (%d bytes); refusing to regenerate it "
+            "because that would permanently lose every stored API key.", path, len(key),
+        )
+        return None
+
     if not key:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             key = Fernet.generate_key()
-            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            # Write to a temp file first (a crash mid-write can never leave a
+            # truncated key at the real path), then publish it with a hard
+            # link, which is create-exclusive and atomic. ``os.replace`` in
+            # place of the link would silently overwrite a key another
+            # process created first, orphaning every ciphertext it wrote.
+            fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix='.secret.key.')
             try:
                 os.write(fd, key)
+                os.fsync(fd)
             finally:
                 os.close(fd)
-        except FileExistsError:
-            # Raced with another process that created the key first.
             try:
-                key = path.read_bytes().strip()
+                os.chmod(tmp_name, 0o600)
             except OSError:
-                logger.warning("Failed reading freshly created %s", path)
-                return None
+                pass
+            try:
+                os.link(tmp_name, str(path))
+            except FileExistsError:
+                # Raced with another process that created the key first:
+                # adopt ITS key, never overwrite it.
+                try:
+                    key = path.read_bytes().strip()
+                except OSError:
+                    logger.warning("Failed reading freshly created %s", path)
+                    return None
+            except (OSError, NotImplementedError, AttributeError):
+                # Filesystem without hard-link support: fall back to replace.
+                # The single-instance lock makes a race here unlikely.
+                os.replace(tmp_name, str(path))
+                tmp_name = ''
+            if tmp_name:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
         except OSError as e:
             logger.warning("Cannot write encryption key %s: %s", path, e)
             return None

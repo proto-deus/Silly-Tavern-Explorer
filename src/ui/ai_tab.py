@@ -152,10 +152,10 @@ class AITab(QWidget):
         # Header: title + current selection + settings.
         header_row = QHBoxLayout()
         title = QLabel('Generate')
-        title.setStyleSheet('font-size: 16px; font-weight: bold; color: #e0e0e0;')
+        title.setStyleSheet('font-weight: bold; color: #e0e0e0;')
         header_row.addWidget(title)
         self._selected_label = QLabel('No character selected')
-        self._selected_label.setStyleSheet('font-size: 13px; color: #6cb6ff;')
+        self._selected_label.setStyleSheet('color: #6cb6ff;')
         header_row.addWidget(self._selected_label)
         header_row.addStretch()
         settings_btn = QPushButton('Settings')
@@ -362,7 +362,12 @@ class AITab(QWidget):
     # ---- selection ----
 
     def select_card(self, char_id: int) -> None:
-        """Set the currently-selected card (driven by the shared sidebar)."""
+        """Set the currently-selected card (driven by the shared sidebar).
+
+        The fill-panel refresh re-reads the card PNG and re-tokenizes every
+        field, which is far too slow to run on every library-grid click, so
+        it is deferred until the tab is actually shown.
+        """
         changed = char_id != self._selected_id
         self._selected_id = char_id
         entry = self.db.get_by_id(char_id)
@@ -372,7 +377,16 @@ class AITab(QWidget):
             self._selected_label.setText('No character selected')
         if changed:
             self._clear_all_results()
-        self._on_fill_card_changed()
+        if self.isVisible():
+            self._on_fill_card_changed()
+        else:
+            self._fill_refresh_pending = True
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if getattr(self, '_fill_refresh_pending', False):
+            self._fill_refresh_pending = False
+            self._on_fill_card_changed()
 
     # ---- preset ----
 

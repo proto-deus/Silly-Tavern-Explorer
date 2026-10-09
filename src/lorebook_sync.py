@@ -20,10 +20,12 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from src import vault
 from src.fs_utils import atomic_write_bytes
 from src import lorebook_store
 from src.sillytavern_sync import SyncAction, SyncSummary
@@ -110,8 +112,8 @@ def load_sync_state() -> dict[str, dict[str, str]]:
     """Load the baseline state: ``{normcase(filename): {'explorer': h, 'st': h}}``."""
     path = _state_path()
     try:
-        raw = json.loads(path.read_text(encoding='utf-8'))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        raw = json.loads(vault.read_text(path))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, vault.VaultError):
         return {}
     if not isinstance(raw, dict):
         return {}
@@ -126,26 +128,42 @@ def load_sync_state() -> dict[str, dict[str, str]]:
 
 def save_sync_state(state: dict[str, dict[str, str]]) -> None:
     """Persist the baseline state atomically."""
-    atomic_write_bytes(
+    vault.write_bytes(
         _state_path(),
         json.dumps(state, ensure_ascii=False, indent=2).encode('utf-8'),
     )
 
 
+_STATE_LOCK = threading.RLock()
+
+
+def _update_sync_state(mutate) -> dict[str, dict[str, str]]:
+    """Read-modify-write the state file under a lock, returning the new state.
+
+    The worker thread records a baseline per plan item while the GUI thread can
+    forget one; an unlocked load-modify-save pair loses whichever update lands
+    second.
+    """
+    with _STATE_LOCK:
+        state = load_sync_state()
+        mutate(state)
+        save_sync_state(state)
+        return state
+
+
 def forget_pair(filename: str) -> None:
     """Drop the baseline for *filename* (e.g. after an unlink/delete)."""
-    state = load_sync_state()
-    state.pop(os.path.normcase(filename), None)
-    save_sync_state(state)
+    key = os.path.normcase(filename)
+    _update_sync_state(lambda st: st.pop(key, None))
 
 
 def _mark_pair_synced(filename: str, explorer_semantic: str, st_semantic: str) -> None:
-    state = load_sync_state()
-    state[os.path.normcase(filename)] = {
-        'explorer': explorer_semantic,
-        'st': st_semantic,
-    }
-    save_sync_state(state)
+    def _apply(state: dict[str, dict[str, str]]) -> None:
+        state[os.path.normcase(filename)] = {
+            'explorer': explorer_semantic,
+            'st': st_semantic,
+        }
+    _update_sync_state(_apply)
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +200,12 @@ def semantic_hash_of_book(book) -> str:
 
 def _entry_from_file(path: Path) -> LorebookFileEntry | None:
     try:
-        raw_bytes = path.read_bytes()
+        # Decrypt-aware read: the hash must cover the *logical* bytes so an
+        # Explorer copy and its plaintext ST twin hash identically even when
+        # the library is encrypted at rest.
+        raw_bytes = vault.read_bytes(path)
         raw = json.loads(raw_bytes.decode('utf-8'))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, vault.VaultError) as exc:
         logger.warning("Skipping unreadable lorebook file %s: %s", path.name, exc)
         return None
     book = lorebook_store.parse_book_json(raw)
@@ -235,14 +256,19 @@ def _classify_pair(
         return LorebookSyncCategory.IN_SYNC
     base_ex = baseline.get('explorer')
     base_st = baseline.get('st')
-    ex_known = bool(base_ex)
-    st_known = bool(base_st)
-    ex_changed = ex_known and ex.semantic_hash != base_ex
-    st_changed = st_known and st.semantic_hash != base_st
-    if not ex_known and not st_known:
+    if not base_ex and not base_st:
         # No baseline: identical content was handled above; anything else
         # is indistinguishable from a two-sided change until first sync.
         return LorebookSyncCategory.BOTH_CHANGED
+    # A half-populated baseline (legacy state recorded one side only) still
+    # names the pair's last-synced content - the sides matched when it was
+    # written. Use it as the reference for BOTH sides so the unrecorded side's
+    # changes are detected instead of being assumed away (which let a
+    # push/pull clobber edits the baseline never saw).
+    ref_ex = base_ex or base_st
+    ref_st = base_st or base_ex
+    ex_changed = ex.semantic_hash != ref_ex
+    st_changed = st.semantic_hash != ref_st
     if ex_changed and not st_changed:
         return LorebookSyncCategory.EXPLORER_CHANGED
     if st_changed and not ex_changed:
@@ -316,7 +342,13 @@ def pull_lorebook(st_entry: LorebookFileEntry) -> str | None:
         logger.warning("Lorebook pull failed for %s: %s", st_entry.filename, exc)
         return str(exc)
     sem = semantic_hash_of_book(book)
-    _mark_pair_synced(st_entry.filename, sem, sem)
+    try:
+        _mark_pair_synced(st_entry.filename, sem, sem)
+    except OSError as exc:
+        logger.warning(
+            "Lorebook '%s' was pulled but its sync baseline could not be saved: %s",
+            st_entry.filename, exc,
+        )
     logger.info("Pulled lorebook '%s' from SillyTavern", st_entry.filename)
     return None
 
@@ -340,7 +372,18 @@ def push_lorebook(ex_entry: LorebookFileEntry, worlds_dir: str | Path) -> str | 
         logger.warning("Lorebook push failed for %s: %s", ex_entry.filename, exc)
         return str(exc)
     sem = semantic_hash_of_book(book)
-    _mark_pair_synced(ex_entry.filename, sem, sem)
+    # Inside the try: a failure writing the baseline (read-only home, disk
+    # full) used to abort the whole batch, abandoning the remaining plan items
+    # and leaving this file written but with no baseline - so it reported
+    # BOTH_CHANGED forever. The file is already safely written; losing the
+    # baseline only costs an extra sync.
+    try:
+        _mark_pair_synced(ex_entry.filename, sem, sem)
+    except OSError as exc:
+        logger.warning(
+            "Lorebook '%s' was pushed but its sync baseline could not be saved: %s",
+            ex_entry.filename, exc,
+        )
     logger.info("Pushed lorebook '%s' to SillyTavern", ex_entry.filename)
     return None
 

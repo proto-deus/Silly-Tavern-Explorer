@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import os
 import re
-import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -15,7 +15,7 @@ from typing import Optional
 
 from src.card_models import CharacterCard
 from src.card_parser import read_card_data, read_chara_card, write_chara_card_dual
-from src.fs_utils import atomic_copy, atomic_replace, unique_temp_path
+from src.fs_utils import atomic_replace, unique_temp_path
 from src.token_counter import count_card_tokens
 
 logger = logging.getLogger(__name__)
@@ -23,23 +23,11 @@ logger = logging.getLogger(__name__)
 
 _ST_ILLEGAL_CHARS = re.compile(r'[\\?*:/|"<>]')
 # Windows reserved device names (case-insensitive), per sanitize-filename.
-_ST_RESERVED_NAMES = re.compile(r'(?i)^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$')
-
-# Backwards-compatible alias (the canonical implementation lives in fs_utils).
-_atomic_replace = atomic_replace
-
-
-def _copy_with_retry(src: str | Path, dst: str | Path, retries: int = 5, delay: float = 0.3) -> None:
-    """Copy *src* to *dst* with retry on Windows ``PermissionError``."""
-    for attempt in range(retries):
-        try:
-            shutil.copy2(str(src), str(dst))
-            return
-        except PermissionError:
-            if attempt == retries - 1:
-                raise
-            time.sleep(delay)
-
+_ST_RESERVED_NAMES = re.compile(
+    # Windows also reserves clock$ and the superscript forms com1-com9 /
+    # lpt1-lpt9, which the original pattern missed.
+    r'(?i)^(con|prn|aux|nul|clock\$|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$'
+)
 
 def sanitize_st_filename(name: str) -> str:
     """Sanitize a character name for use as a SillyTavern PNG filename.
@@ -62,6 +50,19 @@ def st_filename_for(card: CharacterCard) -> str:
     return f"{base}.png"
 
 
+def _fs_key(name: str) -> str:
+    """Case-folded key for comparing filenames on the target filesystem.
+
+    ``os.path.normcase`` is a **no-op on POSIX**, yet the default macOS volume
+    (APFS/HFS+) is case-insensitive. Comparing with it there meant ``card.png``
+    looked free when ``Card.png`` already existed, and the push silently
+    overwrote an unrelated character. Case-fold unconditionally: over-resolving
+    on a case-sensitive Linux volume only costs a harmless ``_1`` suffix,
+    whereas under-resolving destroys a card.
+    """
+    return (name or '').casefold()
+
+
 def resolve_st_filename(
     base_name: str,
     existing: set[str],
@@ -70,28 +71,63 @@ def resolve_st_filename(
     """Resolve a unique filename in the ST characters directory.
 
     If *linked_name* is given (the card is already linked to a specific ST
-    file), reuse it so pushes overwrite the same file.  Otherwise, if
-    *base_name* collides with an *existing* filename, append ``_1``, ``_2``
-    … suffixes until unique — matching ST's ``getPngName`` behavior.
-
-    Comparison uses ``os.path.normcase`` so that on case-insensitive
-    filesystems (Windows, macOS default) "Noah.png" and "noah.png" are
-    treated as the same file.
+    file), reuse it so pushes overwrite the same file - but only when nothing
+    else in the directory claims that name; otherwise the link is stale (a
+    case-only rename, or the file was replaced) and reusing it would clobber
+    that card.  Otherwise, if *base_name* collides with an *existing*
+    filename, append ``_1``, ``_2``, ... suffixes until unique, matching ST's
+    ``getPngName`` behavior.
     """
+    existing_norm = {_fs_key(f) for f in existing}
     if linked_name:
-        return linked_name
-    existing_norm = {os.path.normcase(f) for f in existing}
+        # The link names the file this card owns. Reuse it unless a
+        # *different* existing file would be overwritten.
+        if _fs_key(linked_name) not in existing_norm or linked_name in existing:
+            return linked_name
+        logger.info(
+            "ST link '%s' collides with an existing file; resolving a unique name",
+            linked_name,
+        )
     candidate = base_name
-    if os.path.normcase(candidate) not in existing_norm:
+    if _fs_key(candidate) not in existing_norm:
         return candidate
     stem = Path(base_name).stem
     suffix = Path(base_name).suffix
     i = 1
     while True:
         candidate = f"{stem}_{i}{suffix}"
-        if os.path.normcase(candidate) not in existing_norm:
+        if _fs_key(candidate) not in existing_norm:
             return candidate
         i += 1
+
+
+def _canonical_json_value(value):
+    """Recursively normalise a JSON value for hashing.
+
+    Two semantically-identical cards must hash the same even when a round-trip
+    through another tool changed an int to a float or an int to its string form
+    (``1`` vs ``1.0`` vs ``"1"``); otherwise every ST re-save looks like a change
+    on both sides and the pair is permanently reported as a conflict.
+    """
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            num = float(value)
+        except ValueError:
+            return value
+        if num.is_integer() and value.strip() == str(int(num)):
+            return int(num)
+        return value
+    if isinstance(value, dict):
+        return {str(k): _canonical_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_json_value(v) for v in value]
+    return value
 
 
 def compute_card_hash(card_data: dict) -> str:
@@ -103,7 +139,10 @@ def compute_card_hash(card_data: dict) -> str:
     represent the same content — only the format marker differs.
     """
     normalized = {k: v for k, v in card_data.items() if k not in ('spec', 'spec_version')}
-    canonical = json.dumps(normalized, sort_keys=True, ensure_ascii=False, default=str)
+    canonical = json.dumps(
+        _canonical_json_value(normalized), sort_keys=True,
+        ensure_ascii=False, default=str, allow_nan=False,
+    )
     return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
 
 
@@ -157,6 +196,7 @@ class ExplorerSyncEntry:
     st_avatar_url: Optional[str]
     st_sync_hash: Optional[str]
     current_hash: str
+    thumbnail_path: str = ''
 
 
 @dataclass
@@ -195,7 +235,15 @@ def list_st_characters(characters_dir: str | Path) -> list[StCardEntry]:
     if not cdir.is_dir():
         return []
     entries: list[StCardEntry] = []
-    for p in sorted(cdir.glob('*.png')):
+    # iterdir + suffix compare rather than glob('*.png'): glob is
+    # case-sensitive on Linux, so a '.PNG' card was invisible to both the scan
+    # and collision detection (and could then be overwritten).
+    for p in sorted(cdir.iterdir()):
+        if not p.is_file() or p.suffix.lower() != '.png':
+            continue
+        if p.name.startswith('.ste-'):
+            # Our own staging files from a crashed push; never a real card.
+            continue
         try:
             raw = read_chara_card(p)
             if raw is None:
@@ -240,6 +288,7 @@ def build_explorer_entries(db_rows: list[dict]) -> list[ExplorerSyncEntry]:
             st_avatar_url=row.get('st_avatar_url'),
             st_sync_hash=row.get('st_sync_hash'),
             current_hash=compute_card_hash(raw),
+            thumbnail_path=row.get('thumbnail_path') or '',
         ))
     return entries
 
@@ -284,7 +333,7 @@ def compare_libraries(
     For linked pairs, change detection uses the baseline hash
     (``explorer.st_sync_hash``) compared to each side's current hash.
     """
-    st_by_filename: dict[str, StCardEntry] = {os.path.normcase(e.filename): e for e in st_entries}
+    st_by_filename: dict[str, StCardEntry] = {_fs_key(e.filename): e for e in st_entries}
     st_by_name_creator: dict[tuple[str, str], list[StCardEntry]] = {}
     for e in st_entries:
         key = (e.name.lower(), e.creator.lower())
@@ -303,18 +352,18 @@ def compare_libraries(
                 deleted_at=d.get('deleted_at', ''),
             )
         if entry.st_avatar_url:
-            deleted_by_filename[os.path.normcase(entry.st_avatar_url)] = entry
+            deleted_by_filename[_fs_key(entry.st_avatar_url)] = entry
 
     pairs: list[SyncPair] = []
     consumed_st: set[str] = set()
 
     for ex in explorer_entries:
         if ex.st_avatar_url:
-            st = st_by_filename.get(os.path.normcase(ex.st_avatar_url))
+            st = st_by_filename.get(_fs_key(ex.st_avatar_url))
             if st is None:
                 pairs.append(SyncPair(category=SyncCategory.ONLY_EXPLORER, explorer=ex))
                 continue
-            consumed_st.add(os.path.normcase(st.filename))
+            consumed_st.add(_fs_key(st.filename))
             pairs.append(SyncPair(
                 category=_classify_linked(ex, st),
                 explorer=ex,
@@ -327,11 +376,11 @@ def compare_libraries(
         candidates = st_by_name_creator.get(key, [])
         st_match = None
         for st in candidates:
-            if os.path.normcase(st.filename) not in consumed_st:
+            if _fs_key(st.filename) not in consumed_st:
                 st_match = st
                 break
         if st_match is not None:
-            consumed_st.add(os.path.normcase(st_match.filename))
+            consumed_st.add(_fs_key(st_match.filename))
             if ex.current_hash == st_match.card_hash:
                 cat = SyncCategory.IN_SYNC
             else:
@@ -341,7 +390,7 @@ def compare_libraries(
             pairs.append(SyncPair(category=SyncCategory.ONLY_EXPLORER, explorer=ex))
 
     for st in st_entries:
-        key = os.path.normcase(st.filename)
+        key = _fs_key(st.filename)
         if key in consumed_st:
             continue
         tombstone = deleted_by_filename.get(key)
@@ -385,9 +434,16 @@ class SyncAction(Enum):
 
 @dataclass
 class SyncPlanItem:
-    """A single item in a sync plan: a pair + the action to take."""
+    """A single item in a sync plan: a pair + the action to take.
+
+    ``confirmed`` marks items whose destructive action the user explicitly
+    approved (e.g. the sync dialog's "Delete in ST" button). Unconfirmed
+    deletions re-verify the file content at execution time, because a plan
+    scanned minutes earlier can go stale before it runs.
+    """
     pair: SyncPair
     action: SyncAction
+    confirmed: bool = False
 
 
 @dataclass
@@ -490,12 +546,22 @@ def _deleted_pair_action(pair: SyncPair) -> SyncAction:
     recorded at the last sync — nothing exists on the ST side that the
     Explorer library ever saw.  If the ST copy changed afterwards, the
     pair is left for the user to resolve (e.g. via the sync dialog).
+
+    With no baseline the safety check is impossible, so the previous
+    unconditional DELETE_ST destroyed ST edits of a card that was linked but
+    never successfully synced. Surface it as a conflict instead.
     """
     tombstone = pair.tombstone
     if pair.st is None:
         return SyncAction.SKIP
-    if tombstone is None or not tombstone.st_sync_hash:
-        return SyncAction.DELETE_ST
+    if tombstone is None:
+        return SyncAction.SKIP
+    if not tombstone.st_sync_hash:
+        logger.info(
+            "No sync baseline for deleted card '%s'; not deleting the ST copy",
+            pair.st.filename,
+        )
+        return SyncAction.SKIP
     if pair.st.card_hash == tombstone.st_sync_hash:
         return SyncAction.DELETE_ST
     return SyncAction.SKIP
@@ -549,6 +615,67 @@ def build_pull_all_plan(pairs: list[SyncPair]) -> list[SyncPlanItem]:
     return plan
 
 
+def _sweep_staging_files(cdir: Path, max_age_seconds: float = 3600.0) -> None:
+    """Delete our own stale ``.ste-*.tmp`` staging files from *cdir*.
+
+    A crash or hard kill skips the ``finally`` cleanup.  Only files older than
+    *max_age_seconds* are removed, so a concurrent push's staging file is never
+    deleted out from under it.
+    """
+    cutoff = time.time() - max_age_seconds
+    try:
+        stale = list(cdir.glob('.ste-*.tmp'))
+    except OSError:
+        return
+    for path in stale:
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                logger.info("Removed stale sync staging file %s", path)
+        except OSError:
+            pass
+
+
+def _write_placeholder_png(dest: Path, thumb_path: str = '') -> str:
+    """Write a usable base PNG at *dest* and return its path.
+
+    Used when a card has no PNG on disk (e.g. it was imported from JSON).
+    Without this the push wrote a blank 400x600 grey rectangle, so such a card
+    lost its avatar in SillyTavern permanently.  The cached thumbnail is used
+    when available so the pushed card still shows the character; otherwise a
+    neutral placeholder is drawn.
+    """
+    from PIL import Image, ImageDraw
+    img = None
+    if thumb_path:
+        try:
+            from src import vault
+            img = vault.open_image(thumb_path).convert('RGBA')
+        except Exception:
+            img = None
+    if img is None:
+        img = Image.new('RGBA', (400, 600), (60, 60, 60, 255))
+        try:
+            draw = ImageDraw.Draw(img)
+            bbox = draw.textbbox((0, 0), 'No image')
+            draw.text(
+                ((img.width - bbox[2]) // 2, (img.height - bbox[3]) // 2),
+                'No image', fill=(200, 200, 200, 255),
+            )
+        except (AttributeError, OSError):
+            pass   # a font backend without textbbox; the flat fill is fine
+    else:
+        resample = getattr(Image, 'LANCZOS', Image.BICUBIC)
+        img = img.resize((400, 600), resample)
+    # Vault policy applies: staging temps outside the data dir stay plaintext
+    # (SillyTavern must be able to read them), library copies get sealed.
+    from src import vault
+    buf = io.BytesIO()
+    img.save(buf, 'PNG')
+    vault.write_bytes(dest, buf.getvalue())
+    return str(dest)
+
+
 def push_card_to_st(
     explorer_row: dict,
     card_data: dict,
@@ -572,22 +699,26 @@ def push_card_to_st(
     cdir = Path(characters_dir)
     cdir.mkdir(parents=True, exist_ok=True)
     target_path = cdir / target_name
-    # Unique hidden staging file in the same directory so os.replace stays
-    # atomic; deterministic names like "_tmp_<name>.png" would flash up as
-    # broken characters in ST's directory listing (and collide across
-    # concurrent operations).
-    temp_target = unique_temp_path(cdir, '.ste-push-', '.png')
+    # Clear staging files left behind by a hard kill (a crash skips the
+    # finally-cleanup) so the directory doesn't accumulate debris.
+    _sweep_staging_files(cdir)
+    # The staging file lives in the same directory so os.replace stays atomic,
+    # but uses a .tmp suffix: a .png there is a real card as far as
+    # SillyTavern is concerned, so a hard kill mid-push used to leave a phantom
+    # character in the library.
+    temp_target = unique_temp_path(cdir, '.ste-push-', '.tmp')
     temp_source: Optional[Path] = None
 
     try:
         if source_path and Path(source_path).suffix.lower() == '.png' and Path(source_path).exists():
             source_png = source_path
         else:
-            from PIL import Image
-            temp_source = unique_temp_path(cdir, '.ste-src-', '.png')
-            img = Image.new('RGBA', (400, 600), (60, 60, 60, 255))
-            img.save(temp_source, 'PNG')
-            source_png = str(temp_source)
+            # No PNG to use as the image base: fall back to the cached
+            # thumbnail, or a placeholder card. A bare grey rectangle here
+            # permanently lost the avatar of every JSON-imported card.
+            temp_source = unique_temp_path(cdir, '.ste-src-', '.tmp')
+            source_png = _write_placeholder_png(
+                temp_source, explorer_row.get('thumbnail_path', ''))
 
         write_chara_card_dual(source_png, temp_target, card_data)
         atomic_replace(temp_target, target_path)
@@ -635,8 +766,10 @@ def pull_card_from_st(st_entry: StCardEntry, db) -> PullResult:
             char_id = existing['id']
             source = existing.get('source_path', '')
             if source and Path(source).suffix.lower() == '.png' and Path(source).exists():
-                # Atomic copy: never leaves a truncated PNG at the library path.
-                atomic_copy(str(st_entry.path), source)
+                # Atomic vault-aware copy: never leaves a truncated PNG at the
+                # library path, and seals the pulled copy when encryption is on.
+                from src import vault
+                vault.import_external(str(st_entry.path), source)
                 db.update_card(char_id, card, regen_thumbnail=True, skip_file_write=True)
             else:
                 # Import the replacement FIRST; only remove the old row once
@@ -661,7 +794,22 @@ def pull_card_from_st(st_entry: StCardEntry, db) -> PullResult:
                         "Could not migrate metadata from superseded card %s", char_id,
                     )
                 try:
-                    db.remove_card(char_id, delete_files=False, record_tombstone=False)
+                    # The chat history belongs to the character, not the row:
+                    # move it to the new id before the old row goes away.
+                    migrate = getattr(db, 'migrate_chat_sessions', None)
+                    if migrate is not None:
+                        migrate(char_id, new_id)
+                except Exception:
+                    logger.warning(
+                        "Could not migrate chat sessions from superseded card %s", char_id,
+                    )
+                try:
+                    db.remove_card(
+                        char_id,
+                        delete_files=False,
+                        record_tombstone=False,
+                        delete_sessions=False,
+                    )
                 except Exception:
                     logger.warning("Could not remove superseded card %s", char_id)
                 char_id = new_id
@@ -683,18 +831,19 @@ def pull_card_from_st(st_entry: StCardEntry, db) -> PullResult:
 def _find_by_st_avatar_url_nocase(db, filename: str):
     """Case-insensitive fallback lookup for an ST link.
 
-    Comparison elsewhere uses ``os.path.normcase`` (Windows paths are
-    case-insensitive), but the DB lookup is byte-exact — a case-only rename
-    on the ST side would otherwise classify as a pull with no matching link.
+    The DB lookup is byte-exact, so a case-only rename on the ST side would
+    otherwise classify as a pull with no matching link.  ``_fs_key`` is used
+    rather than ``os.path.normcase`` so this also works on macOS, whose default
+    volume is case-insensitive.
     """
     try:
         rows = db.get_all()
     except AttributeError:
         return None
-    wanted = os.path.normcase(filename)
+    wanted = _fs_key(filename)
     for row in rows:
         url = row.get('st_avatar_url')
-        if url and os.path.normcase(url) == wanted:
+        if url and _fs_key(url) == wanted:
             return row
     return None
 
@@ -731,9 +880,18 @@ def bulk_sync(
     # Collision resolution must consider EVERY png in the directory —
     # including files with no parseable card data (plain images ST keeps
     # there). On case-insensitive filesystems a name that only matches an
-    # unparsed file would silently overwrite it.
+    # unparsed file would silently overwrite it. ``glob('*.png')`` is not
+    # enough: its matching is case-sensitive even on macOS's default
+    # case-insensitive volume, so ``Foo.PNG`` was invisible and ``Foo.png``
+    # was handed out over it.
     cdir = Path(characters_dir)
-    existing_st = {p.name for p in cdir.glob('*.png')} if cdir.is_dir() else set()
+    existing_st = (
+        {
+            p.name for p in cdir.iterdir()
+            if p.is_file() and p.suffix.lower() == '.png'
+        }
+        if cdir.is_dir() else set()
+    )
 
     for i, item in enumerate(plan):
         if is_cancelled is not None and is_cancelled():
@@ -772,7 +930,12 @@ def bulk_sync(
                 summary.errors.append(f"{pair.explorer.name}: no card data")
                 continue
             result = push_card_to_st(
-                {'id': pair.explorer.char_id, 'source_path': source},
+                {
+                    'id': pair.explorer.char_id,
+                    'source_path': source,
+                    # Used as the image base for JSON-imported cards.
+                    'thumbnail_path': pair.explorer.thumbnail_path,
+                },
                 raw,
                 characters_dir,
                 existing_st,
@@ -799,6 +962,20 @@ def bulk_sync(
             try:
                 st_path = Path(pair.st.path)
                 if st_path.exists():
+                    # An unconfirmed (bulk-plan) delete runs on a hash taken
+                    # at scan time. If the ST file changed since, re-verify it
+                    # against the sync baseline before destroying anything.
+                    tombstone = pair.tombstone
+                    baseline = getattr(tombstone, 'st_sync_hash', None) if tombstone else None
+                    if not item.confirmed and baseline:
+                        fresh = read_card_data(st_path)
+                        if fresh is None or compute_card_hash(fresh) != baseline:
+                            summary.errors.append(
+                                f"{pair.st.filename}: ST file changed since the last "
+                                "sync; not deleted (delete it from the SillyTavern "
+                                "folder directly if that is intended)"
+                            )
+                            continue
                     st_path.unlink()
                     logger.info("Deleted ST file: %s", st_path)
                 # Unlink any explorer card that was linked to this file

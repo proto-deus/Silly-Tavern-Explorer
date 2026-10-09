@@ -82,7 +82,7 @@ class STSyncDialog(QDialog):
 
         header_row = QHBoxLayout()
         self._path_label = QLabel('')
-        self._path_label.setStyleSheet('font-size: 12px; color: #ccc;')
+        self._path_label.setStyleSheet('color: #ccc;')
         header_row.addWidget(self._path_label)
         header_row.addStretch()
         self._configure_btn = QPushButton('Configure...')
@@ -110,7 +110,7 @@ class STSyncDialog(QDialog):
         self._detail_text.setReadOnly(True)
         self._detail_text.setMaximumHeight(180)
         self._detail_text.setStyleSheet(
-            'font-family: Consolas, "Courier New", monospace; font-size: 11px;'
+            'font-family: Consolas, "Courier New", monospace; '
         )
         detail_layout.addWidget(self._detail_text)
         splitter.addWidget(detail_container)
@@ -158,7 +158,7 @@ class STSyncDialog(QDialog):
         layout.addLayout(btn_row)
 
         self._status_label = QLabel('')
-        self._status_label.setStyleSheet('color: #aaa; font-size: 11px;')
+        self._status_label.setStyleSheet('color: #aaa; ')
         layout.addWidget(self._status_label)
 
         self._update_path_label()
@@ -403,7 +403,7 @@ class STSyncDialog(QDialog):
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
-        plan = [SyncPlanItem(pair, SyncAction.DELETE_ST)]
+        plan = [SyncPlanItem(pair, SyncAction.DELETE_ST, confirmed=True)]
         self._start_sync_worker(plan)
 
     # ---- bulk sync ----
@@ -459,7 +459,10 @@ class STSyncDialog(QDialog):
                 summary.message() + "\n\nErrors:\n" + '\n'.join(summary.errors[:20]),
             )
         self.sync_completed.emit()
-        self._pairs = pairs
+        if pairs is not None:
+            # None = the rescan failed; keep the previous tree rather than
+            # wiping it with "No cards to compare".
+            self._pairs = pairs
         self._refresh_tree()
         self._set_busy(False)
 

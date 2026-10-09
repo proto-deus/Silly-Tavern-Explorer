@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from pathlib import Path
+from typing import Any
 
 from src.card_models import BookEntry, CharacterBook
-from src.fs_utils import atomic_write_bytes
+from src import vault
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +68,10 @@ def list_lorebooks() -> list[dict]:
     directory = get_lorebooks_dir()
     for path in sorted(directory.glob('*.json'), key=lambda p: p.name.lower()):
         try:
-            raw = json.loads(path.read_text(encoding='utf-8'))
+            raw = json.loads(vault.read_text(path))
             book = parse_book_json(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError,
+                TypeError, vault.VaultError) as exc:
             logger.warning("Skipping unreadable lorebook %s: %s", path.name, exc)
             continue
         result.append({
@@ -88,9 +91,10 @@ def load_lorebook(filename: str) -> CharacterBook | None:
     if not path.exists():
         return None
     try:
-        raw = json.loads(path.read_text(encoding='utf-8'))
+        raw = json.loads(vault.read_text(path))
         return parse_book_json(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError,
+            TypeError, vault.VaultError) as exc:
         logger.warning("Failed to load lorebook %s: %s", filename, exc)
         return None
 
@@ -101,26 +105,77 @@ def save_lorebook(filename: str, book: CharacterBook) -> str:
     if not safe.endswith('.json'):
         safe += '.json'
     data = json.dumps(book.to_dict(), ensure_ascii=False, indent=2)
-    atomic_write_bytes(get_lorebooks_dir() / safe, data.encode('utf-8'))
+    vault.write_bytes(get_lorebooks_dir() / safe, data.encode('utf-8'))
     return safe
 
 
 def delete_lorebook(filename: str) -> bool:
+    """Delete a lorebook file.
+
+    Also drops its sync baseline: leaving it behind grew the state file without
+    bound, and a book later recreated under the same filename would inherit a
+    stale baseline and show as permanently changed.
+    """
     path = get_lorebooks_dir() / Path(filename).name
     try:
         path.unlink(missing_ok=True)
-        return True
     except OSError as exc:
         logger.warning("Failed to delete lorebook %s: %s", filename, exc)
         return False
+    try:
+        from src.lorebook_sync import forget_pair
+        forget_pair(filename)
+    except Exception:
+        logger.debug("Could not clear the sync baseline for %s", filename,
+                     exc_info=True)
+    return True
 
 
 # ---------------------------------------------------------------------------
 # Format conversion
 # ---------------------------------------------------------------------------
 
-_ST_POSITION_TO_SPEC = {0: 'before_char', 1: 'after_char'}
-_SPEC_POSITION_TO_ST = {'before_char': 0, 'after_char': 1}
+# SillyTavern's native ``position`` values. 0/1 are the classic before/after
+# character placements; 2/3/4 are the extended ones and MUST round-trip, or a
+# pull-then-push silently relocates every entry in the book.
+_ST_POSITION_TO_SPEC = {
+    0: 'before_char',
+    1: 'after_char',
+    2: 'before_EM',
+    3: 'after_EM',
+    4: 'at_depth',
+}
+_SPEC_POSITION_TO_ST = {
+    'before_char': 0,
+    'after_char': 1,
+    'before_em': 2,
+    'after_em': 3,
+    'at_depth': 4,
+}
+# Canonical (lowercase) spelling -> stored spelling, used to normalise the
+# several equivalent spellings a card or an ST export can carry.
+_POSITION_CANONICAL = {
+    'before_char': 'before_char',
+    'after_char': 'after_char',
+    'before_em': 'before_EM',
+    'after_em': 'after_EM',
+    'at_depth': 'at_depth',
+}
+
+
+def _canonical_position(position: str) -> str:
+    """Normalise a stored position string to its canonical spec spelling.
+
+    Comparison is case-insensitive and tolerant of separators so that values
+    written by older versions (or by ST, which spells them 'before_EM') all
+    map onto the same canonical form.  Unknown values are passed through
+    unchanged rather than silently rewritten.
+    """
+    p = (position or '').strip()
+    if not p:
+        return 'before_char'
+    key = p.lower().replace('-', '_').replace(' ', '_')
+    return _POSITION_CANONICAL.get(key, p)
 
 
 def _entry_items(entries) -> list[dict]:
@@ -141,6 +196,50 @@ def _entry_items(entries) -> list[dict]:
         return [v for _, v in sorted(entries.items(), key=_key_order)
                 if isinstance(v, dict)]
     return []
+
+
+def _safe_int(val: Any, default: int = 0) -> int:
+    """Coerce *val* to int without raising.
+
+    Hand-edited or corrupt world-info files can carry ``"order": "abc"`` or
+    ``NaN``/``Infinity`` (which ``json.loads`` accepts); one bad entry must
+    not abort parsing of the whole book.
+    """
+    if isinstance(val, bool):
+        return default
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        try:
+            return int(val)
+        except (ValueError, OverflowError):
+            return default
+    if isinstance(val, str):
+        try:
+            return int(float(val.strip()))
+        except (ValueError, OverflowError):
+            return default
+    return default
+
+
+def _opt_book_int(val: Any) -> int | None:
+    """Like ``_safe_int`` but returns None for absent or non-coercible values.
+
+    A corrupt ``"scan_depth": "auto"`` must round-trip as absent rather than
+    being silently rewritten to ``0``.
+    """
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val) if math.isfinite(val) else None
+    if isinstance(val, str):
+        try:
+            return int(float(val.strip()))
+        except (ValueError, OverflowError):
+            return None
+    return None
 
 
 def _st_entry_to_book_entry(raw: dict) -> BookEntry:
@@ -165,17 +264,20 @@ def _st_entry_to_book_entry(raw: dict) -> BookEntry:
     if isinstance(position_raw, bool):
         position_raw = int(position_raw)
     if isinstance(position_raw, (int, float)):
-        position = _ST_POSITION_TO_SPEC.get(int(position_raw), 'before_char')
+        position = _ST_POSITION_TO_SPEC.get(_safe_int(position_raw, 0), 'before_char')
     elif isinstance(position_raw, str) and position_raw.strip():
-        position = position_raw.strip()
+        position = _canonical_position(position_raw)
     else:
         position = 'before_char'
 
-    depth_raw = raw.get('depth')
-    depth = depth_raw if isinstance(depth_raw, (int, float)) and not isinstance(depth_raw, bool) else 4
+    depth = _safe_int(raw.get('depth'), 4)
 
     uid = raw.get('uid')
-    if isinstance(uid, (int, float)) and not isinstance(uid, bool):
+    if isinstance(uid, bool):
+        pass
+    elif isinstance(uid, int):
+        extensions['uid'] = uid
+    elif isinstance(uid, float) and math.isfinite(uid):
         extensions['uid'] = int(uid)
 
     return BookEntry(
@@ -184,10 +286,10 @@ def _st_entry_to_book_entry(raw: dict) -> BookEntry:
         content=str(raw.get('content') or ''),
         extensions=extensions,
         enabled=not bool(raw.get('disable', False)),
-        insertion_order=int(raw.get('order') or 0),
+        insertion_order=_safe_int(raw.get('order'), 0),
         case_sensitive=bool(raw.get('caseSensitive', False)),
         match_whole_words=bool(raw.get('matchWholeWords', False)),
-        depth=int(depth) if depth is not None else 4,
+        depth=depth,
         position=position,
     )
 
@@ -206,23 +308,72 @@ def st_world_info_to_book(raw: dict) -> CharacterBook:
         uid = entry.extensions.get('uid')
         return (0, int(uid)) if isinstance(uid, int) else (1, 0)
     entries.sort(key=_uid_key)
+    # Preserve book-level fields the model doesn't know about (and any
+    # ``extensions`` dict) so a pull -> edit -> push round-trip never strips
+    # keys from the user's ST world file.
+    known = {
+        'name', 'description', 'scan_depth', 'token_budget',
+        'recursive_scanning', 'extensions', 'entries',
+    }
+    ext = raw.get('extensions')
+    extensions = dict(ext) if isinstance(ext, dict) else {}
+    extra = {k: v for k, v in raw.items() if k not in known}
     return CharacterBook(
         name=str(raw.get('name') or ''),
         description=str(raw.get('description') or ''),
-        scan_depth=raw.get('scan_depth'),
-        token_budget=raw.get('token_budget'),
+        scan_depth=_opt_book_int(raw.get('scan_depth')),
+        token_budget=_opt_book_int(raw.get('token_budget')),
         recursive_scanning=bool(raw.get('recursive_scanning', False)),
-        extensions={},
+        extensions=extensions,
         entries=entries,
+        extra_data=extra,
     )
 
 
 def book_to_st_world_info(book: CharacterBook) -> dict:
     """Serialize *book* into SillyTavern's native world-info JSON shape."""
     entries_out: dict[str, dict] = {}
-    for i, entry in enumerate(book.entries):
+    # Pass 1: resolve the explicit uid of every entry. A uid is required (ST
+    # keys its entry map by it), so entries the Explorer created carry none.
+    # Falling back to the *list index* would collide with a real ST uid the
+    # moment the user inserts or reorders an entry, and because entries_out is
+    # a dict the colliding entry would silently overwrite (and lose) another.
+    resolved: list[tuple[BookEntry, dict, int | None]] = []
+    claimed: set[int] = set()
+    for entry in book.entries:
         ext = dict(entry.extensions)
-        uid = ext.pop('uid', i)
+        raw_uid = ext.pop('uid', None)
+        uid: int | None = None
+        if isinstance(raw_uid, bool):
+            uid = None
+        elif isinstance(raw_uid, int):
+            uid = raw_uid
+        elif isinstance(raw_uid, float) and raw_uid.is_integer():
+            uid = int(raw_uid)
+        elif isinstance(raw_uid, str) and raw_uid.strip().lstrip('-').isdigit():
+            uid = int(raw_uid.strip())
+        if uid is not None:
+            claimed.add(uid)
+        resolved.append((entry, ext, uid))
+
+    # Pass 2: keep explicit uids in order, allocate the lowest free uid to
+    # everything else.
+    used: set[int] = set()
+    spare = 0
+    final: list[tuple[BookEntry, dict, int]] = []
+    for entry, ext, uid in resolved:
+        if uid is None or uid in used:
+            if uid is not None:
+                logger.warning(
+                    "Duplicate lorebook entry uid %s in book %r; reassigning",
+                    uid, book.name)
+            while spare in claimed or spare in used:
+                spare += 1
+            uid = spare
+        used.add(uid)
+        final.append((entry, ext, uid))
+
+    for entry, ext, uid in final:
         secondary = ext.pop('keysecondary', [])
         out: dict = {
             'uid': uid,
@@ -233,7 +384,8 @@ def book_to_st_world_info(book: CharacterBook) -> dict:
             'constant': bool(ext.pop('constant', False)),
             'selective': True,
             'order': entry.insertion_order,
-            'position': _SPEC_POSITION_TO_ST.get(entry.position, 0),
+            'position': _SPEC_POSITION_TO_ST.get(
+                _canonical_position(entry.position).lower(), 0),
             'disable': not entry.enabled,
             'excludeRecursion': bool(ext.pop('excludeRecursion', False)),
             'preventRecursion': bool(ext.pop('preventRecursion', False)),
@@ -247,7 +399,8 @@ def book_to_st_world_info(book: CharacterBook) -> dict:
         }
         out.update(ext)
         entries_out[str(uid)] = out
-    data: dict = {'entries': entries_out}
+    data: dict = dict(book.extra_data)
+    data.update({'entries': entries_out})
     if book.name:
         data['name'] = book.name
     if book.description:
@@ -258,6 +411,8 @@ def book_to_st_world_info(book: CharacterBook) -> dict:
         data['token_budget'] = book.token_budget
     if book.recursive_scanning:
         data['recursive_scanning'] = book.recursive_scanning
+    if book.extensions:
+        data['extensions'] = dict(book.extensions)
     return data
 
 
@@ -404,7 +559,7 @@ def _generated_item_to_entry(item: dict, index: int) -> BookEntry | None:
     if not isinstance(name, str):
         name = str(name)
     order_raw = item.get('insertion_order', item.get('order'))
-    order = order_raw if isinstance(order_raw, (int, float)) and not isinstance(order_raw, bool) else index * 100
+    order = _safe_int(order_raw, index * 100)
     return BookEntry(
         name=name.strip(),
         keys=_normalize_generated_keys(item.get('keys')),

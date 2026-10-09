@@ -4,10 +4,11 @@ import logging
 import json
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from copy import deepcopy
+
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
-    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
@@ -25,10 +26,26 @@ from src.card_models import CharacterCard
 from src.card_parser import read_card_data, replace_card_image, write_chara_card_dual
 from src.database import LibraryDatabase, sanitize_filename
 from src.token_counter import count_card_tokens, count_tokens
+from src.ui.dialog_helper import exec_dialog
+from src.ui.form_undo import FormSnapshot, UndoStack
 from src.ui.widgets.collapsible_section import CollapsibleSection
 from src.ui.widgets.tag_widget import TagWidget
 
 logger = logging.getLogger(__name__)
+
+# In-flight tokenizer warmup threads. Kept referenced until they finish and
+# joined at shutdown (see wait_for_token_warmup): destroying a running
+# QThread aborts the process.
+_WARMUP_THREADS: list[QThread] = []
+
+
+def wait_for_token_warmup(timeout_ms: int = 5000) -> None:
+    """Join any in-flight tokenizer warmup thread. Safe to call at shutdown."""
+    for thread in list(_WARMUP_THREADS):
+        try:
+            thread.wait(timeout_ms)
+        except RuntimeError:
+            pass   # already deleted
 
 
 class DirtyState:
@@ -182,6 +199,10 @@ class EditTab(QWidget):
         # save() refuses to write unless these match.
         self._form_loaded_for_id: int | None = None
         self._current_card: CharacterCard | None = None
+        # Whole-form snapshot history (Ctrl+Z / Ctrl+Shift+Z). Seeded after
+        # each successful load so undo never walks into the previous card.
+        self._undo_stack = UndoStack(limit=50)
+        self._actions: dict[str, object] = {}
         self._dirty_state = DirtyState()
         self._character_book_dict: dict | None = None
         self._html_preview_mode: bool = False
@@ -193,6 +214,17 @@ class EditTab(QWidget):
         self._token_timer.setSingleShot(True)
         self._token_timer.setInterval(300)
         self._token_timer.timeout.connect(self._do_update_token_count)
+        # Undo/redo operate on whole-form snapshots; coalesce the debounce
+        # window's keystrokes into a single undoable step.
+        self._undo_timer = QTimer(self)
+        self._undo_timer.setSingleShot(True)
+        self._undo_timer.setInterval(900)
+        self._undo_timer.timeout.connect(self._commit_undo_snapshot)
+
+        # Warm the BPE table off the UI thread. The first count_tokens() call
+        # lazily loads (or, offline, fails to load) a ~1.7 MB vocabulary, which
+        # froze the window for seconds on the first keystroke in the editor.
+        QTimer.singleShot(0, self._prewarm_token_counter)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -461,11 +493,126 @@ class EditTab(QWidget):
                   self._sys_edit, self._phi_edit, self._first_edit,
                   self._example_edit, self._notes_edit):
             w.textChanged.connect(self._mark_dirty)
+        # User notes participate in undo snapshots and are saved with the
+        # card: without this wiring an undo could silently revert typed
+        # notes while the dirty flag still claimed "no changes".
+        self._user_notes_edit.textChanged.connect(self._mark_dirty)
         self._talk_spin.valueChanged.connect(self._mark_dirty)
         self._tag_widget.tags_changed.connect(self._mark_dirty)
 
     def _mark_dirty(self, *args) -> None:
         self._dirty_state.mark_dirty()
+        if not self._dirty_state.is_loading:
+            # Debounced: a snapshot per keystroke would fill the history with
+            # single-character steps and make undo useless.
+            self._undo_timer.start()
+
+    # ---- undo / redo ----
+
+    def _take_snapshot(self, label: str = '') -> FormSnapshot:
+        """Capture the current editable state of the form."""
+        return FormSnapshot(
+            values={
+                'name': self._name_edit.text(),
+                'creator': self._creator_edit.text(),
+                'version': self._version_edit.text(),
+                'description': self._get_field_text(self._desc_edit),
+                'personality': self._get_field_text(self._pers_edit),
+                'scenario': self._get_field_text(self._scen_edit),
+                'system_prompt': self._get_field_text(self._sys_edit),
+                'post_history': self._get_field_text(self._phi_edit),
+                'first_mes': self._get_field_text(self._first_edit),
+                'mes_example': self._get_field_text(self._example_edit),
+                'creator_notes': self._get_field_text(self._notes_edit),
+                'user_notes': self._user_notes_edit.toPlainText(),
+                'talkativeness': self._talk_spin.value(),
+                'tags': list(self._tag_widget.get_tags()),
+                'alt_greetings': self._collect_alt_greetings(),
+            },
+            character_book=deepcopy(self._character_book_dict),
+            extensions=deepcopy(
+                self._current_card.extensions if self._current_card else {}),
+            label=label,
+        )
+
+    def _apply_snapshot(self, snapshot: FormSnapshot) -> None:
+        """Restore *snapshot* into the form without disturbing undo history."""
+        self._dirty_state.begin_update()
+        try:
+            v = snapshot.values
+            self._name_edit.setText(v.get('name', ''))
+            self._creator_edit.setText(v.get('creator', ''))
+            self._version_edit.setText(v.get('version', ''))
+            for field, key in (
+                (self._desc_edit, 'description'),
+                (self._pers_edit, 'personality'),
+                (self._scen_edit, 'scenario'),
+                (self._sys_edit, 'system_prompt'),
+                (self._phi_edit, 'post_history'),
+                (self._first_edit, 'first_mes'),
+                (self._example_edit, 'mes_example'),
+                (self._notes_edit, 'creator_notes'),
+            ):
+                self._set_field_text(field, v.get(key, ''))
+            self._user_notes_edit.setPlainText(v.get('user_notes', ''))
+            self._talk_spin.setValue(v.get('talkativeness', 0.5))
+            self._tag_widget.set_tags(list(v.get('tags', [])))
+            self._rebuild_alt_greetings(list(v.get('alt_greetings', [])))
+            self._character_book_dict = deepcopy(snapshot.character_book)
+            if self._current_card is not None:
+                self._current_card.extensions = deepcopy(snapshot.extensions)
+        finally:
+            self._dirty_state.end_update()
+        if self._undo_stack.is_at_baseline:
+            # Undoing back to the pristine state is not an unsaved change.
+            self._dirty_state.clear()
+        else:
+            self._dirty_state.mark_dirty()
+        # The restored texts bypassed the debounced recount (see
+        # _update_token_count): refresh the labels once, after the update.
+        self._token_timer.start()
+
+    def undo(self) -> None:
+        """Revert the form to its previous committed state."""
+        if not self._undo_stack.can_undo:
+            self.status_message.emit('Nothing to undo', 2000)
+            return
+        self._undo_timer.stop()
+        snapshot = self._undo_stack.undo()
+        if snapshot is None:
+            return
+        self._apply_snapshot(snapshot)
+        self.status_message.emit('Undone', 2000)
+        self._update_undo_actions()
+
+    def redo(self) -> None:
+        """Re-apply the state that undo reverted."""
+        if not self._undo_stack.can_redo:
+            self.status_message.emit('Nothing to redo', 2000)
+            return
+        self._undo_timer.stop()
+        snapshot = self._undo_stack.redo()
+        if snapshot is None:
+            return
+        self._apply_snapshot(snapshot)
+        self.status_message.emit('Redone', 2000)
+        self._update_undo_actions()
+
+    def _commit_undo_snapshot(self) -> None:
+        """Fold the debounced edits into one undoable step."""
+        if self._dirty_state.is_loading or self._current_id is None:
+            return
+        self._undo_stack.commit(self._take_snapshot())
+        self._update_undo_actions()
+
+    def _update_undo_actions(self) -> None:
+        for action_id, enabled in (
+            ('edit.undo', self._undo_stack.can_undo),
+            ('edit.redo', self._undo_stack.can_redo),
+        ):
+            action = self._actions.get(action_id)
+            if action is not None:
+                action.setEnabled(enabled)
 
     def _on_settings_requested(self) -> None:
         self.settings_requested.emit()
@@ -474,11 +621,11 @@ class EditTab(QWidget):
         from src.ui.widgets.new_character_dialog import NewCharacterDialog
         dlg = NewCharacterDialog(self.db, self)
         dlg.card_added.connect(self.card_added)
-        dlg.exec()
+        exec_dialog(dlg)
 
     def _make_label(self, text: str) -> QLabel:
         lbl = QLabel(text)
-        lbl.setStyleSheet('font-size: 12px; font-weight: bold; color: #ccc; margin-top: 6px;')
+        lbl.setStyleSheet('font-weight: bold; color: #ccc; margin-top: 6px;')
         return lbl
 
     def _collapse_all_sections(self) -> None:
@@ -575,34 +722,59 @@ class EditTab(QWidget):
         self._current_id = char_id
         self._load_card()
 
+    @property
+    def form_loaded_for_id(self) -> int | None:
+        """The card id whose content is currently in the form (if any)."""
+        return self._form_loaded_for_id
+
     def set_selected_id(self, char_id: int) -> None:
         """Set the selected character id without loading the card (for cross-tab sync)."""
         self._current_id = char_id
 
-    def _load_card(self) -> None:
+    def _load_card(self, token_count: int | None = None,
+                   refresh_labels: bool = True) -> None:
+        """Load the current card into the form.
+
+        *token_count* passes in a value the caller already computed (save()
+        counts the card it just wrote, so the reload does not re-tokenize it);
+        *refresh_labels* can be skipped when the per-field labels are already
+        current for the content being loaded.
+        """
         if self._current_id is None:
             return
         entry = self.db.get_by_id(self._current_id)
         if not entry:
+            # The card is gone (deleted elsewhere). Leaving the previous card's
+            # content in the form - with Save enabled - let the user keep
+            # editing and saving a card that no longer exists.
+            self._current_id = None
+            self._current_card = None
             self._form_loaded_for_id = None
+            self._clear_form()
             return
 
         source = entry.get('source_path', '')
         if not source or not Path(source).exists():
             QMessageBox.warning(self, 'Error', 'Source file not found.')
+            self._current_id = None
+            self._current_card = None
             self._form_loaded_for_id = None
+            self._clear_form()
             return
 
         raw = read_card_data(source)
         if not raw:
             QMessageBox.warning(self, 'Error', 'Could not read character card data.')
             self._form_loaded_for_id = None
+            self._clear_form()
             return
 
         self._dirty_state.begin_load()
         try:
             card = CharacterCard.from_spec_dict(raw, source)
-            card.token_count = count_card_tokens(card)
+            card.token_count = (
+                count_card_tokens(card) if token_count is None else token_count
+            )
             self._current_card = card
             self._form_loaded_for_id = self._current_id
 
@@ -638,9 +810,13 @@ class EditTab(QWidget):
             self._character_book_dict = card.character_book if isinstance(card.character_book, dict) else None
             # Compute token counts directly from the card data we already have
             # rather than triggering _update_token_count which re-gathers and re-encodes.
-            self._update_token_counts_from_card(card)
+            if refresh_labels:
+                self._update_token_counts_from_card(card)
         finally:
             self._dirty_state.end_load()
+        # Seed the undo history with the freshly loaded state.
+        self._undo_stack.reset(self._take_snapshot(f'Loaded {card.name}'))
+        self._update_undo_actions()
 
     def _gather_card(self) -> CharacterCard:
         base = self._current_card if self._current_card else CharacterCard()
@@ -729,7 +905,7 @@ class EditTab(QWidget):
         row_layout.setContentsMargins(0, 2, 0, 0)
         row_layout.setSpacing(4)
         label = QLabel(f'Greeting {idx}:')
-        label.setStyleSheet('font-size: 11px; font-weight: bold; color: #aaa;')
+        label.setStyleSheet('font-weight: bold; color: #aaa;')
         row_layout.addWidget(label)
         row_layout.addStretch()
         del_btn = QPushButton('x')
@@ -737,7 +913,7 @@ class EditTab(QWidget):
         del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         del_btn.setStyleSheet(
             'QPushButton { background: transparent; color: #999; border: none;'
-            ' padding: 0px; font-size: 11px; font-weight: bold; }'
+            ' padding: 0px; font-weight: bold; }'
             ' QPushButton:hover { color: #ff6666; }'
         )
         row_layout.addWidget(del_btn)
@@ -783,7 +959,39 @@ class EditTab(QWidget):
         )
 
     def _update_token_count(self) -> None:
+        if self._dirty_state.is_loading:
+            # Programmatic population (card load / snapshot restore) sets the
+            # counts itself; letting the debounced pass re-encode every field
+            # right afterwards doubled the work on every load and save.
+            return
         self._token_timer.start()
+
+    def _prewarm_token_counter(self) -> None:
+        """Load the tokenizer in the background so the first count is instant."""
+        thread = QThread()   # deliberately unparented: a parented thread would
+        # be destroyed with the tab at shutdown while still running.
+        thread.setObjectName('tokenizer-warmup')
+
+        def _warm() -> None:
+            try:
+                count_tokens('warmup')
+            except Exception:
+                logger.debug("Token counter warmup failed", exc_info=True)
+
+        # A plain function keeps the runnable from capturing the widget, so the
+        # thread cannot outlive it and keep it alive.
+        thread.run = _warm  # type: ignore[method-assign]
+
+        def _release() -> None:
+            try:
+                _WARMUP_THREADS.remove(thread)
+            except ValueError:
+                pass
+            thread.deleteLater()
+
+        thread.finished.connect(_release)
+        _WARMUP_THREADS.append(thread)
+        thread.start()
 
     def _do_update_token_count(self) -> None:
         # Encode each field individually once, then sum for permanent/full.
@@ -845,7 +1053,7 @@ class EditTab(QWidget):
             logger.exception("Failed to load tags before tag manager")
             return
         dlg = TagManagerDialog(self.db, self)
-        dlg.exec()
+        exec_dialog(dlg)
         # Tags may have changed across the library; refresh autocomplete and
         # reconcile only the tag list into the current form — a full card
         # reload here would silently discard unsaved edits.  Reconciliation
@@ -879,7 +1087,7 @@ class EditTab(QWidget):
     def _edit_character_book(self) -> None:
         from src.ui.widgets.character_book_editor import CharacterBookEditor
         dlg = CharacterBookEditor(self._character_book_dict, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        if exec_dialog(dlg):
             self._character_book_dict = dlg.get_book_dict()
             self._mark_dirty()
 
@@ -888,7 +1096,7 @@ class EditTab(QWidget):
             return
         from src.ui.widgets.extensions_editor import ExtensionsEditor
         dlg = ExtensionsEditor(self._current_card.extensions, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        if exec_dialog(dlg):
             self._current_card.extensions = dlg.get_extensions()
             self._mark_dirty()
 
@@ -925,7 +1133,16 @@ class EditTab(QWidget):
         """Persist the private user notes for the currently selected card."""
         if self._current_id is None:
             return
-        self.db.set_user_notes(self._current_id, self._user_notes_edit.toPlainText())
+        if self._form_loaded_for_id != self._current_id:
+            # The notes field belongs to a different card than the current
+            # selection; writing would attach them to the wrong card.
+            return
+        try:
+            self.db.set_user_notes(self._current_id, self._user_notes_edit.toPlainText())
+        except Exception as e:
+            logger.exception("Failed to save user notes for card %s", self._current_id)
+            QMessageBox.critical(self, 'Error', f"Failed to save notes: {e}")
+            return
         self.status_message.emit('Notes saved', 2000)
 
     def save(self) -> bool:
@@ -948,10 +1165,14 @@ class EditTab(QWidget):
             self.db.update_card(self._current_id, card, rename_file_on_name_change=True)
             self._dirty_state.clear()
             self.status_message.emit(f"'{card.name}' saved", 4000)
+            # The labels already describe the saved text (the gathered card
+            # *is* what was written), so only the form reload below is needed
+            # - a second token pass would re-encode everything needlessly.
+            self._update_token_counts_from_card(card)
             # Reload from disk so the editor (header, file path, in-memory
             # card) reflects the saved state, including a renamed file when
             # the character name changed.
-            self._load_card()
+            self._load_card(token_count=card.token_count, refresh_labels=False)
             self.card_updated.emit(self._current_id)
             return True
         except Exception as e:
@@ -1048,8 +1269,51 @@ class EditTab(QWidget):
         """Mark the form as clean (used after Discard in the dirty guard)."""
         self._dirty_state.clear()
 
+    def discard_edits(self) -> None:
+        """Throw away unsaved edits without any prompts.
+
+        Used by the dirty guard's "Discard" choice: merely clearing the dirty
+        flag kept the form buffer, so a later global Ctrl+S resurrected and
+        saved the content the user had explicitly discarded.
+        """
+        if self._current_id is not None and self._form_loaded_for_id == self._current_id:
+            self._load_card()
+        else:
+            self._dirty_state.clear()
+
     def revert(self) -> None:
         """Reload the current card from disk, discarding edits."""
+        # Same guard as save(): _current_id and _form_loaded_for_id can drift
+        # apart (selection changed without the dirty prompt), and reloading
+        # then wipes the form and clears the dirty flag for a card the user may
+        # still be editing.
+        if self._current_id is None:
+            return
+        if self._form_loaded_for_id != self._current_id:
+            QMessageBox.warning(
+                self, 'Revert',
+                'The editor form does not match the selected card.\n\n'
+                'Select the card again before reverting.',
+            )
+            return
+        self._load_card()
+
+    def reload_current(self) -> None:
+        """Re-read the current card from disk, keeping the selection.
+
+        Used after an external change (a SillyTavern pull rewrote the file), so
+        the form buffer cannot overwrite it on the next save. Unlike revert()
+        this is not user-initiated, so it discards silently - but it only runs
+        when the form is clean.
+        """
+        if self._current_id is None:
+            return
+        if self.is_dirty():
+            logger.info(
+                "Not reloading card %s after sync: the form has unsaved edits",
+                self._current_id,
+            )
+            return
         self._load_card()
 
     def delete_card(self) -> None:
@@ -1069,7 +1333,14 @@ class EditTab(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
         deleted_id = self._current_id
-        self.db.remove_card(deleted_id, delete_files=True)
+        try:
+            self.db.remove_card(deleted_id, delete_files=True)
+        except Exception as e:
+            # Leaving the form populated with a card the user believes they
+            # deleted is worse than reporting the failure.
+            logger.exception("Failed to delete card %s", deleted_id)
+            QMessageBox.critical(self, 'Error', f"Failed to delete card: {e}")
+            return
         self._current_id = None
         self._current_card = None
         self._form_loaded_for_id = None
@@ -1121,6 +1392,8 @@ class EditTab(QWidget):
                 section.set_token_count(0)
         finally:
             self._dirty_state.end_load()
+        self._undo_stack.reset(self._take_snapshot('Empty form'))
+        self._update_undo_actions()
 
     def export_png(self) -> None:
         """Export the current card as a PNG file (menu entry)."""
@@ -1130,7 +1403,6 @@ class EditTab(QWidget):
         """Duplicate the current card into the library with a '(copy)' suffix."""
         if self._current_id is None or self._current_card is None:
             return
-        import shutil
         import uuid
         from src.card_models import build_duplicate_card
         from src.database import _get_library_dir
@@ -1154,12 +1426,23 @@ class EditTab(QWidget):
         # failure can't escape the slot (PyQt6 aborts on slot exceptions).
         dest_path = lib_dir / f"{sanitize_filename(clone.name)[:60]}_{uuid.uuid4().hex[:8]}{ext}"
         try:
-            shutil.copy2(source, str(dest_path))
+            from src import vault
+            vault.import_external(source, str(dest_path))
             clone.source_path = str(dest_path)
             new_id = self.db.add_card(clone)
-            self.status_message.emit(f"Duplicated as '{clone.name}'", 4000)
-            self.card_added.emit(new_id)
-            self.load_card_by_id(new_id)
         except Exception as e:
             QMessageBox.critical(self, 'Error', f"Failed to duplicate: {e}")
             logger.exception("Duplicate failed")
+            return
+        self.status_message.emit(f"Duplicated as '{clone.name}'", 4000)
+        # card_added is synchronous: the main window's handler prompts about
+        # unsaved edits and may return without switching. Only load the clone
+        # if the form was actually switched - otherwise loading it here would
+        # overwrite the user's edits one line after they cancelled.
+        self.card_added.emit(new_id)
+        if self._form_loaded_for_id == new_id:
+            return
+        if self.is_dirty():
+            # The user kept editing the original card; leave the form alone.
+            return
+        self.load_card_by_id(new_id)

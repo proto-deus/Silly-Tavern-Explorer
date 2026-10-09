@@ -61,7 +61,7 @@ class _PromptTab(QWidget):
         self._preview_label = QLabel('')
         self._preview_label.setWordWrap(True)
         self._preview_label.setStyleSheet(
-            'font-size: 11px; color: #b0b0b0; background-color: #222; '
+            'color: #b0b0b0; background-color: #222; '
             'border-radius: 4px; padding: 6px;'
         )
         layout.addWidget(self._preview_label)
@@ -70,7 +70,7 @@ class _PromptTab(QWidget):
 
     def _make_label(self, text: str) -> QLabel:
         lbl = QLabel(text)
-        lbl.setStyleSheet('font-size: 12px; font-weight: bold; color: #ccc; margin-top: 6px;')
+        lbl.setStyleSheet('font-weight: bold; color: #ccc; margin-top: 6px;')
         return lbl
 
     def _reset(self) -> None:
@@ -171,7 +171,7 @@ class PromptSettingsDialog(QDialog):
             'at generation time. Unknown placeholders resolve to empty strings.'
         )
         info.setWordWrap(True)
-        info.setStyleSheet('font-size: 11px; color: #aaa;')
+        info.setStyleSheet('color: #aaa;')
         layout.addWidget(info)
 
         btn_box = QDialogButtonBox(

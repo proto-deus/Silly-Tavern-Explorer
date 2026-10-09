@@ -54,10 +54,39 @@ def apply_theme(app, font_size: int = 13) -> None:
     """
     from PyQt6.QtGui import QFont
 
+    set_base_font_size(font_size)
     font = QFont(_default_font_family())
     font.setPointSize(px_to_pt(font_size))
     app.setFont(font)
     app.setStyleSheet(get_dark_theme(font_size))
+
+
+# The configured base font size. Widgets that want secondary/heading text call
+# ui_font_px() instead of hardcoding a pixel size: a widget's own stylesheet
+# takes precedence over the application-wide `QWidget { font-size }` rule, so
+# a literal `font-size: 11px` silently ignored the View > Font Size setting for
+# that widget.
+_base_font_size = 13
+
+
+def set_base_font_size(size: int) -> None:
+    """Record the configured base font size used by :func:`ui_font_px`."""
+    global _base_font_size
+    _base_font_size = max(6, int(size))
+
+
+def base_font_size() -> int:
+    return _base_font_size
+
+
+def ui_font_px(delta: int = 0) -> int:
+    """Return a per-widget font size that tracks the global Font Size setting.
+
+    *delta* shifts it relative to the configured base, so secondary text stays
+    proportionally smaller (e.g. ``ui_font_px(-2)``). Never returns less than
+    7px, which would be unreadable.
+    """
+    return max(7, _base_font_size + delta)
 
 
 def _spin_arrow_path(name: str) -> str:

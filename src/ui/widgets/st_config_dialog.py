@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QDialog,
@@ -22,7 +23,8 @@ from src.lorebook_sync import resolve_worlds_dir
 from src.settings_manager import (
     load_st_characters_path,
     load_st_worlds_path,
-    save_st_characters_path,
+    clear_st_settings,
+save_st_characters_path,
     save_st_worlds_path,
 )
 from src.sillytavern_sync import detect_st_installs
@@ -83,7 +85,7 @@ class STConfigDialog(QDialog):
         path_layout.addWidget(self._candidates_list)
 
         self._status_label = QLabel('')
-        self._status_label.setStyleSheet('font-size: 12px; color: #aaa;')
+        self._status_label.setStyleSheet('color: #aaa;')
         path_layout.addWidget(self._status_label)
 
         layout.addWidget(path_group)
@@ -110,7 +112,7 @@ class STConfigDialog(QDialog):
             'Lorebooks tab. Leave this as-is to follow the characters directory.'
         )
         worlds_hint.setWordWrap(True)
-        worlds_hint.setStyleSheet('font-size: 11px; color: #888;')
+        worlds_hint.setStyleSheet('color: #888;')
         worlds_layout.addWidget(worlds_hint)
 
         layout.addWidget(worlds_group)
@@ -121,6 +123,13 @@ class STConfigDialog(QDialog):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
+        forget_btn = QPushButton('Forget Setup')
+        forget_btn.setToolTip(
+            'Clear the saved SillyTavern paths. Cards keep their links, so you '
+            'can re-point at a moved install without re-linking.',
+        )
+        forget_btn.clicked.connect(self._on_forget)
+        btn_row.addWidget(forget_btn)
         save_btn = QPushButton('Save')
         save_btn.clicked.connect(self._save)
         cancel_btn = QPushButton('Cancel')
@@ -136,6 +145,22 @@ class STConfigDialog(QDialog):
         if path:
             self._path_edit.setText(path)
             self._update_status()
+
+    def _on_forget(self) -> None:
+        """Clear the saved ST paths without touching the cards' ST links."""
+        reply = QMessageBox.question(
+            self, 'Forget SillyTavern Setup',
+            'Clear the saved SillyTavern paths?\n\n'
+            'Your cards keep their SillyTavern links, so re-pointing at a moved '
+            'install will not require re-linking.',
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        clear_st_settings()
+        self._path_edit.clear()
+        self._worlds_edit.clear()
+        self._worlds_auto = True
+        self._update_status()
 
     def _on_characters_changed(self, text: str) -> None:
         """Keep the auto-derived worlds path following the characters path."""

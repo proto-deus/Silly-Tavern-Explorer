@@ -12,7 +12,7 @@ from typing import Optional
 
 from PIL import Image
 
-from src.fs_utils import atomic_write_bytes
+from src import vault
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +154,7 @@ def _safe_decompress(data: bytes, max_size: int = _MAX_DECOMPRESSED_TEXT) -> Opt
     """zlib-decompress *data*, refusing payloads that expand beyond *max_size*."""
     decompressor = zlib.decompressobj()
     out = decompressor.decompress(data, max_size + 1)
-    if len(out) > max_size or not decompressor.eof and decompressor.unconsumed_tail:
+    if len(out) > max_size or (not decompressor.eof and decompressor.unconsumed_tail):
         return None
     return out
 
@@ -179,31 +179,57 @@ def _find_card_text(chunks: list[dict]) -> Optional[tuple[str, str]]:
 
 
 def _decode_card_text(text_value: str) -> Optional[dict]:
-    """Decode a base64+JSON card payload, returning None on any failure."""
+    """Decode a base64+JSON card payload, returning None on any failure.
+
+    The chunk text was decoded as latin-1, so bytes 0x80-0xFF arrive as
+    U+0080-U+00FF. Handing such a string to ``b64decode`` makes it call
+    ``.encode('ascii')``, which raises a plain ``ValueError`` - not a
+    ``binascii.Error`` - so it has to be caught here or a single malformed PNG
+    aborts the caller's whole batch import.
+    """
     stripped = text_value.rstrip('=').strip()
     if not stripped or len(stripped) % 4 == 1:
         logger.warning("Character card base64 looks malformed (len=%d)", len(stripped))
     try:
         decoded = base64.b64decode(text_value, validate=False)
+    except (base64.binascii.Error, ValueError, TypeError) as e:
+        logger.warning("Failed to decode character card base64: %s", e)
+        return None
+    try:
         return json.loads(decoded)
-    except (base64.binascii.Error, json.JSONDecodeError, UnicodeDecodeError) as e:
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
         logger.warning("Failed to decode character card data: %s", e)
         return None
 
 
+def _is_card_payload(value) -> bool:
+    """True when *value* is a decoded card payload (a non-empty JSON object).
+
+    A ``chara``/``ccv3`` chunk can legally contain any JSON value; a list or
+    scalar is not a character card and must not be handed to the model layer
+    (which would silently produce a blank, nameless card).
+    """
+    return isinstance(value, dict)
+
+
 def read_chara_card(png_path: str | Path) -> Optional[dict]:
     try:
-        png_data = Path(png_path).read_bytes()
+        png_data = vault.read_bytes(png_path)
         chunks = extract_chunks(png_data)
-    except (PNGParseError, OSError) as e:
+    except (PNGParseError, OSError, vault.VaultError) as e:
         logger.warning("Failed to read PNG chunks from %s: %s", png_path, e)
         return None
     result = _find_card_text(chunks)
     if result is not None:
         keyword, text_value = result
         card = _decode_card_text(text_value)
-        if card is not None:
+        if _is_card_payload(card):
             return card
+        if card is not None:
+            # A chunk holding a JSON array/scalar is not a character card.
+            # Returning it would make the caller build a blank nameless card.
+            logger.warning("%s chunk in %s does not contain a JSON object",
+                           keyword, png_path)
         if keyword == 'ccv3':
             # A corrupt ccv3 chunk must not shadow a valid chara chunk:
             # fall back to the V2 data before giving up.
@@ -220,7 +246,7 @@ def read_chara_card(png_path: str | Path) -> Optional[dict]:
                     continue
                 if kw == 'chara':
                     card = _decode_card_text(text_value)
-                    if card is not None:
+                    if _is_card_payload(card):
                         return card
         return None
     return None
@@ -234,9 +260,8 @@ def read_card_from_json(json_path: str | Path) -> Optional[dict]:
     or if the content doesn't look like a character card.
     """
     try:
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        data = json.loads(vault.read_text(json_path))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError, vault.VaultError) as e:
         logger.warning("Failed to read JSON card from %s: %s", json_path, e)
         return None
     if not isinstance(data, dict):
@@ -258,8 +283,7 @@ def read_card_data(path: str | Path) -> Optional[dict]:
 
 def get_card_image(png_path: str | Path) -> Optional[Image.Image]:
     try:
-        with Image.open(png_path) as img:
-            return img.convert('RGBA')
+        return vault.open_image(png_path).convert('RGBA')
     except Exception as e:
         # Log (not silently swallow): corrupt images should be diagnosable
         # from the app log.
@@ -280,8 +304,37 @@ def save_thumbnail(png_path: str | Path, thumb_path: str | Path, size: tuple[int
     if thumb is None:
         return False
     Path(thumb_path).parent.mkdir(parents=True, exist_ok=True)
-    thumb.save(thumb_path, 'PNG')
+    # Serialize to memory first so the write goes through the vault policy
+    # (thumbnails under the data dir are sealed when encryption is on).
+    buf = io.BytesIO()
+    thumb.save(buf, 'PNG')
+    vault.write_bytes(thumb_path, buf.getvalue())
     return True
+
+
+def _text_chunk_insert_index(chunks: list[dict]) -> int:
+    """Index at which a text chunk should be inserted.
+
+    PNG (RFC 2083) requires tEXt/zTXt/iTXt to appear *before* IDAT. SillyTavern
+    writes them with ``beforeIDAT``, so placing ours after IDAT makes the two
+    tools disagree and is rejected by strict validators.
+    """
+    for i, chunk in enumerate(chunks):
+        if chunk['name'] == 'IDAT':
+            return i
+    return len(chunks)
+
+
+def _encode_json_chunk_payload(card_data: dict) -> bytes:
+    """Serialize *card_data* to the bytes embedded in a card text chunk.
+
+    ``ensure_ascii=True`` is deliberate: it escapes every non-ASCII character
+    (so no encoding can fail) and, crucially, escapes lone surrogates that
+    ``json.loads`` happily produces from a ``\\udXXX`` escape. With
+    ``ensure_ascii=False`` such a card raises UnicodeEncodeError on save and
+    can never be written back.
+    """
+    return json.dumps(card_data, ensure_ascii=True).encode('ascii')
 
 
 def write_chara_card(
@@ -290,36 +343,32 @@ def write_chara_card(
     card_data: dict,
     keyword: str = 'chara',
 ) -> None:
-    png_data = Path(png_path).read_bytes()
+    png_data = vault.read_bytes(png_path)
     chunks = extract_chunks(png_data)
 
-    json_bytes = json.dumps(card_data, ensure_ascii=False).encode('utf-8')
-    b64_text = base64.b64encode(json_bytes).decode('ascii')
+    b64_text = base64.b64encode(_encode_json_chunk_payload(card_data)).decode('ascii')
 
     text_chunk_data = keyword.encode('latin-1') + b'\x00' + b64_text.encode('latin-1')
 
-    # Remove existing chunks with the target keyword in *any* text encoding
-    # (tEXt, zTXt, iTXt) so a stale compressed chunk can't shadow the new
-    # data on read-back.
+    # Remove existing chunks carrying *either* card keyword, in any text
+    # encoding (tEXt, zTXt, iTXt). Filtering on the target keyword alone was a
+    # silent no-op for a card that also has a 'ccv3' chunk: read_chara_card
+    # prefers ccv3, so the write landed on disk but was never read back.
     filtered_chunks = []
     for chunk in chunks:
-        if chunk['name'] == 'tEXt':
-            existing_keyword, _ = _parse_text_chunk(chunk['data'])
-        elif chunk['name'] == 'zTXt':
-            existing_keyword, _ = _parse_ztxt_chunk(chunk['data'])
-        elif chunk['name'] == 'iTXt':
-            existing_keyword, _ = _parse_itxt_chunk(chunk['data'])
-        else:
-            existing_keyword = None
-        if existing_keyword == keyword:
-            continue
+        if chunk['name'] in ('tEXt', 'zTXt', 'iTXt'):
+            if chunk['name'] == 'tEXt':
+                existing_keyword, _ = _parse_text_chunk(chunk['data'])
+            elif chunk['name'] == 'zTXt':
+                existing_keyword, _ = _parse_ztxt_chunk(chunk['data'])
+            else:
+                existing_keyword, _ = _parse_itxt_chunk(chunk['data'])
+            if existing_keyword in ('chara', 'ccv3'):
+                continue
         filtered_chunks.append(chunk)
 
-    iend_idx = _find_iend_index(filtered_chunks)
-    if iend_idx is None:
-        filtered_chunks.append({'name': 'IEND', 'data': b''})
-        iend_idx = len(filtered_chunks) - 1
-    filtered_chunks.insert(iend_idx, {'name': 'tEXt', 'data': text_chunk_data})
+    insert_at = _text_chunk_insert_index(filtered_chunks)
+    filtered_chunks.insert(insert_at, {'name': 'tEXt', 'data': text_chunk_data})
 
     _write_png_atomic(output_path, encode_chunks(filtered_chunks))
 
@@ -336,24 +385,39 @@ def replace_card_image(
     carried over into the new image, so card data stored in compressed
     or internationalized text chunks survives the image swap.
     """
-    source_data = Path(source_png).read_bytes()
+    source_data = vault.read_bytes(source_png)
     chunks = extract_chunks(source_data)
 
     # Preserve everything except pixel-data and image-boundary chunks.
     skip = {'IDAT', 'PLTE', 'tRNS', 'IHDR', 'IEND', 'bKGD', 'hIST', 'sBIT'}
     preserved_chunks = [c for c in chunks if c['name'] not in skip]
 
-    new_img = Image.open(new_image_path).convert('RGBA')
+    # Re-encode through the source's own pixel format. A blanket
+    # .convert('RGBA') inflated palette/greyscale/16-bit images to 8-bit RGBA
+    # (bigger files, banding) and the skipped PLTE/tRNS made that irreversible.
+    with Image.open(new_image_path) as src_img:
+        src_img.load()
+        if src_img.mode == 'P':
+            # Keep the palette; carry transparency across if the source had it.
+            new_img = src_img.copy()
+        elif src_img.mode in ('I;16', 'I;16B', 'I;16L', 'I;16N'):
+            new_img = src_img.copy()
+        else:
+            new_img = src_img.convert(src_img.mode if src_img.mode in ('L', 'LA', 'RGB', 'RGBA') else 'RGBA')
     buf = io.BytesIO()
     new_img.save(buf, format='PNG')
     new_png_data = buf.getvalue()
 
     new_chunks = extract_chunks(new_png_data)
-    final_chunks = []
-    for c in new_chunks:
-        if c['name'] == 'IEND':
-            final_chunks.extend(preserved_chunks)
-        final_chunks.append(c)
+    # Text chunks (and other ancillary chunks such as iCCP) must precede IDAT;
+    # appending them before IEND is exactly the placement the write path
+    # avoids for validator/ST compatibility.
+    insert_at = _text_chunk_insert_index(new_chunks)
+    if insert_at >= len(new_chunks):
+        iend = _find_iend_index(new_chunks)
+        if iend is not None:
+            insert_at = iend
+    final_chunks = new_chunks[:insert_at] + preserved_chunks + new_chunks[insert_at:]
 
     _write_png_atomic(output_path, encode_chunks(final_chunks))
 
@@ -370,8 +434,15 @@ def write_chara_card_dual(
     output_path: str | Path,
     card_data: dict,
 ) -> None:
-    """Write both 'chara' (v2) and 'ccv3' (v3) tEXt chunks for maximum compatibility."""
-    png_data = Path(png_path).read_bytes()
+    """Write both 'chara' (v2) and 'ccv3' (v3) tEXt chunks for maximum compatibility.
+
+    The payload's own ``spec``/``spec_version`` are preserved as written; the
+    v2 chunk always claims v2 and the v3 chunk always claims v3 so each reader
+    finds the marker it looks for, but a V3-only key (``assets``,
+    ``group_only_greetings``, ``creator_notes_multilingual``) is kept out of the
+    legacy chunk instead of being injected into it.
+    """
+    png_data = vault.read_bytes(png_path)
     chunks = extract_chunks(png_data)
 
     # Remove existing chara and ccv3 chunks (tEXt, zTXt, or iTXt)
@@ -388,31 +459,36 @@ def write_chara_card_dual(
                 continue
         filtered_chunks.append(chunk)
 
-    # Find IEND (or append one if missing)
-    iend_idx = _find_iend_index(filtered_chunks)
-    if iend_idx is None:
+    # Ensure IEND exists (a chunk-less input would otherwise be undecodable).
+    if _find_iend_index(filtered_chunks) is None:
         filtered_chunks.append({'name': 'IEND', 'data': b''})
-        iend_idx = len(filtered_chunks) - 1
 
     # Build v2 chunk
     v2_data = copy.deepcopy(card_data)
     v2_data['spec'] = 'chara_card_v2'
     v2_data['spec_version'] = '2.0'
-    v2_json = json.dumps(v2_data, ensure_ascii=False).encode('utf-8')
-    v2_b64 = base64.b64encode(v2_json).decode('ascii')
+    for v3_key in ('assets', 'group_only_greetings', 'creator_notes_multilingual'):
+        v2_data.pop(v3_key, None)
+        # Real app output nests V3 extras inside ``data`` (see
+        # CharacterCard.to_spec_dict), so the legacy chunk has to drop them
+        # there too — stripping only the top level left ``data.assets`` in.
+        if isinstance(v2_data.get('data'), dict):
+            v2_data['data'].pop(v3_key, None)
+    v2_b64 = base64.b64encode(_encode_json_chunk_payload(v2_data)).decode('ascii')
     v2_chunk_data = b'chara\x00' + v2_b64.encode('latin-1')
 
     # Build v3 chunk
     v3_data = copy.deepcopy(card_data)
     v3_data['spec'] = 'chara_card_v3'
     v3_data['spec_version'] = '3.0'
-    v3_json = json.dumps(v3_data, ensure_ascii=False).encode('utf-8')
-    v3_b64 = base64.b64encode(v3_json).decode('ascii')
+    v3_b64 = base64.b64encode(_encode_json_chunk_payload(v3_data)).decode('ascii')
     v3_chunk_data = b'ccv3\x00' + v3_b64.encode('latin-1')
 
-    # Insert both before IEND
-    filtered_chunks.insert(iend_idx, {'name': 'tEXt', 'data': v2_chunk_data})
-    filtered_chunks.insert(iend_idx + 1, {'name': 'tEXt', 'data': v3_chunk_data})
+    # Insert both before the first IDAT (PNG requires text chunks to precede
+    # image data, and ST writes them with beforeIDAT).
+    insert_at = _text_chunk_insert_index(filtered_chunks)
+    filtered_chunks.insert(insert_at, {'name': 'tEXt', 'data': v2_chunk_data})
+    filtered_chunks.insert(insert_at + 1, {'name': 'tEXt', 'data': v3_chunk_data})
 
     _write_png_atomic(output_path, encode_chunks(filtered_chunks))
 
@@ -429,4 +505,6 @@ def _write_png_atomic(output_path: str | Path, output: bytes) -> None:
             check_img.verify()
     except Exception as e:
         raise PNGParseError(f"Refusing to write invalid PNG output: {e}") from e
-    atomic_write_bytes(output_path, output)
+    # vault.write_bytes keeps the atomic replace and applies the encryption
+    # policy: library copies are sealed, exports/ST pushes stay plaintext.
+    vault.write_bytes(output_path, output)

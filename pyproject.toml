@@ -1,0 +1,101 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "st-explorer"
+version = "1.0.0"
+description = "Desktop application for browsing, editing and managing SillyTavern character cards"
+requires-python = ">=3.11"
+dependencies = [
+    "PyQt6>=6.5.0",
+    "Pillow>=10.0.0",
+    "tiktoken>=0.5.0",
+    "requests>=2.31.0",
+    "markdown>=3.5.0",
+    "cryptography>=42.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "pyinstaller>=6.0", "ruff>=0.6.0"]
+
+[tool.setuptools]
+packages = ["src", "src.ui", "src.ui.widgets"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Qt widgets leak handles across a whole session unless each test gets a fresh
+# process state; a per-test timeout keeps a hung slot from stalling CI forever.
+addopts = "-ra"
+filterwarnings = [
+    "error::DeprecationWarning:src.*",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [".LastGood", "build", "dist", ".pytest_cache"]
+
+[tool.ruff.lint]
+# A focused, bug-finding rule set rather than a style wish-list: F (pyflakes)
+# catches unused/undefined names, B (bugbear) catches real defect classes, and
+# RUF catches subtle mistakes. Purely cosmetic rules (import sorting, Optional
+# -> | None, contextlib.suppress) are deliberately excluded so enabling the
+# linter does not bury real findings under thousands of auto-fixable nits.
+select = [
+    "F",    # pyflakes
+    "E9",   # syntax errors
+    "B",    # bugbear
+    "RUF",  # ruff-specific correctness rules
+    "S",    # bandit security rules
+]
+ignore = [
+    # Qt overrides methods with C++ naming; renaming is not actionable here.
+    "N802", "N803", "N806",
+    # Local imports are deliberate: main.py defers heavy imports until after the
+    # startup dependency check so a missing package is reported without Qt.
+    "PLC0415",
+    # B023 false positives: the closures here are only ever invoked
+    # synchronously inside the same loop iteration (chat_builder's example
+    # parser, the library grid's scroll-into-view).
+    "B023",
+    # Deliberate getattr with a default for optional third-party attributes.
+    "B009",
+    # Best-effort cleanup paths use try/except/pass on purpose: a failure to
+    # delete a stale temp file or to close an optional handle must not mask the
+    # operation's real outcome.
+    "S110",
+    # Every SQL statement binds its values as parameters. The only interpolated
+    # SQL is built from _SORT_WHITELIST members and literal column names.
+    "S608",
+    # Shell-outs are intentional and platform-specific: 'explorer' on Windows to
+    # reveal a file, and the frozen executable's own path for restart.
+    "S603", "S607",
+    # Typography: the em dash, en dash and arrows in comments/docstrings are
+    # deliberate prose, not homoglyph-injection risk.
+    "RUF001", "RUF002", "RUF003",
+    # Constant lookup tables (sort labels, reserved names) are intentionally
+    # class-level dicts, never mutated at runtime.
+    "RUF012",
+    # Tuple/list concatenation that predates unpacking syntax and reads more
+    # clearly here (building an exception's arg tuple, prepending a system
+    # message). Left as-is rather than churned for style.
+    "RUF005",
+    # Tests build fixtures and assert on unused unpacked values.
+    "RUF059",
+    "S101",  # assert is the right tool in tests
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "B011", "F401", "F811", "RUF015"]
+# Random is used for shuffle-only content, not cryptography.
+"src/ui/widgets/duplicate_scanner.py" = ["S311"]
+# The QApplication reference is held on purpose: without it a freshly created
+# instance could be garbage-collected before the message box is shown.
+"main.py" = ["F841"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+[tool.ruff.format]
+quote-style = "single"

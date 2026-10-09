@@ -6,14 +6,17 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
 from PyQt6.QtWidgets import (
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
     QSpinBox,
@@ -80,6 +83,7 @@ class MainWindow(QMainWindow):
         self._suppress_tab_change = False
         self._actions: dict[str, QAction] = {}
         self._st_pushpull_worker = None
+        self._st_bulk_worker = None
         self.setWindowTitle('ST Explorer - SillyTavern Character Card Explorer')
         self.setMinimumSize(1000, 800)
         self.resize(1200, 1000)
@@ -229,6 +233,10 @@ class MainWindow(QMainWindow):
                 sort_group.addAction(act)
             menu.addAction(act)
             self._actions[action_def.action_id] = act
+        # Let the Edit tab drive the enabled state of Undo/Redo from its
+        # snapshot history.
+        self._edit_tab._actions = self._actions
+        self._edit_tab._update_undo_actions()
 
         self._actions['view.sort_name'].setChecked(True)
 
@@ -240,9 +248,12 @@ class MainWindow(QMainWindow):
             'file.backup': self._on_file_backup,
             'file.backup_library': self._on_file_backup_library,
             'file.restore_library': self._on_file_restore_library,
+            'file.check_library': self._on_file_check_library,
             'file.quit': self._on_file_quit,
             'edit.save': self._on_edit_save,
             'edit.revert': self._on_edit_revert,
+            'edit.undo': self._on_edit_undo,
+            'edit.redo': self._on_edit_redo,
             'edit.duplicate': self._on_edit_duplicate,
             'edit.delete': self._on_edit_delete,
             'edit.find': self._on_edit_find,
@@ -253,8 +264,8 @@ class MainWindow(QMainWindow):
             'view.sort_favorites': lambda: self._on_view_sort('Favorites'),
             'view.sort_random': lambda: self._on_view_sort('Random'),
             'view.refresh': self._on_view_refresh,
-            'view.zoom_in': lambda: self._library_tab.zoom_thumbnails(16),
-            'view.zoom_out': lambda: self._library_tab.zoom_thumbnails(-16),
+            'view.zoom_in': lambda: self._on_view_zoom(16),
+            'view.zoom_out': lambda: self._on_view_zoom(-16),
             'view.font_size': self._on_view_font_size,
             'view.find_duplicates': self._on_view_find_duplicates,
             'view.statistics': self._on_view_statistics,
@@ -388,6 +399,17 @@ class MainWindow(QMainWindow):
             progress.reset()
         QMessageBox.critical(self, 'Backup Library', f'Backup failed:\n{message}')
 
+    def _on_file_check_library(self) -> None:
+        """Run the library integrity check (File > Check Library)."""
+        from src.ui.dialog_helper import exec_dialog
+        from src.ui.widgets.doctor_dialog import DoctorDialog
+        self.statusBar().showMessage('Checking the library...', 0)
+        try:
+            dlg = DoctorDialog(self.db, self)
+            exec_dialog(dlg)
+        finally:
+            self.statusBar().showMessage('Library check finished.', 5000)
+
     def _on_file_restore_library(self) -> None:
         """Replace the current library with a backup zip (prompts restart)."""
         from src.library_backup import BackupCancelled, restore_backup
@@ -463,14 +485,16 @@ class MainWindow(QMainWindow):
         if progress is not None:
             progress.reset()
         self.statusBar().showMessage('Library restored.', 5000)
-        answer = QMessageBox.question(
+        # Restart is mandatory, not optional: open database connections and
+        # cached UI state still point at the pre-restore library, so letting
+        # the user decline would leave the app running against a swapped-out
+        # data dir.
+        QMessageBox.information(
             self, 'Restore Library',
-            'Restore complete.\n\nRestart ST Explorer now to load the restored library?',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
+            'Restore complete. ST Explorer will now restart to load the '
+            'restored library.',
         )
-        if answer == QMessageBox.StandardButton.Yes:
-            self._restart_application()
+        self._restart_application()
 
     def _on_restore_library_fail(self, message: str) -> None:
         progress = getattr(self, '_restore_progress', None)
@@ -502,18 +526,48 @@ class MainWindow(QMainWindow):
     def _on_edit_revert(self) -> None:
         self._edit_tab.revert()
 
+    def _on_edit_undo(self) -> None:
+        if self._tabs.currentWidget() is not self._edit_tab:
+            self.statusBar().showMessage(
+                'Undo applies to the Edit tab; switch to it first.', 4000,
+            )
+            return
+        self._edit_tab.undo()
+
+    def _on_edit_redo(self) -> None:
+        if self._tabs.currentWidget() is not self._edit_tab:
+            self.statusBar().showMessage(
+                'Redo applies to the Edit tab; switch to it first.', 4000,
+            )
+            return
+        self._edit_tab.redo()
+
     def _on_edit_duplicate(self) -> None:
         widget = self._tabs.currentWidget()
         if isinstance(widget, LibraryTab):
             widget.duplicate_card()
         elif isinstance(widget, EditTab):
             widget.duplicate_card()
+        else:
+            # The Generate/Lorebooks/Test tabs have no selection of their own;
+            # say so rather than appearing to do nothing.
+            sid = self._sidebar.current_id()
+            if sid is not None:
+                self.statusBar().showMessage(
+                    'Duplicate is available from the Library or Edit tab.', 4000,
+                )
+            else:
+                self.statusBar().showMessage('Select a card first.', 4000)
 
     def _on_edit_delete(self) -> None:
-        # 'Del' is a window-wide shortcut: only honour it when the Library
-        # tab is frontmost, otherwise it would switch tabs and delete a
-        # card that isn't the one being edited/viewed.
-        if self._tabs.currentWidget() is not self._library_tab:
+        # 'Del' is a window-wide shortcut, and a read-only QTextEdit does not
+        # claim it - so pressing Delete while reading the Library detail pane
+        # used to delete the selected card. Only honour it on the Library tab,
+        # and not while a text field has focus.
+        widget = self._tabs.currentWidget()
+        if widget is not self._library_tab:
+            return
+        if isinstance(QApplication.focusWidget(), (QLineEdit, QTextEdit, QPlainTextEdit)):
             return
         self._library_tab.delete_selected()
 
@@ -526,6 +580,9 @@ class MainWindow(QMainWindow):
     def _on_edit_card_updated(self, char_id: int) -> None:
         self._sidebar.refresh_card(char_id)
         self._library_tab._refresh_single_thumbnail(char_id)
+        # The saved text changed the token total, so the status-bar figure was
+        # stale until some unrelated action happened to emit library_changed.
+        self._update_status()
 
     def _on_edit_card_added(self, char_id: int) -> None:
         # Resolve unsaved edits for the previous card first, then load the
@@ -572,14 +629,29 @@ class MainWindow(QMainWindow):
     # ---- View handlers ----
 
     def _on_view_favorites(self) -> None:
-        # 'F' is a window-wide shortcut: scope it to the Library tab so it
-        # can't fire while typing context is ambiguous.
+        # 'F' is a window-wide shortcut and a read-only QTextEdit does not
+        # claim it, so clicking into the Library detail pane and pressing F
+        # toggled the filter. Scope it to the Library tab and ignore it while a
+        # text field has focus.
         if self._tabs.currentWidget() is not self._library_tab:
+            return
+        if isinstance(QApplication.focusWidget(), (QLineEdit, QTextEdit, QPlainTextEdit)):
             return
         self._library_tab.toggle_favorites_filter()
 
     def _on_view_sort(self, label: str) -> None:
         self._library_tab.set_sort_by_label(label)
+
+    def _on_view_zoom(self, delta: int) -> None:
+        """Zoom the Library grid.
+
+        Scoped to the Library tab: the action used to resize the invisible
+        grid from any tab, so Ctrl+= on the Edit tab changed a thumbnail size
+        the user could not see.
+        """
+        widget = self._tabs.currentWidget()
+        if isinstance(widget, LibraryTab):
+            widget.zoom_thumbnails(delta)
 
     def _on_view_refresh(self) -> None:
         widget = self._tabs.currentWidget()
@@ -669,7 +741,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dlg)
         text = QTextEdit()
         text.setReadOnly(True)
-        text.setStyleSheet('font-family: Consolas, "Courier New", monospace; font-size: 11px;')
+        text.setStyleSheet('font-family: Consolas, "Courier New", monospace; ')
         try:
             content = log_path.read_text(encoding='utf-8', errors='replace')
             if len(content) > 20000:
@@ -797,8 +869,8 @@ class MainWindow(QMainWindow):
         """
         from src.ui.widgets.sync_worker import ScanWorker
 
-        if self._worker_is_alive(getattr(self, '_st_plan_worker', None)):
-            self.statusBar().showMessage('A sync scan is already running.', 3000)
+        if self._sync_workers_busy():
+            self.statusBar().showMessage('A sync operation is already running.', 3000)
             return
         self.statusBar().showMessage('Scanning libraries...', 0)
         worker = ScanWorker(self.db, path, self)
@@ -823,6 +895,18 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             # The C++ QThread was already destroyed by deleteLater.
             return False
+
+    def _sync_workers_busy(self) -> bool:
+        """True while any scan/push-pull/bulk sync worker is running.
+
+        One guard for all three: asymmetric checks let a "Push Selected"
+        start during a scan and run ``bulk_sync`` concurrently with the
+        scan's follow-up, overwriting each other's ST files.
+        """
+        for attr in ('_st_plan_worker', '_st_pushpull_worker', '_st_bulk_worker'):
+            if self._worker_is_alive(getattr(self, attr, None)):
+                return True
+        return False
 
     def _on_st_scan_completed(self, pairs) -> None:
         from src.sillytavern_sync import SyncAction
@@ -865,7 +949,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, 'SillyTavern', 'SillyTavern directory not configured.')
             self._on_st_configure()
             return
-        if self._worker_is_alive(getattr(self, '_st_pushpull_worker', None)):
+        if self._sync_workers_busy():
             self.statusBar().showMessage('A sync operation is already running.', 3000)
             return
         action = SyncAction.PUSH if direction == 'push' else SyncAction.PULL
@@ -887,26 +971,34 @@ class MainWindow(QMainWindow):
                 self, 'SillyTavern Sync',
                 summary.message() + "\n\nErrors:\n" + '\n'.join(summary.errors[:20]),
             )
-        self._library_tab.invalidate_card_cache()
-        self._library_tab.load_cards()
-        self._st_status.refresh()
+        self._on_sync_changed()
 
     def _run_bulk_sync(self, plan, path: str, label: str) -> None:
         from src.ui.widgets.sync_worker import SyncWorker
+        if self._sync_workers_busy():
+            # Refuse rather than overwrite a live worker: replacing the slot
+            # orphaned the running thread (invisible to shutdown) and gave
+            # both workers independent filename-collision sets.
+            self.statusBar().showMessage('A sync operation is already running.', 3000)
+            return
         self.statusBar().showMessage(label, 0)
-        self._st_pushpull_worker = SyncWorker(self.db, plan, path, self)
+        # A *separate* attribute from _st_pushpull_worker: PushPullWorker and
+        # SyncWorker both ran bulk_sync concurrently when they shared one slot,
+        # giving them independent filename-collision sets that could overwrite
+        # each other's ST files.
+        self._st_bulk_worker = SyncWorker(self.db, plan, path, self)
         self._st_progress = QProgressDialog(label, 'Cancel', 0, len(plan), self)
         self._st_progress.setWindowTitle('SillyTavern Sync')
         self._st_progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._st_progress.setMinimumDuration(300)
         self._st_progress.setAutoClose(False)
         self._st_progress.setAutoReset(False)
-        self._st_progress.canceled.connect(self._st_pushpull_worker.cancel)
-        self._st_pushpull_worker.progress.connect(self._on_st_bulk_progress)
-        self._st_pushpull_worker.completed.connect(self._on_st_bulk_finished)
+        self._st_progress.canceled.connect(self._st_bulk_worker.cancel)
+        self._st_bulk_worker.progress.connect(self._on_st_bulk_progress)
+        self._st_bulk_worker.completed.connect(self._on_st_bulk_finished)
         # Cleanup on the built-in signal so cancelled runs are still deleted.
-        self._st_pushpull_worker.finished.connect(self._st_pushpull_worker.deleteLater)
-        self._st_pushpull_worker.start()
+        self._st_bulk_worker.finished.connect(self._st_bulk_worker.deleteLater)
+        self._st_bulk_worker.start()
 
     def _on_st_bulk_progress(self, current: int, total: int, name: str) -> None:
         progress = getattr(self, '_st_progress', None)
@@ -922,26 +1014,42 @@ class MainWindow(QMainWindow):
         if progress is not None:
             progress.close()
             self._st_progress = None
-        self._st_pushpull_worker = None
+        self._st_bulk_worker = None
         self.statusBar().showMessage(summary.message(), 5000)
         if summary.errors:
             QMessageBox.warning(
                 self, 'SillyTavern Sync',
                 summary.message() + "\n\nErrors:\n" + '\n'.join(summary.errors[:20]),
             )
+        self._on_sync_changed()
+
+    def _on_sync_changed(self) -> None:
+        """Refresh everything a completed sync could have invalidated.
+
+        The Edit tab must be reloaded too: pull rewrites the card file on disk,
+        so leaving the editor's form buffer populated would let the next Ctrl+S
+        overwrite the pulled version with the pre-pull contents.
+        """
         self._library_tab.invalidate_card_cache()
         self._library_tab.load_cards()
+        selected = self._sidebar.current_id()
+        if selected is not None and self._edit_tab.current_id() == selected:
+            self._edit_tab.reload_current()
         self._st_status.refresh()
 
     def _shutdown_st_workers(self, timeout_ms: int = 3000) -> bool:
-        """Cancel both SillyTavern workers and wait briefly.
+        """Cancel background workers and wait briefly.
 
         Returns True when no worker is running any more (or stopped within
         the timeout). False means the window must stay open — destroying a
-        live QThread aborts the process.
+        live QThread aborts the process. Covers the backup/restore workers
+        too: they are unparented and would otherwise be garbage-collected
+        mid-run when the window closes right after a cancelled progress
+        dialog.
         """
         ok = True
-        for attr in ('_st_plan_worker', '_st_pushpull_worker'):
+        for attr in ('_st_plan_worker', '_st_pushpull_worker', '_st_bulk_worker',
+                     '_backup_worker', '_restore_worker'):
             worker = getattr(self, attr, None)
             if not self._worker_is_alive(worker):
                 setattr(self, attr, None)
@@ -949,11 +1057,17 @@ class MainWindow(QMainWindow):
             try:
                 worker.cancel()
             except AttributeError:
-                pass  # e.g. PushPullWorker has no cooperative cancel
+                # Backup/restore workers expose a cooperative flag instead.
+                try:
+                    worker.cancelled = True
+                except Exception:
+                    pass
             if not worker.wait(timeout_ms):
                 ok = False
             else:
                 setattr(self, attr, None)
+        from src.ui.edit_tab import wait_for_token_warmup
+        wait_for_token_warmup(timeout_ms)
         return ok
 
     def _on_st_refresh(self) -> None:
@@ -1003,7 +1117,9 @@ class MainWindow(QMainWindow):
                 return 'save'
             return 'cancel'
         if reply == QMessageBox.StandardButton.Discard:
-            self._edit_tab.clear_dirty()
+            # Actually discard: reloading the card clears the form buffer so
+            # a later Ctrl+S cannot resurrect the thrown-away content.
+            self._edit_tab.discard_edits()
             return 'discard'
         return 'cancel'
 
@@ -1048,8 +1164,9 @@ class MainWindow(QMainWindow):
             self._edit_tab.load_card_by_id(char_id)
         elif isinstance(widget, TestTab):
             self._test_tab.select_card(char_id)
-        elif isinstance(widget, AITab):
-            self._ai_tab.select_card(char_id)
+        # AITab is intentionally NOT re-selected here: select_card() above
+        # already ran, and calling it again re-parsed the PNG and re-counted its
+        # tokens for no reason.
 
     def _on_settings(self) -> None:
         from src.ui.widgets.settings_dialog import SettingsDialog
@@ -1086,7 +1203,9 @@ class MainWindow(QMainWindow):
 
         sid = self._sidebar.current_id()
         if isinstance(widget, EditTab):
-            if sid is not None:
+            # Skip the reload when this card is already in the form: re-parsing
+            # the PNG is slow and it reset the Ctrl+Z history on every visit.
+            if sid is not None and sid != widget.form_loaded_for_id:
                 widget.load_card_by_id(sid)
         elif isinstance(widget, AITab):
             if sid is not None:
@@ -1166,6 +1285,12 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        # Stop the ST status scan: it runs on a child QThread, and destroying a
+        # live QThread with its parent aborts the process.
+        try:
+            self._st_status.shutdown()
+        except RuntimeError:
+            pass
         save_window_geometry(self.saveGeometry())
         # Persist tab state for next session.
         save_library_selected_ids(self._library_tab.get_selected_ids())

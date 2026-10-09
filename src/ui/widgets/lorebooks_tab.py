@@ -182,7 +182,7 @@ class LorebooksTab(QWidget):
         right = QVBoxLayout()
         header_row = QHBoxLayout()
         title = QLabel('Lorebooks')
-        title.setStyleSheet('font-size: 16px; font-weight: bold; color: #e0e0e0;')
+        title.setStyleSheet('font-weight: bold; color: #e0e0e0;')
         header_row.addWidget(title)
         header_row.addStretch()
         self._use_context_cb = QCheckBox('Use card context')
@@ -195,7 +195,7 @@ class LorebooksTab(QWidget):
         self._use_context_cb.toggled.connect(self._on_use_context_toggled)
         header_row.addWidget(self._use_context_cb)
         self._card_label = QLabel('')
-        self._card_label.setStyleSheet('font-size: 12px; color: #6cb6ff;')
+        self._card_label.setStyleSheet('color: #6cb6ff;')
         self._card_label.setToolTip(
             'The character selected in the sidebar is used as context for AI '
             'generation so lore stays consistent with it.'
@@ -254,7 +254,7 @@ class LorebooksTab(QWidget):
         v.addLayout(row2)
 
         hint = QLabel('Changes save automatically.')
-        hint.setStyleSheet('color: #777; font-size: 11px;')
+        hint.setStyleSheet('color: #777; ')
         v.addWidget(hint)
         return panel
 
@@ -465,6 +465,9 @@ class LorebooksTab(QWidget):
         filename = item.data(Qt.ItemDataRole.UserRole)
         book = lorebook_store.load_lorebook(filename)
         if book is None:
+            # Do not keep editing the *previous* book under the new row: a
+            # later autosave would write it to the newly selected filename.
+            self._clear_editor()
             self.status_message.emit(f'Could not load lorebook: {filename}', 5000)
             return
         self._filename = filename
@@ -573,18 +576,23 @@ class LorebooksTab(QWidget):
             lorebook_store.save_lorebook(self._filename, self._book)
             self._update_list_item_label()
             self.lorebooks_changed.emit()
-        except OSError as e:
+        except Exception as e:
+            # Includes serialization failures: this runs in a timer slot, and
+            # an escaping exception would abort the process.
             logger.exception("Failed to autosave lorebook")
             self.status_message.emit(f'Autosave failed: {e}', 5000)
 
     def _update_list_item_label(self) -> None:
-        row = self._current_row()
-        if row < 0:
+        if self._book is None or self._filename is None:
             return
-        item = self._book_list.item(row)
-        if item is None or self._book is None:
-            return
-        item.setText(f"{self._book.name or '(untitled)'}  ({len(self._book.entries)})")
+        # Match by filename rather than the current row: on a row switch the
+        # autosave flush runs while the new row is already current, and
+        # updating "the current row" then overwrites the wrong label.
+        for row in range(self._book_list.count()):
+            item = self._book_list.item(row)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == self._filename:
+                item.setText(f"{self._book.name or '(untitled)'}  ({len(self._book.entries)})")
+                return
 
     # ---- book actions ----
 
@@ -723,10 +731,16 @@ class LorebooksTab(QWidget):
         if self._book is None:
             return
         dlg = _BookEntryEditDialog(BookEntry(insertion_order=len(self._book.entries) * 100), self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._book.entries.append(dlg.get_entry())
-            self._refresh_entry_list()
-            self._persist_now()
+        try:
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._book.entries.append(dlg.get_entry())
+                self._refresh_entry_list()
+                self._persist_now()
+        finally:
+            # Parented dialogs are hidden, not destroyed, after exec(): one
+            # subtree leaked per Add/Edit otherwise.
+            dlg.setParent(None)
+            dlg.deleteLater()
 
     def _on_edit_entry(self, *args) -> None:
         if self._book is None:
@@ -735,16 +749,29 @@ class LorebooksTab(QWidget):
         if not 0 <= idx < len(self._book.entries):
             return
         dlg = _BookEntryEditDialog(self._book.entries[idx], self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._book.entries[idx] = dlg.get_entry()
-            self._refresh_entry_list()
-            self._persist_now()
+        try:
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._book.entries[idx] = dlg.get_entry()
+                self._refresh_entry_list()
+                self._persist_now()
+        finally:
+            dlg.setParent(None)
+            dlg.deleteLater()
 
     def _on_remove_entry(self) -> None:
         if self._book is None:
             return
         idx = self._selected_entry_index()
         if not 0 <= idx < len(self._book.entries):
+            return
+        entry = self._book.entries[idx]
+        # Entry removal persists immediately (no undo), so confirm it first.
+        if QMessageBox.question(
+            self, 'Remove Entry',
+            f'Remove "{entry.name or f"entry {idx + 1}"}"?\n\n'
+            'This is saved immediately and cannot be undone.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
             return
         self._book.entries.pop(idx)
         self._refresh_entry_list()
@@ -858,9 +885,13 @@ class LorebooksTab(QWidget):
         self._cancel_gen_btn.setEnabled(True)
         client = AIClient(self._api_preset)
         self._worker = _LorebookWorker(client, mode, params, self)
+        self._result_delivered = False
         self._worker.chunk.connect(self._on_chunk)
         self._worker.completed.connect(self._on_generated)
         self._worker.error.connect(self._on_generate_error)
+        # A cancelled run returns from run() without emitting anything, so the
+        # finished signal is what unsticks the "Generating..." UI.
+        self._worker.finished.connect(self._on_worker_finished)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
 
@@ -912,6 +943,7 @@ class LorebooksTab(QWidget):
     @pyqtSlot(str)
     def _on_generated(self, text: str) -> None:
         mode = self._worker.mode if self._worker is not None else None
+        self._result_delivered = True
         self._finish_generation()
         self._pending_text = text
         self._pending_mode = mode
@@ -921,10 +953,18 @@ class LorebooksTab(QWidget):
 
     @pyqtSlot(str)
     def _on_generate_error(self, error: str) -> None:
+        self._result_delivered = True
         self._finish_generation()
         short = error.splitlines()[0] if error else 'Unknown error'
         self._ai_result.setPlainText(f'Error: {error}')
         QMessageBox.critical(self, 'Generation Error', short)
+
+    def _on_worker_finished(self) -> None:
+        """Unstick the UI when the worker ended without a result (cancel)."""
+        if not getattr(self, '_result_delivered', True):
+            self._result_delivered = True
+            self._finish_generation()
+            self._ai_result.setPlainText('Generation cancelled.')
 
     def _finish_generation(self) -> None:
         self._worker = None
@@ -959,16 +999,20 @@ class LorebooksTab(QWidget):
             return
         self._flush_autosave()
         if self._pending_mode == 'entry':
-            self._apply_entry_content()
+            applied = self._apply_entry_content()
         else:
-            self._apply_book_entries()
-        self._on_clear_result()
+            applied = self._apply_book_entries()
+        if applied:
+            # Only clear on success: a declined overwrite or unparsable
+            # output must keep the generated text so the user can retry
+            # without paying for another generation.
+            self._on_clear_result()
 
-    def _apply_entry_content(self) -> None:
+    def _apply_entry_content(self) -> bool:
         idx = self._selected_entry_index()
         if not 0 <= idx < len(self._book.entries):
             QMessageBox.information(self, 'Apply Result', 'Select an entry first.')
-            return
+            return False
         entry = self._book.entries[idx]
         if entry.content and entry.content.strip():
             if QMessageBox.question(
@@ -976,13 +1020,14 @@ class LorebooksTab(QWidget):
                 f'Replace the content of "{entry.name or "this entry"}"? Continue?',
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             ) != QMessageBox.StandardButton.Yes:
-                return
+                return False
         entry.content = lorebook_store.clean_generated_text(self._pending_text)
         self._refresh_entry_list()
         self._persist_now()
         self.status_message.emit('Entry content updated.', 3000)
+        return True
 
-    def _apply_book_entries(self) -> None:
+    def _apply_book_entries(self) -> bool:
         replace = getattr(self, '_pending_target_replace', False)
         generated = lorebook_store.parse_generated_book(self._pending_text)
         if generated is None:
@@ -991,7 +1036,7 @@ class LorebooksTab(QWidget):
                 'Could not parse any entries from the generated output.\n'
                 'Try generating again or adjust the prompt.',
             )
-            return
+            return False
         if replace:
             if QMessageBox.question(
                 self, 'Replace Entries',
@@ -1000,7 +1045,7 @@ class LorebooksTab(QWidget):
                 f'{len(generated.entries)} generated ones. Continue?',
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             ) != QMessageBox.StandardButton.Yes:
-                return
+                return False
             self._book.entries = generated.entries
             if generated.name:
                 self._name_edit.setText(generated.name)
@@ -1017,6 +1062,7 @@ class LorebooksTab(QWidget):
             f'{verb} {len(generated.entries)} entr'
             f'{"y" if len(generated.entries) == 1 else "ies"}.', 4000,
         )
+        return True
 
     def flush(self) -> None:
         """Force-write any pending debounced edits (called on app shutdown)."""

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Optional
 
 from src.card_models import BookEntry, CharacterBook, CharacterCard, parse_character_book
@@ -37,6 +38,7 @@ def substitute_macros(
     user_name: str,
     char_name: str,
     custom_macros: dict[str, str] | None = None,
+    escape_for_format: bool = False,
 ) -> str:
     """Replace ``{{user}}`` / ``{{char}}`` macros in *text*.
 
@@ -45,18 +47,29 @@ def substitute_macros(
     and is applied after the built-in macros.  Values are substituted
     literally (backslashes have no special meaning).  Pure function so it
     can be unit-tested without Qt.
+
+    When *escape_for_format* is set the replacement values have their braces
+    doubled: the caller is going to run ``str.format_map`` over the result,
+    and without escaping a card named ``{description}`` would silently have
+    its own name replaced by its description (third-party card text must not
+    become template syntax).
     """
     if not text:
         return ''
-    text = _sub_literal(_USER_RE, user_name or '', text)
-    text = _sub_literal(_CHAR_RE, char_name or '', text)
+
+    def _value(v) -> str:
+        s = v if isinstance(v, str) else str(v)
+        return s.replace('{', '{{').replace('}', '}}') if escape_for_format else s
+
+    text = _sub_literal(_USER_RE, _value(user_name or ''), text)
+    text = _sub_literal(_CHAR_RE, _value(char_name or ''), text)
     if custom_macros:
         for name, value in custom_macros.items():
             key = str(name).strip()
             if not key:
                 continue
             pattern = r'\{\{\s*' + re.escape(key) + r'\s*\}\}'
-            text = _sub_literal(pattern, str(value), text)
+            text = _sub_literal(pattern, _value(value), text)
     return text
 
 
@@ -96,7 +109,12 @@ def resolve_system_prompt(
         from src.ai_prompts import load_prompt
         raw = load_prompt('chat_system')
 
-    macroed = substitute_macros(raw, user_name, card.name, custom_macros)
+    # Escape braces in the macro values: ``substitute`` below runs
+    # format_map over this string, and card/user text must not become
+    # template syntax.
+    macroed = substitute_macros(
+        raw, user_name, card.name, custom_macros, escape_for_format=True,
+    )
     from src.ai_prompts import substitute
     return substitute(macroed, **_card_fields(card))
 
@@ -118,6 +136,11 @@ def build_initial_messages(
     return [{'role': 'assistant', 'content': content}]
 
 
+def _message_ts() -> str:
+    """Timestamp stamped onto a message at creation time (not render time)."""
+    return datetime.now().isoformat(timespec='seconds')
+
+
 def append_message(
     messages: list[dict[str, str]],
     role: str,
@@ -129,10 +152,12 @@ def append_message(
     """Return a new message list with *content* appended under *role*.
 
     Macros are substituted for user/assistant messages.  Pure function.
+    Each message carries a ``ts`` stamp so re-rendering the chat does not
+    rewrite every visible timestamp to "now".
     """
     substituted = substitute_macros(content, user_name, char_name, custom_macros)
     new_list = list(messages)
-    new_list.append({'role': role, 'content': substituted})
+    new_list.append({'role': role, 'content': substituted, 'ts': _message_ts()})
     return new_list
 
 
@@ -142,7 +167,7 @@ def make_message(role: str, content: str, attachments: list[dict] | None = None)
     Attachments are stored verbatim (never macro-substituted) so file contents
     are passed through unchanged.  Pure function.
     """
-    msg: dict = {'role': role, 'content': content or ''}
+    msg: dict = {'role': role, 'content': content or '', 'ts': _message_ts()}
     if attachments:
         msg['attachments'] = [dict(a) for a in attachments]
     return msg

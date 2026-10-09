@@ -79,41 +79,81 @@ class _UrlImageLabel(ClickableImageLabel):
         super().mousePressEvent(event)
 
 
+def _widget_alive(widget) -> bool:
+    """True if *widget*'s C++ object still exists.
+
+    A weakref to a parented Qt widget does NOT detect destruction: PyQt keeps
+    the Python wrapper alive after the underlying C++ object is deleted (via
+    ``deleteLater`` or when its parent is destroyed). Calling any method on it
+    then raises ``RuntimeError: wrapped C/C++ object ... has been deleted``,
+    which - inside a slot - aborts the whole process.
+    """
+    if widget is None:
+        return False
+    try:
+        from PyQt6 import sip
+    except ImportError:  # pragma: no cover - PyQt6 always ships sip
+        pass
+    else:
+        try:
+            return not sip.isdeleted(widget)
+        except (TypeError, RuntimeError):
+            return False
+    try:
+        widget.objectName()
+        return True
+    except RuntimeError:
+        return False
+
+
 def load_url_image(url: str, label: QLabel, max_dim: int = 512) -> None:
     """Fetch *url* asynchronously and display the downscaled image in *label*.
 
-    *label* is held via a weak reference so it is safe to delete the label
-    before the response arrives.  When *url* cannot be fetched or is not a
-    valid image the label is simply left unchanged (it should already display a
-    placeholder before this call).
+    *label* is held via a weak reference so it is safe to drop the label before
+    the response arrives.  Any re-render of the chat can delete the widget
+    outright, so the finished handler verifies the C++ object still exists
+    before touching it.  When *url* cannot be fetched or is not a valid image
+    the label is simply left unchanged (it should already display a placeholder
+    before this call).
     """
     from PyQt6.QtNetwork import QNetworkReply
     ref = weakref.ref(label)
+    # Shared cell: the progress/meta handlers and the finished handler all
+    # need to know whether the reply was killed for exceeding the size cap.
+    too_large = {'flag': False}
 
     def _on_finished(reply: QNetworkReply, dim: int) -> None:
         reply.deleteLater()
         lbl = ref()
-        if lbl is None:
+        if not _widget_alive(lbl):
             return
-        if reply.error() != QNetworkReply.NetworkError.NoError:
-            lbl.setText('Image unavailable')
-            return
-        data = bytes(reply.readAll())
-        image = QImage.fromData(data)
-        if image.isNull():
-            lbl.setText('Image unavailable')
-            return
-        if image.width() > dim or image.height() > dim:
-            image = image.scaled(
-                dim, dim,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        pixmap = QPixmap.fromImage(image)
-        _cache_pixmap(url, pixmap)
-        if isinstance(lbl, ClickableImageLabel):
-            lbl._loaded = True
-        lbl.setPixmap(pixmap)
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                lbl.setText('Image too large' if too_large['flag'] else 'Image unavailable')
+                return
+            data = bytes(reply.readAll())
+            if len(data) > _MAX_IMAGE_BYTES:
+                too_large['flag'] = True
+                lbl.setText('Image too large')
+                return
+            image = QImage.fromData(data)
+            if image.isNull():
+                lbl.setText('Image unavailable')
+                return
+            if image.width() > dim or image.height() > dim:
+                image = image.scaled(
+                    dim, dim,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            pixmap = QPixmap.fromImage(image)
+            _cache_pixmap(url, pixmap)
+            if isinstance(lbl, ClickableImageLabel):
+                lbl._loaded = True
+            lbl.setPixmap(pixmap)
+        except RuntimeError:
+            # The label was deleted between the liveness check and the call.
+            pass
 
     request = QNetworkRequest(QUrl(url))
     request.setAttribute(
@@ -122,6 +162,24 @@ def load_url_image(url: str, label: QLabel, max_dim: int = 512) -> None:
     )
     request.setTransferTimeout(_TRANSFER_TIMEOUT_MS)
     reply = _network_manager().get(request)
+
+    def _on_meta(reply: QNetworkReply = reply) -> None:
+        try:
+            length = int(reply.header(QNetworkRequest.KnownHeaders.ContentLengthHeader) or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length > _MAX_IMAGE_BYTES:
+            too_large['flag'] = True
+            reply.abort()
+
+    def _on_progress(received: int, _total: int, reply: QNetworkReply = reply) -> None:
+        # Enforce the cap mid-transfer too: Content-Length can be absent or lie.
+        if received > _MAX_IMAGE_BYTES:
+            too_large['flag'] = True
+            reply.abort()
+
+    reply.metaDataChanged.connect(_on_meta)
+    reply.downloadProgress.connect(_on_progress)
     reply.finished.connect(partial(_on_finished, reply, max_dim))
 
 

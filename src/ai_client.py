@@ -20,9 +20,140 @@ _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_MAX_SECONDS = 8.0
 
+# Transport failures that are worth retrying. requests splits these across
+# several exception classes; catching only ConnectionError/Timeout missed the
+# most common real-world failure - ChunkedEncodingError, raised when a server
+# drops the connection mid-response - which then escaped as a raw traceback.
+_RETRYABLE_TRANSPORT_ERRORS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
+    requests.exceptions.TooManyRedirects,
+    requests.exceptions.SSLError,
+)
+
+# Bad request *configuration* (malformed URL, illegal header value) is
+# permanent: retrying the identical request cannot help. It also must never
+# be wrapped verbatim - ``InvalidHeader``'s message embeds the full header
+# value, i.e. the API key, which would then land in the plaintext app log.
+_PERMANENT_CONFIG_ERRORS = (
+    requests.exceptions.InvalidHeader,
+    requests.exceptions.InvalidURL,
+    # http.client raises a bare UnicodeEncodeError for a header value that
+    # isn't latin-1 encodable (e.g. a pasted API key with a smart quote).
+    UnicodeEncodeError,
+)
+
+
+def redact_secrets(message: object) -> str:
+    """Return *message* with anything that looks like a credential removed.
+
+    Applied to every transport error string that reaches a log or the UI:
+    exception messages can echo request headers, including ``Authorization``.
+    """
+    text = str(message)
+    text = re.sub(r'(?i)(bearer\s+)[^\s\'"]+', r'\1[redacted]', text)
+    text = re.sub(r'(?i)((?:api[ _-]?key|authorization|token)\s*[:=]\s*)[^\s,;\'"]+',
+                  r'\1[redacted]', text)
+    text = re.sub(r'(?i)(header value\s*[:=]?\s*)([\'"]?)[^\s\'"]+',
+                  r'\1\2[redacted]', text)
+    return text
+
+
+def _permanent_config_message(exc: BaseException) -> str:
+    """Safe, user-facing message for a permanent request-configuration error."""
+    if isinstance(exc, requests.exceptions.InvalidHeader):
+        return (
+            'The API key (or another request header) contains invalid '
+            'characters. Check the key in Settings.'
+        )
+    if isinstance(exc, UnicodeEncodeError):
+        return (
+            'The API key contains characters that cannot be sent '
+            '(e.g. smart quotes). Re-enter it in Settings.'
+        )
+    return redact_secrets(exc)
+
 
 class _RetryableError(Exception):
     """Internal marker: a transient transport/HTTP failure worth retrying."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _is_complete_json(text: str) -> bool:
+    """True when *text* is a self-contained JSON value."""
+    try:
+        json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return True
+
+
+def _http_error_detail(exc: requests.HTTPError) -> str:
+    """Build a useful message from an HTTPError, including the response body.
+
+    A bare HTTPError only reports the status line; the body is where
+    OpenAI-compatible servers put "model not found", "invalid api key", etc.
+    """
+    base = str(exc)
+    response = getattr(exc, 'response', None)
+    if response is None:
+        return base
+    try:
+        body = response.text
+    except Exception:
+        return base
+    if not isinstance(body, str) or not body.strip():
+        return base
+    body = body.strip()
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict):
+            err = parsed.get('error')
+            if isinstance(err, dict) and err.get('message'):
+                return str(err['message'])
+            if isinstance(err, str) and err:
+                return err
+    except (json.JSONDecodeError, ValueError):
+        pass
+    if len(body) > 400:
+        body = body[:400] + '...'
+    return f"{base}: {body}"
+
+
+def _parse_retry_after(exc: requests.HTTPError) -> float | None:
+    """Return the server's requested Retry-After delay in seconds, if any.
+
+    Retrying a 429 after a fixed 1 s regardless of what the server asked for
+    just produces more 429s. Supports both the delta-seconds and HTTP-date
+    forms.
+    """
+    response = getattr(exc, 'response', None)
+    if response is None:
+        return None
+    try:
+        headers = response.headers
+        raw = headers.get('Retry-After') if headers else None
+    except Exception:
+        return None
+    if not raw or not isinstance(raw, (str, int, float)):
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        when = parsedate_to_datetime(str(raw))
+    except (TypeError, ValueError):
+        return None
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc) if when.tzinfo else datetime.now()
+    return max(0.0, (when - now).total_seconds())
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -139,16 +270,22 @@ def with_sampling_override(
     preset: APIPreset,
     temperature: float | None = None,
     min_p: float | None = None,
+    model: str | None = None,
+    context_size: int | None = None,
 ) -> APIPreset:
-    """Return *preset* with per-chat sampling overrides applied.
+    """Return *preset* with per-chat overrides applied.
 
     ``None`` values keep the preset's setting.  Pure function.
     """
-    changes: dict[str, float] = {}
+    changes: dict = {}
     if temperature is not None and temperature != preset.temperature:
         changes['temperature'] = max(0.0, float(temperature))
     if min_p is not None and min_p != preset.min_p:
         changes['min_p'] = min(1.0, max(0.0, float(min_p)))
+    if model is not None and model != preset.model:
+        changes['model'] = str(model)
+    if context_size is not None and context_size != preset.context_size:
+        changes['context_size'] = max(0, int(context_size))
     if not changes:
         return preset
     return replace(preset, **changes)
@@ -158,12 +295,30 @@ class AIClient:
     def __init__(self, preset: APIPreset):
         self.preset = preset
         self._session: Optional[requests.Session] = None
+        self._response = None   # the in-flight streamed response, for cancel()
         self._cancel_requested = False
 
     def _headers(self) -> dict[str, str]:
         h = {'Content-Type': 'application/json'}
         if self.preset.api_key:
-            h['Authorization'] = f'Bearer {self.preset.api_key}'
+            # Trim (stray whitespace comes from copy-paste) and refuse values
+            # that cannot go on the wire BEFORE requests does: its
+            # InvalidHeader exception embeds the whole header value in the
+            # message, which would leak the key into logs and the UI.
+            key = self.preset.api_key.strip()
+            if '\r' in key or '\n' in key:
+                raise RuntimeError(
+                    'The API key contains invalid characters. '
+                    'Check the key in Settings.'
+                ) from None
+            try:
+                key.encode('latin-1')
+            except UnicodeEncodeError:
+                raise RuntimeError(
+                    'The API key contains characters that cannot be sent '
+                    '(e.g. smart quotes). Re-enter it in Settings.'
+                ) from None
+            h['Authorization'] = f'Bearer {key}'
         return h
 
     def _url(self) -> str:
@@ -173,14 +328,34 @@ class AIClient:
     def cancel(self) -> None:
         """Request cancellation of any in-progress generation.
 
-        Closes the underlying HTTP session so an active request is interrupted
-        rather than waiting for the full timeout to elapse.  The flag is never
-        cleared by starting a request: ``cancel()`` may arrive from the UI
-        thread before the worker thread has started iterating, and wiping it
-        would silently lose the cancellation.  Construct a fresh
+        ``Session.close()`` only discards *idle* pooled connections, so it did
+        **not** interrupt a response being read - a server that stalled
+        mid-stream kept the request blocked for the full 120 s timeout, leaving
+        Send/Cancel disabled the whole time. The in-flight response's socket is
+        shut down directly, which does raise out of ``iter_lines()``
+        immediately.
+
+        The flag is never cleared by starting a request: ``cancel()`` may arrive
+        from the UI thread before the worker thread has started iterating, and
+        wiping it would silently lose the cancellation.  Construct a fresh
         :class:`AIClient` per generation instead of reusing a cancelled one.
         """
         self._cancel_requested = True
+        response = self._response
+        if response is not None:
+            # Force-close the socket; without this a stalled read blocks until
+            # the request timeout expires.
+            try:
+                raw = getattr(response, 'raw', None)
+                sock = getattr(raw, '_fp', None)
+                if sock is not None:
+                    sock.close()
+            except Exception:
+                pass
+            try:
+                response.close()
+            except Exception:
+                pass
         session = self._session
         if session is not None:
             try:
@@ -194,9 +369,12 @@ class AIClient:
 
     def _max_retries(self) -> int:
         try:
-            return max(0, int(getattr(self.preset, 'retry_attempts', 2)))
+            value = int(getattr(self.preset, 'retry_attempts', 2))
         except (TypeError, ValueError):
             return 2
+        # Clamp: the value comes from user settings, and an unbounded retry
+        # count turns a mis-configured preset into an infinite loop.
+        return max(0, min(5, value))
 
     def _cancellable_sleep(self, seconds: float) -> None:
         """Sleep in short slices so cancel() interrupts the backoff promptly."""
@@ -215,13 +393,15 @@ class AIClient:
         return isinstance(status, int) and status in _RETRYABLE_STATUS_CODES
 
     def generate(self, system_prompt: str, user_prompt: str, stream: bool = False) -> str | Generator[str, None, None]:
-        payload = self._build_payload(
-            [
-                {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': user_prompt},
-            ],
-            stream,
-        )
+        messages = [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt},
+        ]
+        # This path used to send the prompts untrimmed, so a "Fill Missing
+        # Fields" request (which pastes every card field) could exceed the
+        # provider's context and be rejected outright.
+        messages = trim_messages(messages, self.preset.context_size, self.preset.max_tokens)
+        payload = self._build_payload(messages, stream)
 
         if stream:
             return self._generate_stream(payload)
@@ -236,11 +416,22 @@ class AIClient:
         don't trip up backends that reject unknown keys.
         """
         p = self.preset
+        # The settings dialog allows any combination, including a 512-token
+        # context with a 32768 output length. Every provider rejects a
+        # max_tokens larger than the window, so clamp it to something that can
+        # actually be satisfied instead of sending a guaranteed 400.
+        max_tokens = max(1, int(p.max_tokens or 1))
+        context = max(1, int(p.context_size or 1))
+        if max_tokens >= context:
+            logger.warning(
+                "max_tokens (%d) >= context size (%d); clamping", max_tokens, context,
+            )
+            max_tokens = max(1, context // 2)
         payload: dict[str, Any] = {
             'model': p.model,
             'messages': messages,
             'temperature': p.temperature,
-            'max_tokens': p.max_tokens,
+            'max_tokens': max_tokens,
             'stream': stream,
         }
         if p.top_p < 1.0:
@@ -279,7 +470,9 @@ class AIClient:
         propagates ``requests.HTTPError`` for permanent HTTP failures.
         """
         self._session = requests.Session()
+        self._response = None
         produced = False
+        resp = None
         try:
             try:
                 resp = self._session.post(
@@ -289,43 +482,110 @@ class AIClient:
                     stream=True,
                     timeout=120,
                 )
+                self._response = resp
                 resp.raise_for_status()
             except requests.HTTPError as exc:
+                # Surface the server's explanation: a bare HTTPError string for
+                # a 400 is just "400 Client Error", which tells the user
+                # nothing about (say) an unknown model.
+                detail = _http_error_detail(exc)
                 if self._http_error_is_retryable(exc):
-                    raise _RetryableError(f"API error: {exc}") from exc
+                    retry_after = _parse_retry_after(exc)
+                    raise _RetryableError(
+                        f"API error: {redact_secrets(detail)}", retry_after=retry_after,
+                    ) from exc
+                # Keep raising HTTPError (callers and tests rely on the type)
+                # but fold the server's explanation into the message, which
+                # would otherwise be just "401 Client Error: Unauthorized".
+                if detail != str(exc):
+                    exc.args = (redact_secrets(detail),) + tuple(exc.args[1:])
                 raise
+            except _PERMANENT_CONFIG_ERRORS as exc:
+                # Permanent config problem: no retry, and no verbatim message
+                # (it can carry the API key). ``from None`` keeps the original
+                # exception - and its leaky message - out of every traceback.
+                raise RuntimeError(_permanent_config_message(exc)) from None
+            except _RETRYABLE_TRANSPORT_ERRORS as exc:
+                if produced:
+                    raise
+                raise _RetryableError(
+                    f"Connection failed: {redact_secrets(exc)}"
+                ) from None
+
+            # SSE: an event may span several "data:" lines which must be joined
+            # with a newline. Most providers instead send one complete JSON
+            # object per line with no blank separator, so a line that already
+            # parses on its own is emitted immediately rather than buffered.
+            pending: list[str] = []
+
+            def flush() -> Generator[str, None, None]:
+                # ``produced`` must flip here too: content delivered through
+                # a multi-line SSE event counts as output, and a later
+                # transport error must not retry and duplicate it.
+                nonlocal produced
+                if pending:
+                    joined = '\n'.join(pending)
+                    pending.clear()
+                    for piece in self._emit_sse_event(joined):
+                        produced = True
+                        yield piece
+
             for line in resp.iter_lines():
                 if self._cancel_requested:
                     raise RuntimeError('Generation cancelled')
                 if not line:
+                    yield from flush()
                     continue
                 line_str = line.decode('utf-8', errors='replace')
-                # SSE allows an optional single space after "data:".
                 if not line_str.startswith('data:'):
+                    # A non-data field (event:, id:, comment) terminates an
+                    # event per the SSE spec.
+                    yield from flush()
                     continue
                 data_str = line_str[5:].lstrip(' ')
                 if data_str.strip() == '[DONE]':
                     break
-                try:
-                    chunk = json.loads(data_str)
-                    if isinstance(chunk, dict) and chunk.get('error'):
-                        err = chunk['error']
-                        msg = err.get('message', str(err)) if isinstance(err, dict) else str(err)
-                        raise RuntimeError(f"API stream error: {msg}")
-                    choices = chunk.get('choices', [])
-                    if choices:
-                        delta = choices[0].get('delta', {})
-                        content = delta.get('content', '')
-                        if content:
-                            produced = True
-                            yield content
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
-        except (requests.ConnectionError, requests.Timeout) as exc:
+                if _is_complete_json(data_str):
+                    yield from flush()
+                    for piece in self._emit_sse_event(data_str):
+                        produced = True
+                        yield piece
+                else:
+                    pending.append(data_str)
+            yield from flush()
+        except _RETRYABLE_TRANSPORT_ERRORS as exc:
+            if produced or self._cancel_requested:
+                # A forced socket close during cancel() surfaces here; report it
+                # as a cancellation rather than a connection failure (and never
+                # retry it).
+                if self._cancel_requested:
+                    raise RuntimeError('Generation cancelled') from exc
+                raise
+            raise _RetryableError(
+                f"Connection failed: {redact_secrets(exc)}"
+            ) from None
+        except requests.HTTPError:
+            # Already enriched with the response body above; the type is part
+            # of the contract callers rely on.
+            raise
+        except requests.RequestException as exc:
+            # Anything else from requests (protocol error, undecodable body)
+            # is a genuine failure, but must not surface as a bare requests
+            # type in the UI.
             if produced:
                 raise
-            raise _RetryableError(f"Connection failed: {exc}") from exc
+            raise RuntimeError(
+                f"API request failed: {redact_secrets(exc)}"
+            ) from None
         finally:
+            # Always release the connection: without this a streamed response
+            # holds its socket until the session is collected.
+            self._response = None
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
             session = self._session
             self._session = None
             if session is not None:
@@ -333,6 +593,29 @@ class AIClient:
                     session.close()
                 except Exception:
                     pass
+
+    @staticmethod
+    def _emit_sse_event(data_str: str) -> Generator[str, None, None]:
+        """Yield the text content of one assembled SSE event payload."""
+        try:
+            chunk = json.loads(data_str)
+        except json.JSONDecodeError:
+            logger.debug("Skipping unparsable SSE payload: %r", data_str[:200])
+            return
+        if not isinstance(chunk, dict):
+            # Some gateways emit a bare array for an error payload; treat it
+            # as "no content" instead of raising AttributeError on .get().
+            return
+        if chunk.get('error'):
+            err = chunk['error']
+            msg = err.get('message', str(err)) if isinstance(err, dict) else str(err)
+            raise RuntimeError(f"API stream error: {msg}")
+        choices = chunk.get('choices') or []
+        if not choices:
+            return
+        delta = choices[0].get('delta') or {}
+        if isinstance(delta, dict) and delta.get('content'):
+            yield delta['content']
 
     def _generate_stream(self, payload: dict) -> Generator[str, None, None]:
         max_retries = self._max_retries()
@@ -346,7 +629,10 @@ class AIClient:
             except _RetryableError as exc:
                 if attempt >= max_retries:
                     raise RuntimeError(str(exc)) from exc
-                delay = _backoff_delay(attempt)
+                # Honour Retry-After when the server sent one; fall back to
+                # exponential backoff otherwise.
+                delay = exc.retry_after if exc.retry_after is not None else _backoff_delay(attempt)
+                delay = min(delay, _BACKOFF_MAX_SECONDS * 5)
                 logger.warning(
                     "API request failed (%s); retrying in %.0f s (attempt %d/%d)",
                     exc, delay, attempt + 1, max_retries,
@@ -397,9 +683,15 @@ class AIClient:
         if system and system.strip():
             full_messages.append({'role': 'system', 'content': system})
         full_messages.extend(messages)
-        full_messages = trim_messages(full_messages, self.preset.context_size, self.preset.max_tokens)
         if post_history and post_history.strip():
             full_messages.append({'role': 'system', 'content': post_history})
+        # Trim with the post-history text already in place: it used to be
+        # appended afterwards, so unbounded card-controlled PHI text was never
+        # charged against the context budget and the request could overshoot
+        # by its full length. trim_messages keeps a trailing system message.
+        full_messages = trim_messages(
+            full_messages, self.preset.context_size, self.preset.max_tokens,
+        )
         payload = self._build_payload(full_messages, stream)
         if stream:
             return self._generate_stream(payload)
@@ -443,6 +735,36 @@ def _message_token_cost(msg: dict, token_fn) -> int:
     return cost
 
 
+def _truncate_to_tokens(msg: dict, budget: int, token_fn):
+    """Return *msg* with its text trimmed to roughly *budget* tokens.
+
+    Used only when the system prompt alone would overflow the context window.
+    Returns None when the message has no trimmable text (e.g. multimodal), so
+    the caller can leave it untouched.
+    """
+    content = msg.get('content')
+    if not isinstance(content, str) or not content:
+        return None
+    if budget <= 0:
+        return None
+    # Binary-search the character budget: tokens/char is roughly constant.
+    text = content
+    if token_fn(text) <= budget:
+        return msg
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if token_fn(text[:mid]) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    if lo <= 0:
+        return None
+    out = dict(msg)
+    out['content'] = text[:lo] + '\n[... system prompt truncated to fit the context window ...]'
+    return out
+
+
 def split_for_context(
     messages: list[dict[str, Any]],
     context_size: int,
@@ -461,7 +783,11 @@ def split_for_context(
         return messages, []
     if token_fn is None:
         from src.token_counter import count_tokens as token_fn
-    budget = context_size - max(0, max_tokens)
+    # max_tokens must fit inside the context: a preset with a 512 context and a
+    # 32768 output length is a guaranteed 400 from every provider, and left
+    # unclamped it made the budget calculation below meaningless.
+    reserved = max(0, min(max_tokens, max(1, context_size - 1)))
+    budget = context_size - reserved
     if budget <= 1:
         budget = max(1, context_size // 2)
 
@@ -469,12 +795,21 @@ def split_for_context(
     rest = list(messages[1:]) if system is not None else list(messages)
     if not rest:
         return messages, []
-    if system is not None:
-        budget -= _message_token_cost(system, token_fn)
-        if budget <= 0:
-            budget = 1  # always allow at least the most recent message
-
     kept: list[dict[str, Any]] = [rest[-1]]
+    if system is not None:
+        system_cost = _message_token_cost(system, token_fn)
+        # A system prompt (or the newest message) that alone exceeds the
+        # window still has to be sent, or the request is meaningless - but the
+        # output allowance then has to shrink, otherwise the *sum* provably
+        # exceeds the context. Trim the system prompt as a last resort so the
+        # payload stays inside the window.
+        if system_cost > budget - _message_token_cost(kept[0], token_fn):
+            trimmed = _truncate_to_tokens(system, budget, token_fn)
+            if trimmed is not None:
+                system = trimmed
+                system_cost = _message_token_cost(system, token_fn)
+        budget = max(1, budget - system_cost)
+
     total = _message_token_cost(kept[0], token_fn)
     dropped: list[dict[str, Any]] = []
     for msg in reversed(rest[:-1]):
@@ -538,14 +873,50 @@ def _try_parse_json(text: str) -> Optional[dict]:
             return obj
     except (json.JSONDecodeError, ValueError):
         pass
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if match:
+    # Scan for the first balanced JSON object instead of a greedy
+    # ``\{.*\}``: the greedy match spans from the first '{' to the LAST '}', so
+    # any trailing prose (or a second object) after the JSON made it
+    # unparsable and the whole generation was discarded.
+    for start in (i for i, ch in enumerate(text) if ch == '{'):
+        candidate = _balanced_object(text, start)
+        if candidate is None:
+            continue
         try:
-            obj = json.loads(match.group())
-            if isinstance(obj, dict):
-                return obj
+            obj = json.loads(candidate)
         except (json.JSONDecodeError, ValueError):
-            pass
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def _balanced_object(text: str, start: int) -> Optional[str]:
+    """Return the brace-balanced JSON object starting at *start*, or None.
+
+    String literals and their escapes are skipped so a '}' inside a value
+    doesn't end the object early.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
     return None
 
 

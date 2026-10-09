@@ -27,7 +27,9 @@ def _check_dependencies() -> list[str]:
     Returns a list of missing package names.
     """
     import importlib.util
-    required = ['PyQt6', 'PIL', 'tiktoken', 'requests']
+    # cryptography encrypts the API keys on macOS/Linux - without it they fall
+    # back to plain text silently - so it is required, not optional.
+    required = ['PyQt6', 'PIL', 'tiktoken', 'requests', 'markdown', 'cryptography']
     missing = []
     for name in required:
         if importlib.util.find_spec(name) is None:
@@ -59,7 +61,7 @@ def _show_missing_dep_error(missing: list[str]) -> None:
         return
     # The reference must be kept: without it a freshly created QApplication
     # could be garbage-collected before the message box is shown.
-    app = QApplication.instance() or QApplication([sys.argv[0]])  # noqa: F841
+    app = QApplication.instance() or QApplication([sys.argv[0]])
     QMessageBox.critical(None, 'ST Explorer - Missing Dependencies', message)
 
 
@@ -101,6 +103,26 @@ def main():
             )
             sys.exit(0)
 
+        from src import vault
+        if vault.get_vault().enabled:
+            # Encrypted library: the password must be verified and the
+            # database unsealed before anything opens it.
+            from src.ui.widgets.unlock_dialog import UnlockDialog
+            unlock = UnlockDialog()
+            if unlock.exec() != unlock.DialogCode.Accepted:
+                logger.info("Startup cancelled at the unlock prompt")
+                sys.exit(0)
+            try:
+                vault.unseal_database()
+            except vault.VaultError:
+                logging.getLogger(__name__).exception("Database unseal failed")
+                QMessageBox.critical(
+                    None, 'ST Explorer',
+                    'The library database could not be unlocked.\n\n'
+                    'See the log for details: ~/.st-explorer/app.log',
+                )
+                sys.exit(1)
+
         db = LibraryDatabase()
         window = MainWindow(db)
     except Exception:
@@ -113,6 +135,18 @@ def main():
         sys.exit(1)
 
     window.show()
+
+    # Seal the database on the way out (aboutToQuit fires even when the
+    # dirty-changes guard cancels a close, but by then exec() is returning
+    # and the seal only runs once the event loop is done).
+    def _seal_on_exit() -> None:
+        try:
+            from src import vault
+            vault.seal_database()
+        except Exception:
+            logging.getLogger(__name__).exception("Failed to seal the library database")
+
+    app.aboutToQuit.connect(_seal_on_exit)
 
     logger.info("ST Explorer started")
     sys.exit(app.exec())

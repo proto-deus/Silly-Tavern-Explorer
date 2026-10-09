@@ -3,17 +3,30 @@ from __future__ import annotations
 from typing import Iterable
 
 
-def normalize_tag(tag: str) -> str:
+def normalize_tag(tag: object) -> str:
     """Normalize a tag for storage/comparison: stripped and lower-cased.
 
     Pure function so tag-list manipulation can be unit-tested without a DB
     or Qt event loop.
+
+    Card data is third-party input, so a tag may be a number, ``None`` or a
+    nested list (``"tags": [1, "ok", ["x"]]``). Coerce rather than crash: the
+    library-level tag listing runs over *every* card, so a single malformed
+    card would otherwise take down the tag sidebar and tag manager.
     """
-    return (tag or '').strip().lower()
+    if tag is None:
+        return ''
+    if not isinstance(tag, str):
+        try:
+            tag = str(tag)
+        except Exception:
+            return ''
+    return tag.strip().lower()
 
 
 def _normalize_all(tags: Iterable[str]) -> list[str]:
-    return [normalize_tag(t) for t in tags if normalize_tag(t)]
+    normalized = (normalize_tag(t) for t in tags)
+    return [n for n in normalized if n]
 
 
 def rename_tag(tags: list[str], old: str, new: str) -> list[str]:

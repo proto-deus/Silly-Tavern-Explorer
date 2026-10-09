@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QStackedWidget,
@@ -34,11 +35,13 @@ from src.ai_client import PRESETS, preset_from_saved
 from src.settings_manager import (
     load_active_provider,
     load_macro_settings,
+    load_provider_models,
     load_provider_settings,
     load_test_settings,
     load_user_persona,
     save_all_provider_settings,
     save_macro_settings,
+    save_provider_models,
     save_test_settings,
     save_user_persona,
     set_active_provider,
@@ -85,7 +88,19 @@ class _FetchModelsWorker(QThread):
             url = self.base_url.rstrip('/') + '/models'
             headers = {'Content-Type': 'application/json'}
             if self.api_key:
-                headers['Authorization'] = f'Bearer {self.api_key}'
+                # Same rule as ai_client: trim, and refuse values requests
+                # would reject with an InvalidHeader (whose message embeds
+                # the whole header value, i.e. the key).
+                key = self.api_key.strip()
+                try:
+                    key.encode('latin-1')
+                except UnicodeEncodeError:
+                    self.error.emit(
+                        'The API key contains characters that cannot be sent. '
+                        'Re-enter it in Settings.'
+                    )
+                    return
+                headers['Authorization'] = f'Bearer {key}'
             resp = requests.get(url, headers=headers, timeout=15, stream=True)
             try:
                 self._check_cancel()
@@ -149,6 +164,15 @@ class _APIPanel(QWidget):
         self._key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         form.addRow('API Key:', self._key_edit)
 
+        # Shown when a stored key exists but could not be decrypted: the field
+        # reads as empty, which would otherwise look like "no key was ever
+        # saved" and tempt the user to save over the real ciphertext.
+        self._key_warning = QLabel('')
+        self._key_warning.setWordWrap(True)
+        self._key_warning.setStyleSheet('color: #e0a030; ')
+        self._key_warning.setVisible(False)
+        form.addRow('', self._key_warning)
+
         model_row = QHBoxLayout()
         self._model_combo = QComboBox()
         self._model_combo.setEditable(True)
@@ -162,7 +186,7 @@ class _APIPanel(QWidget):
         form.addRow('Model:', model_row)
 
         self._status_label = QLabel('')
-        self._status_label.setStyleSheet('color: #aaa; font-size: 11px;')
+        self._status_label.setStyleSheet('color: #aaa; ')
         form.addRow('', self._status_label)
         layout.addWidget(conn_group)
         layout.addStretch()
@@ -170,10 +194,41 @@ class _APIPanel(QWidget):
     def load_connection(self, connection: dict) -> None:
         self._url_edit.setText(connection.get('base_url', ''))
         self._key_edit.setText(connection.get('api_key', ''))
+        provider = self._preset_combo.currentText()
+        cached = load_provider_models(provider, connection.get('base_url', ''))
+        self._populate_model_combo(cached, connection.get('model', ''))
+        self._refresh_key_warning()
+
+    def _populate_model_combo(self, models: list[str], current: str) -> None:
+        """Fill the model combo from the cached list, keeping *current* visible."""
         self._model_combo.clear()
-        model = connection.get('model', '')
-        if model:
-            self._model_combo.setCurrentText(model)
+        items = list(models)
+        if current and current not in items:
+            items.append(current)
+        self._model_combo.addItems(items)
+        if current:
+            self._model_combo.setCurrentText(current)
+        elif items:
+            self._model_combo.setCurrentIndex(0)
+
+    def _refresh_key_warning(self) -> None:
+        """Surface a stored-but-undecryptable API key.
+
+        ``_read_api_key`` returns '' when decryption fails (leaving the
+        ciphertext intact), so without this the user would see an empty field,
+        assume nothing was saved, and hit Save - which is exactly the path that
+        used to destroy the key.
+        """
+        from src.settings_manager import undecryptable_api_key_providers
+        preset = self._preset_combo.currentText()
+        if preset in undecryptable_api_key_providers():
+            self._key_warning.setText(
+                "This provider's saved key could not be decrypted. It has been "
+                "left untouched - re-enter the key and Save to replace it."
+            )
+            self._key_warning.setVisible(True)
+        else:
+            self._key_warning.setVisible(False)
 
     @staticmethod
     def _fetch_worker_is_alive(worker) -> bool:
@@ -194,10 +249,14 @@ class _APIPanel(QWidget):
         # result must not repopulate the model list for this one.
         if self._fetch_worker_is_alive(self._fetch_worker):
             self._fetch_worker.cancel()
+        # Drop wrappers of workers that already finished so the registry
+        # cannot grow without bound across repeated fetches.
+        _LIVE_FETCH_WORKERS[:] = [w for w in _LIVE_FETCH_WORKERS if not w.isFinished()]
         api_key = self._key_edit.text().strip()
         self._fetch_btn.setEnabled(False)
         self._status_label.setText('Fetching models...')
         self._fetch_request_url = base_url
+        self._fetch_request_provider = self._preset_combo.currentText()
         # Parentless + registry-tracked: the thread can never be destroyed
         # while running, even if this dialog closes first.
         self._fetch_worker = _FetchModelsWorker(base_url, api_key)
@@ -210,12 +269,26 @@ class _APIPanel(QWidget):
         self._fetch_worker.start()
 
     def _release_fetch_worker(self) -> None:
+        worker = self.sender()
         try:
-            _LIVE_FETCH_WORKERS.remove(self.sender())
+            _LIVE_FETCH_WORKERS.remove(worker)
         except ValueError:
             pass
+        if worker is getattr(self, '_fetch_worker', None):
+            self._fetch_worker = None
+
+    def _is_current_fetch(self) -> bool:
+        """True when the emitting worker is the one for the current request.
+
+        A newer fetch overwrites the request context, so a late result from a
+        superseded worker must not be cached or shown as its own.
+        """
+        worker = self.sender()
+        return worker is None or worker is getattr(self, '_fetch_worker', None)
 
     def _on_models_fetched(self, models: list[str]) -> None:
+        if not self._is_current_fetch():
+            return
         self._fetch_btn.setEnabled(True)
         # Drop stale results: the user may have changed the URL/provider
         # while this fetch was in flight.
@@ -224,21 +297,26 @@ class _APIPanel(QWidget):
         if not models:
             self._status_label.setText('No models found.')
             return
-        current = self._model_combo.currentText()
-        self._model_combo.clear()
-        self._model_combo.addItems(models)
-        if current and current in models:
-            self._model_combo.setCurrentText(current)
-        elif models:
-            self._model_combo.setCurrentIndex(0)
+        # Cache the list so the combo (and the Test tab) can be populated
+        # without re-fetching; Fetch Models only refreshes it.
+        provider = getattr(self, '_fetch_request_provider', '') or self._preset_combo.currentText()
+        try:
+            save_provider_models(provider, models, self._fetch_request_url)
+        except Exception:
+            logger.exception("Failed to cache fetched model list")
+        self._populate_model_combo(models, self._model_combo.currentText())
         self._status_label.setText(f'Found {len(models)} model(s).')
 
     def _on_models_error(self, error: str) -> None:
-        self._fetch_btn.setEnabled(True)
+        if self._is_current_fetch():
+            self._fetch_btn.setEnabled(True)
+        from src.ai_client import redact_secrets
+        error = redact_secrets(error)
         short = error.splitlines()[0] if error else 'Unknown error'
         if len(short) > 100:
             short = short[:97] + '...'
-        self._status_label.setText(f'Error: {short}')
+        if self._is_current_fetch():
+            self._status_label.setText(f'Error: {short}')
         logger.warning("Model fetch error: %s", error)
 
     def cleanup(self) -> None:
@@ -537,6 +615,195 @@ class _TestPanel(QWidget):
         }
 
 
+class _EncryptionPanel(QWidget):
+    """Data-encryption management (enable / change password / disable).
+
+    Actions are immediate (with their own confirmation dialogs) rather than
+    Save/Cancel-bound: enabling or disabling encryption cannot be deferred
+    until the dialog is accepted.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+
+        status_group = QGroupBox('Status')
+        status_form = QFormLayout(status_group)
+        self._status_label = QLabel('')
+        self._recovery_label = QLabel('')
+        status_form.addRow('Data encryption:', self._status_label)
+        status_form.addRow('Recovery key:', self._recovery_label)
+        layout.addWidget(status_group)
+
+        self._note = QLabel('')
+        self._note.setWordWrap(True)
+        self._note.setStyleSheet('color: #888888;')
+        layout.addWidget(self._note)
+
+        actions = QGroupBox('Actions')
+        actions_layout = QVBoxLayout(actions)
+
+        self._enable_btn = QPushButton('Enable Encryption...')
+        self._enable_btn.clicked.connect(self._on_enable)
+        actions_layout.addWidget(self._enable_btn)
+
+        self._change_btn = QPushButton('Change Password...')
+        self._change_btn.clicked.connect(self._on_change_password)
+        actions_layout.addWidget(self._change_btn)
+
+        self._disable_btn = QPushButton('Disable Encryption...')
+        self._disable_btn.clicked.connect(self._on_disable)
+        actions_layout.addWidget(self._disable_btn)
+
+        layout.addWidget(actions)
+        layout.addStretch()
+
+        self._refresh()
+
+    def _refresh(self) -> None:
+        from src import vault
+        v = vault.get_vault()
+        enabled = v.enabled
+        self._status_label.setText('Enabled' if enabled else 'Disabled')
+        self._recovery_label.setText(
+            'Configured' if (enabled and v.has_recovery) else 'Not configured'
+        )
+        self._enable_btn.setEnabled(not enabled)
+        self._change_btn.setEnabled(enabled)
+        self._disable_btn.setEnabled(enabled)
+        if enabled:
+            self._note.setText(
+                'The database is encrypted when the app closes and unlocked '
+                'with your password at startup. Exported files and '
+                'SillyTavern sync copies are always plain text.'
+            )
+        else:
+            self._note.setText(
+                'Your library is currently stored in plain text on disk.'
+            )
+
+    def _run_migration(self, seal: bool) -> tuple[bool, int, int]:
+        """Run one seal/unseal migration pass.
+
+        Returns ``(completed_ok, changed, failed)``. A cancelled pass is
+        never a success: the caller must not update vault state from it.
+        """
+        from src.ui.widgets.encryption_dialogs import MigrationDialog
+        migration = MigrationDialog(seal, parent=self)
+        migration.start()
+        migration.exec()
+        changed, failed = migration.result
+        completed = migration.completed_ok
+        migration.cleanup()
+        return completed, changed, failed
+
+    def _on_enable(self) -> None:
+        from src import vault
+        from src.ui.widgets.encryption_dialogs import (
+            EnableEncryptionDialog,
+            RecoveryKeyDialog,
+        )
+        dlg = EnableEncryptionDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        password, with_recovery = dlg.get_values()
+        try:
+            recovery_key = vault.get_vault().enable(password, with_recovery)
+        except vault.VaultError as exc:
+            QMessageBox.critical(self, 'Enable Encryption', str(exc))
+            return
+        if recovery_key:
+            RecoveryKeyDialog(recovery_key, self).exec()
+        completed, changed, failed = self._run_migration(seal=True)
+        while not completed:
+            # The envelope exists already (enable() ran), so the only way to
+            # finish is to keep sealing - offer that instead of leaving the
+            # library half-plain-text with no path back.
+            answer = QMessageBox.question(
+                self, 'Enable Encryption',
+                'Encryption is on, but the migration did not finish, so some '
+                'files are still plain text on disk.\n\n'
+                'Continue encrypting them now?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                QMessageBox.warning(
+                    self, 'Enable Encryption',
+                    'Some library files remain in plain text on disk. To '
+                    'finish the migration later, use "Disable Encryption" '
+                    'and then enable it again.',
+                )
+                break
+            completed, changed, failed = self._run_migration(seal=True)
+        if completed and failed:
+            QMessageBox.warning(
+                self, 'Enable Encryption',
+                f'Encryption is on, but {failed} file(s) could not be '
+                'encrypted. See the log for details.',
+            )
+        self._refresh()
+
+    def _on_change_password(self) -> None:
+        from src import vault
+        from src.ui.widgets.encryption_dialogs import ChangePasswordDialog
+        dlg = ChangePasswordDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        current, new = dlg.get_values()
+        try:
+            vault.get_vault().change_password(current, new)
+        except vault.VaultError as exc:
+            QMessageBox.critical(self, 'Change Password', str(exc))
+            return
+        QMessageBox.information(self, 'Change Password', 'Password changed.')
+
+    def _on_disable(self) -> None:
+        from src import vault
+        from src.ui.widgets.encryption_dialogs import DisableEncryptionDialog
+        dlg = DisableEncryptionDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        password = dlg.get_password()
+        completed, changed, failed = self._run_migration(seal=False)
+        while not completed:
+            # A cancelled/failed unseal pass must NOT drop the envelope: the
+            # untouched files are still encrypted and the key would be gone.
+            answer = QMessageBox.question(
+                self, 'Disable Encryption',
+                'Decryption did not finish, so encryption is still on and no '
+                'data has been lost. Some files are already decrypted.\n\n'
+                'Continue decrypting the remaining files now?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                QMessageBox.warning(
+                    self, 'Disable Encryption',
+                    'Encryption remains enabled. Re-run "Disable Encryption" '
+                    'to finish the migration.',
+                )
+                return
+            completed, changed, failed = self._run_migration(seal=False)
+        if failed:
+            QMessageBox.warning(
+                self, 'Disable Encryption',
+                f'{failed} file(s) could not be decrypted. Encryption is '
+                'still on so no data is left unreadable.',
+            )
+            return
+        try:
+            if not vault.get_vault().verify_password(password):
+                QMessageBox.critical(
+                    self, 'Disable Encryption',
+                    'The password is no longer correct. Encryption is still on.',
+                )
+                return
+            vault.get_vault().finish_disable()
+        except vault.VaultError as exc:
+            QMessageBox.critical(self, 'Disable Encryption', str(exc))
+            return
+        self._refresh()
+
+
 class SettingsDialog(QDialog):
     """Master settings dialog with API / LLM / Macros / Prompts / Test tabs."""
 
@@ -576,11 +843,13 @@ class SettingsDialog(QDialog):
         )
         self._prompts_panel = _PromptsPanel()
         self._test_panel = _TestPanel(test)
+        self._encryption_panel = _EncryptionPanel()
         self._tabs.addTab(self._api_panel, 'API')
         self._tabs.addTab(self._llm_panel, 'LLM')
         self._tabs.addTab(self._macros_panel, 'Macros')
         self._tabs.addTab(self._prompts_panel, 'Prompts')
         self._tabs.addTab(self._test_panel, 'Test')
+        self._tabs.addTab(self._encryption_panel, 'Encryption')
         layout.addWidget(self._tabs)
 
         buttons = QDialogButtonBox(
@@ -622,6 +891,9 @@ class SettingsDialog(QDialog):
         save_test_settings(test)
         logger.info("Settings saved")
         self.settings_changed.emit()
+        # accept() does not go through closeEvent, so the fetch worker must
+        # be shut down here too or outlive the dialog mid-run.
+        self._api_panel.cleanup()
         self.accept()
 
     def closeEvent(self, event) -> None:

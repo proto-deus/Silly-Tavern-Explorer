@@ -86,7 +86,7 @@ class LorebookSyncDialog(QDialog):
 
         header_row = QHBoxLayout()
         self._path_label = QLabel('')
-        self._path_label.setStyleSheet('font-size: 12px; color: #ccc;')
+        self._path_label.setStyleSheet('color: #ccc;')
         header_row.addWidget(self._path_label)
         header_row.addStretch()
         refresh_btn = QPushButton('Refresh')
@@ -112,7 +112,7 @@ class LorebookSyncDialog(QDialog):
         self._detail_text.setReadOnly(True)
         self._detail_text.setMaximumHeight(140)
         self._detail_text.setStyleSheet(
-            'font-family: Consolas, "Courier New", monospace; font-size: 11px;'
+            'font-family: Consolas, "Courier New", monospace; '
         )
         detail_layout.addWidget(self._detail_text)
         layout.addWidget(detail_container)
@@ -150,7 +150,7 @@ class LorebookSyncDialog(QDialog):
         layout.addLayout(btn_row)
 
         self._status_label = QLabel('')
-        self._status_label.setStyleSheet('color: #aaa; font-size: 11px;')
+        self._status_label.setStyleSheet('color: #aaa; ')
         layout.addWidget(self._status_label)
 
         self._update_path_label()

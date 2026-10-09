@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import traceback
 import uuid
 from pathlib import Path
@@ -86,6 +87,11 @@ class CharacterCreationWizard(QDialog):
         self.db = db
         self._preset = preset
         self._worker: _StreamWorker | None = None
+        # Every live worker, not just the newest. A superseded worker keeps
+        # running until its network read times out, and the dialog must never be
+        # destroyed while any of them is alive (that aborts the process), so
+        # they all have to be tracked and waited on.
+        self._workers: list[_StreamWorker] = []
         self._phase: str = 'ask'  # 'ask' | 'card'
         self._step_index = 0
         self._answers: dict[str, str] = {key: '' for key, *_ in _STEPS}
@@ -101,7 +107,7 @@ class CharacterCreationWizard(QDialog):
         # Step list.
         self._step_list = QListWidget()
         self._step_list.setFixedWidth(180)
-        for key, title, _ in _STEPS:
+        for _key, title, _ in _STEPS:
             self._step_list.addItem(QListWidgetItem(title))
         self._step_list.addItem(QListWidgetItem('Character Image'))
         self._step_list.addItem(QListWidgetItem('Review & Generate'))
@@ -121,7 +127,7 @@ class CharacterCreationWizard(QDialog):
             pl = QVBoxLayout(page)
             pl.setContentsMargins(0, 0, 0, 0)
             title_lbl = QLabel(title)
-            title_lbl.setStyleSheet('font-size: 14px; font-weight: bold; color: #e0e0e0;')
+            title_lbl.setStyleSheet('font-weight: bold; color: #e0e0e0;')
             pl.addWidget(title_lbl)
             chat = QTextEdit()
             chat.setReadOnly(True)
@@ -145,10 +151,10 @@ class CharacterCreationWizard(QDialog):
         ipl = QVBoxLayout(self._image_page)
         ipl.setContentsMargins(0, 0, 0, 0)
         img_title = QLabel('Character Image')
-        img_title.setStyleSheet('font-size: 14px; font-weight: bold; color: #e0e0e0;')
+        img_title.setStyleSheet('font-weight: bold; color: #e0e0e0;')
         ipl.addWidget(img_title)
         img_note = QLabel('Upload an image to use as the character avatar (optional).')
-        img_note.setStyleSheet('color: #aaa; font-size: 12px;')
+        img_note.setStyleSheet('color: #aaa; ')
         img_note.setWordWrap(True)
         ipl.addWidget(img_note)
         upload_btn = QPushButton('Upload Image...')
@@ -169,17 +175,17 @@ class CharacterCreationWizard(QDialog):
         rpl = QVBoxLayout(self._review_page)
         rpl.setContentsMargins(0, 0, 0, 0)
         rev_title = QLabel('Review & Generate')
-        rev_title.setStyleSheet('font-size: 14px; font-weight: bold; color: #e0e0e0;')
+        rev_title.setStyleSheet('font-weight: bold; color: #e0e0e0;')
         rpl.addWidget(rev_title)
         self._review_label = QLabel('')
         self._review_label.setWordWrap(True)
-        self._review_label.setStyleSheet('color: #ccc; font-size: 12px;')
+        self._review_label.setStyleSheet('color: #ccc; ')
         rpl.addWidget(self._review_label)
         self._generate_btn = QPushButton('Generate Card')
         self._generate_btn.clicked.connect(self._on_generate_card)
         rpl.addWidget(self._generate_btn)
         self._streaming_label = QLabel('Generating...')
-        self._streaming_label.setStyleSheet('color: #6cb6ff; font-size: 12px; font-style: italic;')
+        self._streaming_label.setStyleSheet('color: #6cb6ff; font-style: italic;')
         self._streaming_label.setVisible(False)
         rpl.addWidget(self._streaming_label)
         self._card_preview = QTextEdit()
@@ -231,8 +237,10 @@ class CharacterCreationWizard(QDialog):
             self._refresh_review()
 
         self._back_btn.setEnabled(index > 0)
-        self._next_btn.setEnabled(index < self._total_steps() - 1)
-        self._next_btn.setText('Finish' if index == self._total_steps() - 1 else 'Next')
+        # "Finish" used to be disabled at the review step while its handler
+        # sat there as dead code; the review page has its own Generate/Import
+        # actions, so the button is simply not shown there.
+        self._next_btn.setVisible(index < self._total_steps() - 1)
 
     def _on_back(self) -> None:
         if self._step_index > 0:
@@ -240,7 +248,6 @@ class CharacterCreationWizard(QDialog):
 
     def _on_next(self) -> None:
         if self._step_index >= self._total_steps() - 1:
-            self._on_cancel()
             return
         self._go_to_step(self._step_index + 1)
 
@@ -339,21 +346,30 @@ class CharacterCreationWizard(QDialog):
             # The C++ QThread was already destroyed by deleteLater.
             return False
 
+    def _live_workers(self) -> list:
+        """Every still-running stream worker, pruning finished ones."""
+        self._workers = [w for w in self._workers if self._worker_is_alive(w)]
+        return list(self._workers)
+
     def _start_stream(self, system: str, user: str, target_index: int | None) -> None:
-        if self._worker_is_alive(self._worker):
-            # Cooperative cancel only. The old worker is parented to this
-            # dialog and cleans itself up via the built-in finished signal,
-            # so we must NOT wait() (GUI freeze) or drop the reference
-            # (destroy-while-running crash).
-            self._worker.cancel()
+        # Cancel any in-flight stream but keep tracking it: it is parented to
+        # this dialog and cannot be destroyed while running, and dropping the
+        # reference would let reject() tear the dialog down underneath it.
+        for old in self._live_workers():
+            old.cancel()
         client = AIClient(self._preset)
-        self._worker = _StreamWorker(client, system, user, self)
-        self._worker.chunk.connect(lambda text, idx=target_index: self._on_chunk(text, idx))
-        self._worker.completed.connect(lambda full, idx=target_index: self._on_stream_finished(full, idx))
-        self._worker.error.connect(self._on_stream_error)
+        worker = _StreamWorker(client, system, user, self)
+        self._worker = worker
+        self._workers.append(worker)
+        # Handlers ignore signals from superseded workers so a cancelled run
+        # cannot still overwrite the step it was populating.
+        worker.chunk.connect(lambda text, idx=target_index: self._on_chunk(text, idx, worker))
+        worker.completed.connect(
+            lambda full, idx=target_index: self._on_stream_finished(full, idx, worker))
+        worker.error.connect(lambda err: self._on_stream_error(err, worker))
         # Cleanup on the built-in signal so cancelled runs are still deleted.
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._worker.start()
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def _append_speaker(self, chat: QTextEdit, speaker: str) -> None:
         cursor = chat.textCursor()
@@ -361,7 +377,9 @@ class CharacterCreationWizard(QDialog):
         cursor.insertText(f"{speaker}: ")
         chat.setTextCursor(cursor)
 
-    def _on_chunk(self, text: str, target_index: int | None) -> None:
+    def _on_chunk(self, text: str, target_index: int | None, worker=None) -> None:
+        if worker is not None and worker is not self._worker:
+            return
         if self._phase == 'ask' and target_index is not None:
             self._stream_chunk(self._chat_logs[target_index], text)
         elif self._phase == 'card':
@@ -379,7 +397,9 @@ class CharacterCreationWizard(QDialog):
         chat.setTextCursor(cursor)
         chat.ensureCursorVisible()
 
-    def _on_stream_finished(self, full: str, target_index: int | None) -> None:
+    def _on_stream_finished(self, full: str, target_index: int | None, worker=None) -> None:
+        if worker is not None and worker is not self._worker:
+            return
         self._streaming_label.setVisible(False)
         if self._phase == 'ask' and target_index is not None:
             key = _STEPS[target_index][0]
@@ -410,7 +430,9 @@ class CharacterCreationWizard(QDialog):
             self._card_preview.setPlainText(f"Generation error: {e}")
             logger.warning("Wizard card generation error: %s", e)
 
-    def _on_stream_error(self, error: str) -> None:
+    def _on_stream_error(self, error: str, worker=None) -> None:
+        if worker is not None and worker is not self._worker:
+            return
         self._streaming_label.setVisible(False)
         self._generate_btn.setEnabled(True)
         short = error.splitlines()[0] if error else 'Unknown error'
@@ -440,17 +462,21 @@ class CharacterCreationWizard(QDialog):
         save_path = save_dir / f"{safe_name}_{uuid.uuid4().hex[:8]}.png"
 
         try:
+            import io
             from PIL import Image
+            from src import vault
             if self._image_path and Path(self._image_path).exists():
                 img = Image.open(self._image_path).convert('RGBA')
-                img.save(save_path, 'PNG')
             else:
                 img = Image.new('RGBA', (400, 600), (40, 40, 60, 255))
-                img.save(save_path, 'PNG')
+            buf = io.BytesIO()
+            img.save(buf, 'PNG')
+            vault.write_bytes(save_path, buf.getvalue())
             write_chara_card_dual(save_path, save_path, card.to_spec_dict())
             card.source_path = str(save_path)
             char_id = self.db.import_card(save_path)
             if char_id:
+                self._imported = True
                 QMessageBox.information(self, 'Imported', f"'{card.name}' imported to library.")
                 self.library_changed.emit()
                 self.accept()
@@ -465,22 +491,42 @@ class CharacterCreationWizard(QDialog):
 
         Returns True when it is safe to close the dialog; a worker that is
         still finishing (mid network read) keeps the dialog open, because
-        destroying a live QThread aborts the process.
+        destroying a live QThread aborts the process.  *All* live workers are
+        checked, not just the newest - a superseded worker stays alive until its
+        request times out.
         """
-        worker = self._worker
-        if not self._worker_is_alive(worker):
+        live = self._live_workers()
+        if not live:
             return True
-        worker.cancel()
-        if worker.wait(3000):
-            return True
-        self._streaming_label.setText('Cancelling… please close again in a moment.')
-        self._streaming_label.setVisible(True)
-        return False
+        for worker in live:
+            worker.cancel()
+        # Wait on each with a shared budget so a cancelled-but-stuck read can
+        # never hold the dialog open indefinitely. The budget is elapsed time,
+        # not "1ms per worker".
+        budget_end = time.monotonic() + 3.0
+        for worker in live:
+            if worker.isRunning():
+                remaining_ms = int(max(0.0, (budget_end - time.monotonic()) * 1000))
+                if remaining_ms <= 0 or not worker.wait(remaining_ms):
+                    self._streaming_label.setText('Cancelling… please close again in a moment.')
+                    self._streaming_label.setVisible(True)
+                    return False
+        return True
 
     def _on_cancel(self) -> None:
         self.reject()
 
     def reject(self) -> None:
         # Also covers Esc / window-close: never tear down a live worker.
+        # A generated-but-unimported card is thrown away here, so confirm.
+        card = self._generated_card
+        if card is not None and not getattr(self, '_imported', False):
+            if QMessageBox.question(
+                self, 'Discard Character',
+                f"'{card.name}' has been generated but not imported.\n\n"
+                'Discard it?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
         if self._shutdown_worker():
             super().reject()

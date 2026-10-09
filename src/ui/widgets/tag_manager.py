@@ -38,7 +38,7 @@ class TagManagerDialog(QDialog):
         layout = QVBoxLayout(self)
 
         header = QLabel('All tags in the library (with usage counts):')
-        header.setStyleSheet('font-size: 12px; font-weight: bold; color: #ccc;')
+        header.setStyleSheet('font-weight: bold; color: #ccc;')
         layout.addWidget(header)
 
         self._list = QListWidget()
@@ -46,7 +46,7 @@ class TagManagerDialog(QDialog):
         layout.addWidget(self._list)
 
         self._status = QLabel('')
-        self._status.setStyleSheet('color: #aaa; font-size: 11px;')
+        self._status.setStyleSheet('color: #aaa; ')
         layout.addWidget(self._status)
 
         btn_row = QHBoxLayout()
@@ -98,10 +98,26 @@ class TagManagerDialog(QDialog):
             return
         if new_n == old:
             return
-        changed = self.db.rename_tag_all(old, new_n)
+        changed = self._run('rename the tag', lambda: self.db.rename_tag_all(old, new_n))
+        if changed < 0:
+            return
         self._status.setText(f"Renamed '{old}' -> '{new_n}' on {changed} card(s).")
         logger.info("Tag rename: '%s' -> '%s' (%d cards)", old, new_n, changed)
         self._refresh()
+
+    def _run(self, label, fn) -> None:
+        """Run a library-wide tag operation, reporting failures in a dialog.
+
+        These rewrite every card in a single transaction; a failure (locked DB,
+        read-only file) must not escape the slot and abort the process.
+        """
+        try:
+            changed = fn()
+        except Exception as e:
+            logger.exception("Tag operation '%s' failed", label)
+            QMessageBox.critical(self, 'Error', f"Failed to {label}: {e}")
+            return -1
+        return changed
 
     def _on_merge(self) -> None:
         source = self._selected_tag()
@@ -120,7 +136,9 @@ class TagManagerDialog(QDialog):
         )
         if not ok:
             return
-        changed = self.db.merge_tag_all(source, target)
+        changed = self._run('merge the tag', lambda: self.db.merge_tag_all(source, target))
+        if changed < 0:
+            return
         self._status.setText(f"Merged '{source}' into '{target}' on {changed} card(s).")
         logger.info("Tag merge: '%s' -> '%s' (%d cards)", source, target, changed)
         self._refresh()
@@ -137,7 +155,9 @@ class TagManagerDialog(QDialog):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        changed = self.db.delete_tag_all(tag)
+        changed = self._run('delete the tag', lambda: self.db.delete_tag_all(tag))
+        if changed < 0:
+            return
         self._status.setText(f"Deleted '{tag}' from {changed} card(s).")
         logger.info("Tag delete: '%s' (%d cards)", tag, changed)
         self._refresh()

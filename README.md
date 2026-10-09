@@ -15,11 +15,13 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 - **Startup dependency check** — missing packages are reported before Qt loads (native message box on Windows, Qt dialog or terminal message elsewhere)
 - **Single-instance lock** — a second launch detects the running instance and exits
 - **Database backup** — automatic `.bak`/`.bak2` rotation on startup when the DB has changed, plus a manual `backup()` method (File > Backup Now)
+- **Data encryption (opt-in)** — a password-protected vault (Settings > Encryption) encrypts the database, cards, thumbnails, chat sessions, lorebooks, and backups with AES-256-GCM; the app asks for the password at startup and seals the database again on exit. An optional recovery key can unlock the library if the password is forgotten. Exports and SillyTavern sync copies always stay plain text
 - **Duplicate scanner** — finds cards sharing the same name + creator (case-insensitive), or near-identical images via perceptual hashing; tree view with thumbnails, delete selected, or keep one and delete the rest of a group (View > Find Duplicates)
 - **Statistics dashboard** — aggregate metrics rendered as colored bars: total/avg/min/max tokens, top-10 tags, spec version distribution, creator leaderboard, and cards-added-per-week sparkline (View > Statistics)
 - **Font Size** — global application font size (8–32px) configurable via View > Font Size, applied app-wide and persisted across sessions
 - **Session state restore** — window geometry, selected cards, and library scroll position are saved on exit and restored on the next launch
-- **Full-library backup & restore** — File > Backup Library zips the database, all card files, chat sessions, and thumbnails into a single archive with a manifest; File > Restore Library validates and swaps a backup back in atomically, then offers to restart the app
+- **Full-library backup & restore** — File > Backup Library zips the database, all card files, chat sessions, and thumbnails into a single archive with a manifest; File > Restore Library validates and swaps a backup back in atomically, then offers to restart the app. A restore is **non-destructive**: it stages and validates everything first, honours cancellation before touching live data, moves each live directory aside instead of deleting it, and rolls back on failure. Directories the archive doesn't contain are left alone rather than wiped
+- **Library integrity check ("Doctor")** — File > Check Library audits the whole library and reports each problem with its suggested repair: cards whose file is missing, files that hold no character data any more, malformed tag values, stray files in the library folder, chat sessions belonging to deleted cards, SillyTavern links whose file has vanished, stale deletion records, API keys that can no longer be decrypted, and SQLite's own integrity check. Safe problems can be fixed in one click, and no automatic fix ever deletes a card file
 
 ### Library Tab
 - Import character card PNGs (supports V2 `chara` and V3 `ccv3` tEXt chunks) and JSON card files
@@ -58,6 +60,7 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 - **Open containing folder** button
 - Live token count with debounced updates (uses tiktoken)
 - Save/Export/Revert functionality (Ctrl+S / Ctrl+R)
+- **Undo / Redo** — whole-form snapshot history (Ctrl+Z / Ctrl+Shift+Z). Edits are coalesced into one undoable step per pause in typing, so undo crosses fields (edit the name, then the description, then undo both). The history is bounded, reseeded on every card load so undo never walks into the previous card, and the menu entries grey out when there's nothing to step to
 - Preserves favorite status, character book, extensions, and spec version on save
 - **Rename file on name change** — saving with a changed character name renames the card file (and thumbnail) in the library and reloads the editor from the renamed file; the card's database id and SillyTavern link stay the same, so chat sessions and syncing are unaffected
 
@@ -108,6 +111,7 @@ A desktop application for browsing, editing, and managing SillyTavern character 
   - **Macros** — the `{{user}}` value plus custom `{{macro}}` overrides
   - **Prompts** — the tag/summary/character/fill/wizard/chat/memory-summary prompt templates
   - **Test** — chat display colors, timestamps, auto-scroll, max history, first-message greeting
+  - **Encryption** — enable/disable data encryption, change the password, and manage the optional recovery key. Enabling encrypts the whole library in place (with a progress dialog); the database itself is sealed when the app closes and unlocked with the password at the next startup
 
 ### SillyTavern Integration
 - **File-system sync** with a SillyTavern character library directory — works whether ST is running or not (ST doesn't lock or watch files; it picks up external changes via its mtime-keyed cache)
@@ -207,6 +211,13 @@ python main.py
 4. Use per-book **Push / Pull** buttons or bulk **Pull All / Push All / Sync All**; bulk operations are non-destructive and never touch conflicted books
 5. Books are matched by filename (ST's own identity for world info) and compared via an ST-normalized content hash, so Explorer-schema and native ST JSON of the same book always compare equal
 
+### Data Encryption
+1. Go to **Settings > Encryption** and click **Enable Encryption...**
+2. Choose a password (and optionally keep the generated recovery key somewhere safe — it is shown only once)
+3. The library is encrypted in place with a progress dialog; the database is sealed automatically when the app closes
+4. The next launch asks for the password before opening the library; wrong passwords never touch any file
+5. **Change Password...** is instant (only the key is re-wrapped), and **Disable Encryption...** decrypts everything back to plain text after confirming the password
+
 ### Keyboard Shortcuts
 
 All shortcuts are defined in a central registry (`src/ui/shortcuts.py`) and appear in the menu bar.
@@ -218,6 +229,8 @@ All shortcuts are defined in a central registry (`src/ui/shortcuts.py`) and appe
 | Ctrl+Q | Quit |
 | Ctrl+S | Save (Edit tab) |
 | Ctrl+R | Revert (Edit tab) |
+| Ctrl+Z | Undo (Edit tab) |
+| Ctrl+Shift+Z | Redo (Edit tab) |
 | Ctrl+D | Duplicate Card |
 | Del | Delete Card |
 | Ctrl+F | Find (focus search) |
@@ -232,6 +245,7 @@ All shortcuts are defined in a central registry (`src/ui/shortcuts.py`) and appe
 | File > Backup Now | Create a manual database backup |
 | File > Backup Library... | Zip the entire library (DB + cards + sessions + thumbnails) |
 | File > Restore Library... | Restore a library backup zip (prompts restart) |
+| File > Check Library... | Library integrity check ("Doctor") with automatic fixes |
 | View > Font Size... | Set the application font size |
 | View > Find Duplicates | Duplicate scanner dialog |
 | View > Statistics | Library statistics dashboard |
@@ -263,6 +277,18 @@ When saving, both V2 and V3 chunks are written for maximum compatibility.
 - Application log: `~/.st-explorer/app.log`
 - Lorebook sync baseline: `~/.st-explorer/lorebook_sync_state.json`
 - API-key encryption key (macOS/Linux only): `~/.st-explorer/secret.key` (created on first save, owner-only permissions)
+- Data-encryption envelope: `~/.st-explorer/vault.json` (when encryption is enabled)
+
+### Data encryption at rest
+
+When **Settings > Encryption > Enable** is used, everything under `~/.st-explorer` (database, cards, thumbnails, sessions, lorebooks, generated cards, sync baseline, and the local `.bak` backups) is encrypted with AES-256-GCM under a random master key. The master key is wrapped by a key derived from your password (Scrypt) and stored in `vault.json`, so changing the password is instant and never re-encrypts files. An optional recovery key provides a second way to unwrap the master key.
+
+- At startup the app asks for the password (or recovery key) before opening the database; the database file is decrypted in place for the session and re-sealed when the app exits.
+- Files are encrypted on disk at all times and decrypted in memory on use; filenames remain visible in the session/library folders.
+- Encrypted files start with a `STEV` magic prefix, so unencrypted leftovers from before enabling (or from a crash) keep working and are picked up by the next seal pass.
+- **Exports** (PNG/JSON/chat) and **SillyTavern sync** copies are always plain text, since other tools must be able to read them.
+- **Library backups** (File > Backup Library) store the data exactly as encrypted on disk, with the database sealed as it is added; restoring an encrypted backup requires the password. A plain-text backup restored into an encrypted library is re-sealed automatically.
+- A forgotten password (and lost recovery key) means the data cannot be recovered; there is no back door. The app log is deliberately left in plain text for troubleshooting.
 
 Settings are stored by QSettings' native backend per platform:
 
@@ -315,6 +341,7 @@ src/
     lorebook_store.py      Standalone lorebook storage, ST world-info conversion, AI-output parsing
     path_utils.py          Open-containing-folder helpers (testable, OS-aware)
     settings_manager.py    QSettings + cross-platform key encryption (DPAPI/Fernet) + API/LLM/macro/test settings (multi-provider)
+    vault.py               Password-based data encryption: AES-256-GCM envelope, Scrypt KDF, transparent read/write, DB seal/unseal
     sillytavern_sync.py    Pure sync logic: compare, push, pull, bulk_sync (Phase ST)
     single_instance.py     OS lock-file single-instance enforcement
     fs_utils.py            Atomic file writes (temp + os.replace, Windows retry)
@@ -341,7 +368,9 @@ src/
             tag_filter_dialog.py  Checkable tag-list filter popup (replaces inline checkbox strip)
             tag_manager.py      Tag Manager dialog (rename/merge/delete) (Phase 6A)
             prompt_settings_dialog.py  Prompt template editor with live preview (Phase 6C)
-            settings_dialog.py  Master settings dialog (API / LLM / Macros / Prompts / Test)
+            settings_dialog.py  Master settings dialog (API / LLM / Macros / Prompts / Test / Encryption)
+            unlock_dialog.py    Startup password prompt for an encrypted library
+            encryption_dialogs.py  Enable/disable/change-password dialogs + seal/unseal migration worker
             character_sidebar.py  Shared card list for the Edit / Generate / Test tabs
             character_book_editor.py  Character Book (lorebook) entry editor
             extensions_editor.py  Card extensions (JSON dict) editor
@@ -363,4 +392,25 @@ src/
             st_sync_dialog.py     SillyTavern sync dialog (tree, per-card + bulk actions)
             st_status_widget.py   Status-bar ST connection indicator
             sync_worker.py        Async SyncWorker (QThread) for bulk sync operations
+            doctor_dialog.py      Library Check ("Doctor") results + automatic fixes
+    doctor.py              Library integrity checks (missing files, orphans, stale links, ...)
+    form_undo.py           Whole-form snapshot undo/redo history (Qt-free, unit-tested)
+    dialog_helper.py       Modal-dialog helper that disposes of the dialog after use
 ```
+
+## Development
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+
+python -m pytest -q      # 1270+ tests; QT_QPA_PLATFORM=offscreen is set by the suite
+python -m ruff check .   # lint (config in pyproject.toml)
+```
+
+`.github/workflows/ci.yml` runs the suite on Linux and Windows (Python 3.11 and
+3.12), lints with ruff, and smoke-tests the PyInstaller build.
+
+The lint configuration deliberately selects bug-finding rules (pyflakes,
+bugbear, bandit, ruff) rather than a style wish-list, so enabling it surfaces
+real defects instead of thousands of auto-fixable nits. Ignored rules carry a
+comment explaining why.

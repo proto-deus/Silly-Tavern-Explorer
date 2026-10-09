@@ -13,6 +13,7 @@ from typing import Optional
 
 from src.card_models import CharacterCard
 from src.card_parser import read_chara_card, read_card_from_json, save_thumbnail
+from src import vault
 from src.tag_ops import (
     count_tags,
     merge_tag,
@@ -23,10 +24,71 @@ from src.tag_ops import (
 
 logger = logging.getLogger(__name__)
 
+# Bumped when a migration adds work that only needs to run once. Stored in the
+# database's PRAGMA user_version so startup can skip migrations that have
+# already been applied instead of scanning the whole table every launch.
+_SCHEMA_VERSION = 2
+
 
 def _escape_like(text: str) -> str:
-    """Escape SQL LIKE wildcards so user input matches literally."""
-    return text.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+    """Escape SQL LIKE wildcards so user input matches literally.
+
+    The double-quote delimiter used by the tag filter is escaped too, otherwise
+    a tag containing a quote (``say "hi"``) can never match its own JSON blob.
+    """
+    return (text.replace('\\', '\\\\').replace('%', '\\%')
+            .replace('_', '\\_').replace('"', '\\"'))
+
+
+def _st_norm(value) -> str:
+    """Unicode-aware, case-insensitive normalisation for SQL comparison.
+
+    Mirrors :func:`src.tag_ops.normalize_tag` so the SQL tag filter and the
+    Python tag listing agree on what "the same tag" means. Not SQL-standard
+    folding (that would need ICU), just Unicode lower-casing like the rest of
+    the app uses.
+    """
+    if value is None:
+        return ''
+    if not isinstance(value, str):
+        try:
+            value = str(value)
+        except Exception:
+            return ''
+    return value.strip().lower()
+
+
+def _has_tag(tags_json, tag) -> int:
+    """SQL helper: does *tags_json* contain *tag*?
+
+    Compares decoded tag values rather than substring-matching the raw JSON
+    text, so tags containing quotes, backslashes or non-ASCII characters match
+    exactly. Case-insensitive and whitespace-trimmed on both sides, matching
+    :func:`src.tag_ops.normalize_tag`.
+    """
+    wanted = normalize_tag(tag)
+    if not wanted:
+        return 0
+    for t in _decode_tag_blob(tags_json):
+        if normalize_tag(t) == wanted:
+            return 1
+    return 0
+
+
+def _decode_tag_blob(tags_json) -> list:
+    """Decode a card's stored ``tags`` JSON blob into a list.
+
+    Card data is third-party input: the blob may be missing, invalid JSON, a
+    non-list, or a list of non-strings. Always returns a list so a single
+    malformed card can never break a library-wide aggregation.
+    """
+    if not tags_json:
+        return []
+    try:
+        parsed = json.loads(tags_json)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 def _get_data_dir() -> Path:
@@ -48,10 +110,24 @@ def _get_thumbnail_dir() -> Path:
     return d
 
 
+# Windows reserved device names. Library files are safe because they always
+# carry a UUID suffix, but exports build a bare "{name}.png" / "{name}.json".
+_WINDOWS_RESERVED = re.compile(
+    r'(?i)^(con|prn|aux|nul|clock\$|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$'
+)
+
+
 def _sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*]', '_', name)
     name = name.strip('. ')
-    return name[:80] if name else 'untitled'
+    # Truncate before the reserved-name check: "CON" + 100 chars is still the
+    # device name after truncation on some paths, so check the final value.
+    name = name[:80]
+    if not name:
+        return 'untitled'
+    if _WINDOWS_RESERVED.match(name):
+        return f'_{name}'
+    return name
 
 
 sanitize_filename = _sanitize_filename  # public alias for reuse
@@ -103,15 +179,31 @@ def perceptual_hash(path: str | Path, hash_size: int = 8) -> str:
     hashes.  Implemented with basic PIL operations to avoid an extra
     ``imagehash`` dependency.
     """
-    from PIL import Image
-
-    with Image.open(path) as img:
+    with vault.open_image(path) as img:
         gray = img.convert('L').resize((hash_size, hash_size))
-        pixels = list(gray.tobytes())
+        try:
+            pixels = list(gray.tobytes())
+        finally:
+            # ``convert``/``resize`` allocate a new image that is not covered
+            # by the ``with`` above; hashing a whole library would otherwise
+            # hold one extra image in memory per card.
+            gray.close()
     avg = sum(pixels) / len(pixels) if pixels else 0
     bits = ''.join('1' if p >= avg else '0' for p in pixels)
     hex_len = max(1, (hash_size * hash_size) // 4)
     return f'{int(bits, 2):0{hex_len}x}'
+
+
+def hash_hamming_distance(a: str, b: str) -> int:
+    """Return the bit-wise Hamming distance between two perceptual hashes.
+
+    Used to group *near*-identical images: a 1-bit difference in an
+    average-hash would defeat exact-string grouping entirely.
+    """
+    try:
+        return bin(int(a, 16) ^ int(b, 16)).count('1')
+    except (ValueError, TypeError):
+        return 64
 
 
 class LibraryDatabase:
@@ -127,6 +219,12 @@ class LibraryDatabase:
         """Create a new connection with the busy timeout already applied."""
         conn = sqlite3.connect(self.db_path, timeout=5.0)
         conn.execute('PRAGMA busy_timeout=5000')
+        # SQLite's built-in LIKE/lower() are case-insensitive for ASCII only,
+        # so a tag like "École" would be offered by the filter dialog (which
+        # lower-cases) yet never match its own stored blob. A Python callback
+        # gives Unicode-aware, case-insensitive matching.
+        conn.create_function('st_norm', 1, _st_norm, deterministic=True)
+        conn.create_function('st_has_tag', 2, _has_tag, deterministic=True)
         return conn
 
     @contextmanager
@@ -213,22 +311,32 @@ class LibraryDatabase:
         """
         conn = self._connect()
         try:
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        except sqlite3.Error:
-            logger.warning("WAL checkpoint failed during backup")
+            row = conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+            if row and row[0]:
+                # A busy checkpoint leaves committed rows in the -wal file, so
+                # copying only the main DB would back up a truncated database
+                # and could then rotate a good backup away.
+                raise sqlite3.OperationalError(
+                    "database is busy; WAL checkpoint did not complete",
+                )
+        except sqlite3.Error as exc:
+            logger.warning("WAL checkpoint failed during backup: %s", exc)
+            return
         finally:
             conn.close()
 
         tmp_path = bak_path.with_suffix('.bak.tmp')
         try:
-            shutil.copy2(str(db_file), str(tmp_path))
+            # Vault-aware copy: the backup is sealed like every other data
+            # file when encryption is on, so no plaintext DB copy lingers.
+            vault.write_bytes(tmp_path, vault.read_bytes(db_file))
             if bak_path.exists():
                 if bak2_path.exists():
                     bak2_path.unlink()
                 bak_path.rename(bak2_path)
             tmp_path.replace(bak_path)
             logger.info("Database backed up to %s", bak_path)
-        except OSError:
+        except (OSError, vault.VaultError):
             logger.exception("Database backup failed")
             try:
                 tmp_path.unlink(missing_ok=True)
@@ -247,6 +355,10 @@ class LibraryDatabase:
 
     def _migrate_db(self) -> None:
         with self._conn() as conn:
+            # One-time migrations are gated on PRAGMA user_version so a large
+            # library isn't re-scanned on every launch.
+            version_row = conn.execute('PRAGMA user_version').fetchone()
+            schema_version = version_row[0] if version_row else 0
             cols = {row[1] for row in conn.execute('PRAGMA table_info(characters)').fetchall()}
             if 'creator_notes' not in cols:
                 conn.execute("ALTER TABLE characters ADD COLUMN creator_notes TEXT DEFAULT ''")
@@ -264,7 +376,25 @@ class LibraryDatabase:
                 'CREATE INDEX IF NOT EXISTS idx_characters_st_avatar_url '
                 'ON characters (st_avatar_url)'
             )
-            self._migrate_tag_encoding(conn)
+            # Favorites-only, minimum-rating and token-count ordering are
+            # first-class grid operations; without these every refresh was a
+            # full scan plus a temp B-tree for the sort. Created here rather
+            # than in _init_db because 'rating' is itself added by a migration.
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_characters_favorite '
+                'ON characters (is_favorite)'
+            )
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_characters_rating '
+                'ON characters (rating)'
+            )
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_characters_token_count '
+                'ON characters (token_count)'
+            )
+            if schema_version < 1:
+                # Legacy \uXXXX-escaped tag JSON: the pre-2024 storage encoding.
+                self._migrate_tag_encoding(conn)
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS collections (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -279,6 +409,13 @@ class LibraryDatabase:
                     PRIMARY KEY (character_id, collection_id)
                 )
             ''')
+            # The join is driven by collection_id (list_collections and the
+            # collection filter), but the PK leads with character_id - so
+            # without this every collection query full-scanned the table.
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_card_collections_collection '
+                'ON card_collections (collection_id)'
+            )
             # Deletion tombstones: when a card that is linked to a
             # SillyTavern file is deleted in ST Explorer, a row is left
             # here so the sync process can delete the ST copy too — and,
@@ -292,6 +429,11 @@ class LibraryDatabase:
                     deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            if schema_version != _SCHEMA_VERSION:
+                # Only write when it actually changes: an unconditional write
+                # bumps the DB mtime on every launch, which made the startup
+                # backup fire every single time.
+                conn.execute('PRAGMA user_version = %d' % _SCHEMA_VERSION)
             conn.commit()
 
     @staticmethod
@@ -330,7 +472,7 @@ class LibraryDatabase:
         safe_name = _sanitize_filename(card.name)
         dest_name = f"{safe_name}_{uuid.uuid4().hex[:8]}{ext}"
         dest_path = lib_dir / dest_name
-        shutil.copy2(str(source_path), str(dest_path))
+        vault.import_external(source_path, dest_path)
 
         thumb_dir = _get_thumbnail_dir()
         thumb_name = f"{dest_path.stem}_thumb.png"
@@ -341,9 +483,11 @@ class LibraryDatabase:
             else:
                 logger.warning("Failed to generate thumbnail for '%s'; storing null path", card.name)
                 thumb_path_str = None
-        except OSError as e:
+        except (OSError, vault.VaultError) as e:
             # A thumbnail is optional; an unwritable thumbnail directory
-            # must not fail the whole import.
+            # must not fail the whole import. VaultError matters too: an
+            # encrypted-library failure here must not orphan the copy that
+            # ``vault.import_external`` already made above.
             logger.warning("Thumbnail write failed for '%s': %s", card.name, e)
             thumb_path_str = None
 
@@ -449,10 +593,13 @@ class LibraryDatabase:
     def get_creator_counts(self) -> list[tuple[str, int]]:
         """Return ``(creator, count)`` pairs sorted by count descending."""
         with self._conn() as conn:
+            # GROUP BY the *projected* expression: grouping by the raw column
+            # makes NULL and '' two groups that are both labelled 'Unknown'.
             rows = conn.execute(
                 "SELECT COALESCE(NULLIF(creator, ''), 'Unknown') AS creator, "
                 'COUNT(*) AS cnt FROM characters '
-                'GROUP BY creator ORDER BY cnt DESC, creator ASC',
+                "GROUP BY COALESCE(NULLIF(creator, ''), 'Unknown') "
+                'ORDER BY cnt DESC, creator ASC',
             ).fetchall()
             return [(row[0], row[1]) for row in rows]
 
@@ -462,19 +609,24 @@ class LibraryDatabase:
             rows = conn.execute(
                 "SELECT COALESCE(NULLIF(spec_version, ''), 'Unknown') AS ver, "
                 'COUNT(*) AS cnt FROM characters '
-                'GROUP BY spec_version ORDER BY cnt DESC',
+                "GROUP BY COALESCE(NULLIF(spec_version, ''), 'Unknown') "
+                'ORDER BY cnt DESC',
             ).fetchall()
             return {row[0]: row[1] for row in rows}
 
     def get_cards_per_week(self) -> list[tuple[str, int]]:
         """Return ``(week, count)`` pairs for cards added per week, oldest first.
 
-        Week is formatted as ``YYYY-WW`` (ISO-style via SQLite strftime).
+        Week is formatted as ``YYYY-Www`` (true ISO week: ``%G``/``%V``, so
+        a card added on Dec 31 belongs to week 1 of the *next* year rather
+        than being mis-binned under the calendar year).
         """
         with self._conn() as conn:
+            # COALESCE the label too: strftime returns NULL for an
+            # unparseable/NULL date_added, which the stats chart can't render.
             rows = conn.execute(
-                "SELECT strftime('%Y-%W', date_added) AS week, COUNT(*) AS cnt "
-                'FROM characters GROUP BY week ORDER BY week ASC',
+                "SELECT COALESCE(strftime('%G-W%V', date_added), 'Unknown') AS week, "
+                'COUNT(*) AS cnt FROM characters GROUP BY week ORDER BY week ASC',
             ).fetchall()
             return [(row[0], row[1]) for row in rows]
 
@@ -518,12 +670,13 @@ class LibraryDatabase:
             params.extend([q, q, q, q, q])
         if tags:
             for tag in tags:
-                # Exact tag match: tags are stored as JSON arrays, so match
-                # the full quoted element instead of any substring (which
-                # would make "test" also match "testing").
-                escaped = _escape_like(tag)
-                clauses.append("tags LIKE ? ESCAPE '\\'")
-                params.append(f'%"{escaped}"%')
+                # Exact tag match: decode each card's tag list and compare
+                # values. Substring-matching the raw JSON blob cannot work for
+                # tags containing quotes/backslashes (the JSON escapes them),
+                # and SQLite's LIKE/lower only fold ASCII - so a tag like
+                # "École" would be listed but never match its own card.
+                clauses.append('st_has_tag(tags, ?) = 1')
+                params.append(tag)
         where = ' AND '.join(clauses) if clauses else '1=1'
         order = self._sort_order(sort_by)
         with self._conn() as conn:
@@ -584,8 +737,21 @@ class LibraryDatabase:
             ):
                 new_thumb_path = thumb_path.parent / f"{new_path.stem}_{uuid.uuid4().hex[:4]}_thumb.png"
             if os.path.normcase(str(new_thumb_path)) != os.path.normcase(old_thumb):
-                thumb_path.rename(new_thumb_path)
-            new_thumb = str(new_thumb_path)
+                try:
+                    thumb_path.rename(new_thumb_path)
+                except OSError as e:
+                    # The source rename above already happened. Keep the old
+                    # (still valid) thumbnail path and return the *actual*
+                    # post-rename paths, so the caller's DB update never points
+                    # at a file that no longer exists.
+                    logger.warning(
+                        "Could not rename thumbnail %s -> %s: %s",
+                        thumb_path, new_thumb_path, e,
+                    )
+                    return str(new_path), old_thumb
+                new_thumb = str(new_thumb_path)
+            else:
+                new_thumb = str(new_thumb_path)
 
         return str(new_path), new_thumb
 
@@ -701,6 +867,7 @@ class LibraryDatabase:
         char_id: int,
         delete_files: bool = True,
         record_tombstone: bool = True,
+        delete_sessions: Optional[bool] = None,
     ) -> None:
         entry = self.get_by_id(char_id)
         if entry is None:
@@ -712,25 +879,45 @@ class LibraryDatabase:
         # unlinking first remains the way to remove a card locally while
         # keeping the ST copy.
         st_url = entry.get('st_avatar_url')
-        if record_tombstone and st_url:
-            try:
-                self.record_deleted_st_card(
-                    st_url,
-                    name=entry.get('name', ''),
-                    creator=entry.get('creator', ''),
-                    sync_hash=entry.get('st_sync_hash'),
-                )
-            except Exception:
-                logger.exception(
-                    "Could not record ST deletion tombstone for card %s", char_id,
-                )
-        # Delete the DB row FIRST: if file deletion then fails, we're left
-        # with harmless orphan files (cleanable) instead of a ghost row
-        # pointing at deleted files.
+        # One transaction for the tombstone, the join rows and the card row.
+        # They were separate connections, so a failure between them left a
+        # tombstone for a card still in the library - and the next sync would
+        # then delete the live SillyTavern file.
         with self._conn() as conn:
+            if record_tombstone and st_url:
+                try:
+                    self._record_deleted_st_card(
+                        conn, st_url,
+                        name=entry.get('name', ''),
+                        creator=entry.get('creator', ''),
+                        sync_hash=entry.get('st_sync_hash'),
+                    )
+                except Exception:
+                    # A tombstone that half-exists alongside a live row would
+                    # make the next sync delete the ST file for a card that is
+                    # still in the library, so the delete is aborted (and the
+                    # transaction rolled back) rather than committed without it.
+                    logger.exception(
+                        "Could not record ST deletion tombstone for card %s; "
+                        "aborting delete to avoid an inconsistent sync state",
+                        char_id,
+                    )
+                    raise
+            # Delete the DB row FIRST: if file deletion then fails, we're left
+            # with harmless orphan files (cleanable) instead of a ghost row
+            # pointing at deleted files.
             conn.execute('DELETE FROM card_collections WHERE character_id = ?', (char_id,))
             conn.execute('DELETE FROM characters WHERE id = ?', (char_id,))
         logger.info("Removed card ID %s", char_id)
+        # Chat sessions live on disk under sessions/<char_id>/. They are
+        # removed together with the card's files (they are unreachable once
+        # the card is gone), but a caller that keeps the files — e.g. the sync
+        # path that migrates a superseded card to a new id — must keep the
+        # sessions too, so deletion is gated separately from ``delete_files``.
+        if delete_sessions is None:
+            delete_sessions = delete_files
+        if delete_sessions:
+            self._delete_chat_sessions(char_id)
         if delete_files:
             src_path = entry.get('source_path', '')
             if src_path:
@@ -749,17 +936,18 @@ class LibraryDatabase:
                     except OSError as e:
                         logger.warning("Could not delete %s: %s", thumb, e)
 
+    def _iter_tag_blobs(self):
+        """Yield the raw ``tags`` column of every character row."""
+        with self._conn() as conn:
+            yield from conn.execute('SELECT tags FROM characters').fetchall()
+
     def get_all_tags(self) -> list[str]:
         tags: set[str] = set()
-        with self._conn() as conn:
-            rows = conn.execute('SELECT tags FROM characters').fetchall()
-            for (tags_json,) in rows:
-                if tags_json:
-                    try:
-                        for t in json.loads(tags_json):
-                            tags.add(t.lower().strip())
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+        for tags_json, in self._iter_tag_blobs():
+            for t in _decode_tag_blob(tags_json):
+                n = normalize_tag(t)
+                if n:
+                    tags.add(n)
         return sorted(tags)
 
     def get_tag_counts(self) -> dict[str, int]:
@@ -768,18 +956,7 @@ class LibraryDatabase:
         Uses the pure ``count_tags`` helper so the aggregation logic is
         unit-tested without a database.
         """
-        with self._conn() as conn:
-            rows = conn.execute('SELECT tags FROM characters').fetchall()
-        parsed: list[list[str]] = []
-        for (tags_json,) in rows:
-            if not tags_json:
-                parsed.append([])
-                continue
-            try:
-                tags_list = json.loads(tags_json)
-                parsed.append(tags_list if isinstance(tags_list, list) else [])
-            except (json.JSONDecodeError, TypeError):
-                parsed.append([])
+        parsed: list[list] = [_decode_tag_blob(blob) for blob, in self._iter_tag_blobs()]
         return count_tags(parsed)
 
     def _rewrite_tags(self, transform, conn: sqlite3.Connection) -> int:
@@ -986,20 +1163,106 @@ class LibraryDatabase:
 
     # ---- SillyTavern linking ----
 
+    def _record_deleted_st_card(
+        self, conn: sqlite3.Connection, avatar_url: str,
+        name: str = '', creator: str = '', sync_hash: Optional[str] = None,
+    ) -> None:
+        """INSERT OR REPLACE a tombstone on an existing connection."""
+        conn.execute(
+            'INSERT OR REPLACE INTO deleted_st_cards '
+            '(st_avatar_url, name, creator, st_sync_hash, deleted_at) '
+            'VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)',
+            (os.path.normcase(avatar_url), name, creator, sync_hash),
+        )
+
+    def _clear_deleted_st_card(self, conn: sqlite3.Connection, avatar_url: str) -> None:
+        """Delete a tombstone on an existing connection."""
+        wanted = os.path.normcase(avatar_url)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                'SELECT st_avatar_url FROM deleted_st_cards'
+            ).fetchall()
+        finally:
+            conn.row_factory = None
+        for row in rows:
+            if os.path.normcase(row['st_avatar_url']) == wanted:
+                conn.execute(
+                    'DELETE FROM deleted_st_cards WHERE st_avatar_url = ?',
+                    (row['st_avatar_url'],),
+                )
+
+    def migrate_chat_sessions(self, old_id: int, new_id: int) -> None:
+        """Move ``sessions/<old_id>/`` to ``sessions/<new_id>/``.
+
+        Used when a card is superseded during sync and re-imported under a new
+        row id: the chat history belongs to the character, so it must follow
+        the card rather than being deleted with the old row.
+        """
+        if old_id == new_id:
+            return
+        try:
+            from src.app_paths import data_dir
+            base = data_dir() / 'sessions'
+            old_dir = base / str(old_id)
+            new_dir = base / str(new_id)
+        except Exception:
+            logger.exception("Could not resolve the sessions directory")
+            return
+        if not old_dir.is_dir():
+            return
+        try:
+            if not new_dir.exists():
+                new_dir.parent.mkdir(parents=True, exist_ok=True)
+                old_dir.rename(new_dir)
+                return
+            for item in old_dir.iterdir():
+                target = new_dir / item.name
+                if not target.exists():
+                    item.rename(target)
+            shutil.rmtree(old_dir, ignore_errors=True)
+        except OSError as e:
+            logger.warning(
+                "Could not migrate chat sessions from %s to %s: %s",
+                old_dir, new_dir, e,
+            )
+
+    def _delete_chat_sessions(self, char_id: int) -> None:
+        """Remove a deleted card's on-disk chat sessions.
+
+        Sessions live in ``sessions/<char_id>/``; nothing else ever cleaned them
+        up, so they grew without bound, were unreachable from the UI, and were
+        still archived into every library backup.
+        """
+        try:
+            from src.app_paths import data_dir
+            session_dir = data_dir() / 'sessions' / str(char_id)
+        except Exception:
+            logger.exception("Could not resolve the sessions directory")
+            return
+        if not session_dir.is_dir():
+            return
+        try:
+            shutil.rmtree(session_dir)
+        except OSError as e:
+            logger.warning("Could not delete chat sessions in %s: %s", session_dir, e)
+
     def link_to_st(self, char_id: int, avatar_url: str) -> None:
         """Link a card to a SillyTavern character file by its avatar URL."""
+        # Link and tombstone-clear in ONE transaction: separate transactions
+        # could leave a card linked *and* a "deleted on purpose" tombstone
+        # behind, and the next sync would then delete the ST file the user had
+        # just re-linked.
         with self._conn() as conn:
             conn.execute(
                 'UPDATE characters SET st_avatar_url = ? WHERE id = ?',
                 (avatar_url, char_id),
             )
-            conn.commit()
-        # A card linked to this ST file exists again, so any recorded
-        # "deleted on purpose" intent for the file is obsolete.
-        try:
-            self.clear_deleted_st_card(avatar_url)
-        except Exception:
-            logger.exception("Could not clear ST deletion tombstone for '%s'", avatar_url)
+            try:
+                self._clear_deleted_st_card(conn, avatar_url)
+            except Exception:
+                logger.exception("Could not clear ST deletion tombstone for '%s'", avatar_url)
+                raise
         logger.info("Linked card ID %s to ST '%s'", char_id, avatar_url)
 
     def unlink_from_st(self, char_id: int) -> None:
@@ -1064,11 +1327,8 @@ class LibraryDatabase:
         """
         key = os.path.normcase(avatar_url)
         with self._conn() as conn:
-            conn.execute(
-                'INSERT OR REPLACE INTO deleted_st_cards '
-                '(st_avatar_url, name, creator, st_sync_hash, deleted_at) '
-                'VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)',
-                (key, name, creator, sync_hash),
+            self._record_deleted_st_card(
+                conn, key, name=name, creator=creator, sync_hash=sync_hash,
             )
             conn.commit()
         logger.info("Recorded ST deletion tombstone for '%s'", avatar_url)
@@ -1082,17 +1342,7 @@ class LibraryDatabase:
         """
         wanted = os.path.normcase(avatar_url)
         with self._conn() as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                'SELECT st_avatar_url FROM deleted_st_cards'
-            ).fetchall()
-            for row in rows:
-                if os.path.normcase(row['st_avatar_url']) == wanted:
-                    conn.execute(
-                        'DELETE FROM deleted_st_cards WHERE st_avatar_url = ?',
-                        (row['st_avatar_url'],),
-                    )
-            conn.commit()
+            self._clear_deleted_st_card(conn, wanted)
 
     def get_deleted_st_cards(self) -> list[dict]:
         """Return all recorded deletion tombstones (oldest first)."""
@@ -1133,16 +1383,17 @@ class LibraryDatabase:
             ).fetchall()
         return group_duplicate_rows([dict(r) for r in rows])
 
-    def find_image_duplicates(self) -> list[list[dict]]:
+    def find_image_duplicates(self, max_distance: int = 5) -> list[list[dict]]:
         """Find groups of cards with near-identical images via perceptual hashing.
 
         Uses :func:`perceptual_hash` (a simple average-hash over a grayscale
-        thumbnail).  Cards whose source image is missing or unreadable are
-        skipped.  Returns groups with more than one entry.
+        thumbnail) and groups hashes within *max_distance* differing bits, so
+        a re-encoded or slightly scaled copy still matches its original
+        despite not being bit-identical.  Cards whose source image is missing
+        or unreadable are skipped.  Returns groups with more than one entry.
         """
         rows = self.get_all(sort_by='date_added')
-        groups: dict[str, list[dict]] = {}
-        order: list[str] = []
+        groups: list[tuple[str, list[dict]]] = []
         for row in rows:
             source = row.get('source_path', '')
             if not source or not Path(source).exists():
@@ -1152,11 +1403,13 @@ class LibraryDatabase:
             except Exception as e:
                 logger.debug("Could not hash image for card %s: %s", row.get('id'), e)
                 continue
-            if h not in groups:
-                groups[h] = []
-                order.append(h)
-            groups[h].append(row)
-        return [groups[h] for h in order if len(groups[h]) > 1]
+            for rep, members in groups:
+                if hash_hamming_distance(h, rep) <= max_distance:
+                    members.append(row)
+                    break
+            else:
+                groups.append((h, [row]))
+        return [members for _, members in groups if len(members) > 1]
 
     def import_card(self, png_path: str | Path) -> Optional[int]:
         png_path = Path(png_path).resolve()
@@ -1174,8 +1427,11 @@ class LibraryDatabase:
         return self.add_card(card)
 
     def import_cards(self, png_paths: list[str | Path]) -> list[tuple[str, Optional[int], Optional[str]]]:
-        """Import multiple cards in a single transaction.
+        """Import multiple cards, each isolated in its own transaction.
 
+        One bad file must not abort the rest of the batch, so each path goes
+        through :meth:`add_card` independently (a per-file commit, not one
+        transaction for the whole list).
         Returns a list of (path, char_id_or_None, error_or_None) tuples summarizing
         the outcome for each input file.
         """

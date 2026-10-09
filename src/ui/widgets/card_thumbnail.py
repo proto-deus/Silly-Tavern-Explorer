@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QRect, Qt, QThreadPool, pyqtSignal
+from PyQt6.QtCore import QRect, Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
-from src.ui.widgets.async_image import AsyncImageLoader, _PIXMAP_CACHE, cache_key
+from src.ui.widgets.async_image import (
+    AsyncImageLoader,
+    _PIXMAP_CACHE,
+    THUMBNAIL_LOADER_OWNER,
+    cache_key,
+)
 
 
 class CardThumbnail(QWidget):
@@ -23,6 +28,7 @@ class CardThumbnail(QWidget):
         is_favorite: bool = False,
         token_count: int = 0,
         parent: QWidget | None = None,
+        loader_owner: str = THUMBNAIL_LOADER_OWNER,
     ):
         super().__init__(parent)
         self.char_id = char_id
@@ -31,6 +37,7 @@ class CardThumbnail(QWidget):
         self._thumb_path = thumb_path
         self._img_size = 152
         self._name_lines_max = 4
+        self._loader_owner = loader_owner
         self._star_label: QLabel | None = None
         self.setFixedWidth(self._img_size + 8)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -136,9 +143,9 @@ class CardThumbnail(QWidget):
         # (post-rewrite, new mtime) supersedes this one in the meantime.
         self._apply_border()
         self._image_label.setText('')
-        loader = AsyncImageLoader(path, target_px, context=key)
+        loader = AsyncImageLoader(path, target_px, context=key, owner=self._loader_owner)
         loader.signals.loaded.connect(self._on_image_loaded)
-        QThreadPool.globalInstance().start(loader)
+        loader.submit()
 
     def _on_image_loaded(self, qimg, path: str, target_px: int, key=None) -> None:
         # Stale load guard: discard results for a different path or size.
@@ -170,8 +177,7 @@ class CardThumbnail(QWidget):
                 border: 2px solid #3a3a3a;
                 border-radius: 6px;
                 color: #888;
-                font-size: 11px;
-            }
+                            }
         ''')
 
     def set_thumb_size(self, img_size: int) -> None:
@@ -210,7 +216,7 @@ class CardThumbnail(QWidget):
         if self._star_label is not None:
             return
         self._star_label = QLabel('\u2605')
-        self._star_label.setStyleSheet('color: #ffcc44; font-size: 12px;')
+        self._star_label.setStyleSheet('color: #ffcc44; ')
         self._name_row.insertWidget(0, self._star_label)
 
     def _remove_star(self) -> None:
@@ -220,8 +226,18 @@ class CardThumbnail(QWidget):
         self._star_label.deleteLater()
         self._star_label = None
 
-    def update_from_entry(self, name: str, thumb_path: str, is_favorite: bool = False, token_count: int = 0) -> None:
-        """Update an existing thumbnail in-place without recreating the widget."""
+    def update_from_entry(
+        self,
+        name: str,
+        thumb_path: str,
+        is_favorite: bool = False,
+        token_count: int | None = None,
+    ) -> None:
+        """Update an existing thumbnail in-place without recreating the widget.
+
+        ``token_count=None`` leaves the badge untouched: callers that only
+        change e.g. the favorite flag must not wipe the token count.
+        """
         self._is_favorite = is_favorite
         self._thumb_path = thumb_path
         self._name_label.setText(name)
@@ -231,7 +247,8 @@ class CardThumbnail(QWidget):
             self._add_star()
         else:
             self._remove_star()
-        self.set_token_count(token_count)
+        if token_count is not None:
+            self.set_token_count(token_count)
         self._request_load()
         self._apply_name_fit()
 

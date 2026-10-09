@@ -61,6 +61,7 @@ class MessageBubble(QFrame):
         show_variant_back: bool = False,
         show_variant_forward: bool = False,
         variant_forward_new: bool = False,
+        timestamp: str | None = None,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
@@ -69,6 +70,7 @@ class MessageBubble(QFrame):
         self._name = name
         self._text = text or ''
         self._show_timestamp = show_timestamp
+        self._timestamp = timestamp
         self._dialogue_color = dialogue_color
         self._action_color = action_color
         self._emphasis_color = emphasis_color
@@ -172,14 +174,33 @@ class MessageBubble(QFrame):
     def _set_name_html(self, name: str, color: str) -> None:
         ts = ''
         if self._show_timestamp:
-            stamp = datetime.now().strftime('%H:%M')
-            ts = (
-                f'<span style="color:#777; font-size:{self._small_px}px;">'
-                f'[{stamp}]</span> '
-            )
+            stamp = self._format_timestamp()
+            if stamp:
+                ts = (
+                    f'<span style="color:#777; font-size:{self._small_px}px;">'
+                    f'[{stamp}]</span> '
+                )
         self._name_label.setText(
             f'{ts}<b><span style="color:{color}">{html.escape(name)}</span></b>'
         )
+
+    def _format_timestamp(self) -> str:
+        """Format the message's creation-time stamp (empty when unknown).
+
+        Render-time stamping (``datetime.now()``) rewrote every visible
+        timestamp on each re-render - edit, delete, variant navigation -
+        so the times never matched the messages.
+        """
+        raw = self._timestamp or ''
+        if not raw:
+            return ''
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError:
+            return raw[:16]
+        if dt.date() == datetime.now().date():
+            return dt.strftime('%H:%M')
+        return dt.strftime('%Y-%m-%d %H:%M')
 
     def _build_attachments(self, attachments: list[dict]) -> QWidget | None:
         if not attachments:

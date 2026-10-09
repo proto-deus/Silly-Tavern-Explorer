@@ -26,11 +26,14 @@ ACTIONS: list[ShortcutAction] = [
     ShortcutAction('file.backup', 'Backup Now', '', 'File', separator_before=True),
     ShortcutAction('file.backup_library', 'Backup Library...', '', 'File'),
     ShortcutAction('file.restore_library', 'Restore Library...', '', 'File'),
+    ShortcutAction('file.check_library', 'Check Library for Problems...', '', 'File'),
     ShortcutAction('file.quit', 'Quit', 'Ctrl+Q', 'File', separator_before=True),
 
     # --- Edit ---
     ShortcutAction('edit.save', 'Save', 'Ctrl+S', 'Edit'),
     ShortcutAction('edit.revert', 'Revert', 'Ctrl+R', 'Edit'),
+    ShortcutAction('edit.undo', 'Undo', 'Ctrl+Z', 'Edit', separator_before=True),
+    ShortcutAction('edit.redo', 'Redo', 'Ctrl+Shift+Z', 'Edit'),
     ShortcutAction('edit.duplicate', 'Duplicate Card', 'Ctrl+D', 'Edit'),
     ShortcutAction('edit.delete', 'Delete Card', 'Del', 'Edit', separator_before=True),
     ShortcutAction('edit.find', 'Find', 'Ctrl+F', 'Edit', separator_before=True),

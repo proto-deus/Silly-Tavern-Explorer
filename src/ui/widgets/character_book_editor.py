@@ -124,7 +124,11 @@ class _BookEntryEditDialog(QDialog):
         form.addRow('Position:', self._position_edit)
 
         self._order_spin = QSpinBox()
-        self._order_spin.setRange(-1000, 1000)
+        # Wide range: lorebooks' own Add derives orders as len(entries)*100
+        # (>= 1100 for 11+ entries) and imported ST books can carry order
+        # values above 1000; a narrower range silently rewrote them to 1000
+        # on save, changing prompt-insertion priority.
+        self._order_spin.setRange(-1000000, 1000000)
         self._order_spin.setValue(entry.insertion_order)
         form.addRow('Insertion Order:', self._order_spin)
 
@@ -285,7 +289,7 @@ class CharacterBookEditor(QDialog):
         layout.addWidget(QLabel('Entries:'))
         self._entry_list = QListWidget()
         self._entry_list.setMaximumHeight(200)
-        self._entry_list.setStyleSheet('font-size: 11px;')
+        self._entry_list.setStyleSheet('')
         self._entry_list.itemDoubleClicked.connect(self._edit_entry)
         layout.addWidget(self._entry_list)
 
@@ -344,19 +348,27 @@ class CharacterBookEditor(QDialog):
     def _add_entry(self) -> None:
         entry = BookEntry()
         dlg = _BookEntryEditDialog(entry, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._book.entries.append(dlg.get_entry())
-            self._refresh_entry_list()
-            self._entry_list.setCurrentRow(len(self._book.entries) - 1)
+        try:
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._book.entries.append(dlg.get_entry())
+                self._refresh_entry_list()
+                self._entry_list.setCurrentRow(len(self._book.entries) - 1)
+        finally:
+            dlg.setParent(None)
+            dlg.deleteLater()
 
     def _edit_entry(self, *args) -> None:
         row = self._entry_list.currentRow()
         if row < 0 or row >= len(self._book.entries):
             return
         dlg = _BookEntryEditDialog(self._book.entries[row], self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._book.entries[row] = dlg.get_entry()
-            self._refresh_entry_list()
+        try:
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._book.entries[row] = dlg.get_entry()
+                self._refresh_entry_list()
+        finally:
+            dlg.setParent(None)
+            dlg.deleteLater()
 
     def _remove_entry(self) -> None:
         row = self._entry_list.currentRow()

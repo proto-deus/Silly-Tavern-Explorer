@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from src.card_models import CharacterCard
@@ -302,28 +303,81 @@ _DEFAULTS: dict[str, str] = {
 class _SafeDict(dict):
     """dict subclass returning '' for missing keys during str.format_map."""
 
-    def __missing__(self, key: str) -> str:  # noqa: D401
+    def __missing__(self, key: str) -> str:
         return ''
 
 
 def substitute(template: str, **fields: Any) -> str:
     """Substitute ``{placeholder}`` fields in *template* with *fields*.
 
-    Never raises: unknown placeholders resolve to empty strings, and
-    templates with malformed format syntax (literal ``{"a": 1}`` JSON
-    examples, unclosed braces) fall back to macro-only substitution so a
-    user-edited template cannot crash generation.  Literal braces in the
-    template should be escaped as ``{{`` / ``}}`` per Python ``str.format``.
+    Never raises: unknown placeholders resolve to empty strings, and templates
+    with malformed format syntax fall back gracefully so a user-edited template
+    cannot crash generation.
+
+    A template containing an unescaped literal brace (a JSON example such as
+    ``{"a": 1}``) makes ``str.format_map`` raise, and the old fallback returned
+    the template *verbatim* - silently disabling substitution for every
+    placeholder in it. Instead the literal braces are neutralised and the real
+    placeholders are still substituted.  Literal braces in a template should
+    still be written as ``{{`` / ``}}`` per Python ``str.format``.
     """
     if not template:
         return ''
     try:
         return template.format_map(_SafeDict(fields))
     except (ValueError, IndexError, AttributeError, TypeError):
-        # Malformed format string (e.g. a literal JSON example in the
-        # template). Degrade gracefully: leave placeholders untouched.
-        logger.warning("Prompt template has invalid format syntax; using it unformatted")
+        logger.warning(
+            "Prompt template has invalid format syntax (unescaped brace?); "
+            "substituting placeholders anyway",
+        )
+    try:
+        return _escape_literal_braces(template).format_map(_SafeDict(fields))
+    except (ValueError, IndexError, AttributeError, TypeError):
         return template
+
+
+def _escape_literal_braces(template: str) -> str:
+    """Double every brace that is not part of a ``{field}`` placeholder.
+
+    Turns ``Return {"a": 1} for {concept}`` into a string ``str.format`` can
+    process while leaving ``{concept}`` substitutable.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(template)
+    while i < n:
+        ch = template[i]
+        if ch == '{':
+            if template.startswith('{{', i):
+                out.append('{')
+                i += 2
+                continue
+            end = template.find('}', i + 1)
+            if end != -1 and _is_placeholder(template[i + 1:end]):
+                out.append(template[i:end + 1])
+                i = end + 1
+                continue
+            out.append('{{')
+            i += 1
+            continue
+        if ch == '}':
+            if template.startswith('}}', i):
+                out.append('}')
+                i += 2
+                continue
+            out.append('}}')
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+def _is_placeholder(inner: str) -> bool:
+    """True when *inner* is a simple ``name``/``name.attr``/``name[key]`` field."""
+    if not inner or inner[0].isdigit():
+        return False
+    return re.fullmatch(r'[A-Za-z_]\w*(\.[A-Za-z_]\w*|\[[^\[\]]+\])*', inner) is not None
 
 
 def default_prompt(key: str) -> str:

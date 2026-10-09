@@ -42,7 +42,7 @@ class NewCharacterDialog(QDialog):
         layout = QVBoxLayout(self)
 
         name_label = QLabel('Character name:')
-        name_label.setStyleSheet('font-size: 12px; font-weight: bold; color: #ccc;')
+        name_label.setStyleSheet('font-weight: bold; color: #ccc;')
         layout.addWidget(name_label)
 
         self._name_edit = QLineEdit()
@@ -50,7 +50,7 @@ class NewCharacterDialog(QDialog):
         layout.addWidget(self._name_edit)
 
         img_label = QLabel('Character image (optional):')
-        img_label.setStyleSheet('font-size: 12px; font-weight: bold; color: #ccc; margin-top: 8px;')
+        img_label.setStyleSheet('font-weight: bold; color: #ccc; margin-top: 8px;')
         layout.addWidget(img_label)
 
         self._image_preview = QLabel('No image selected')
@@ -121,12 +121,16 @@ class NewCharacterDialog(QDialog):
         save_path = save_dir / f"{safe_name}_{uuid.uuid4().hex[:8]}.png"
 
         try:
+            import io
             from PIL import Image
+            from src import vault
             if self._image_path and Path(self._image_path).exists():
                 img = Image.open(self._image_path).convert('RGBA')
             else:
                 img = Image.new('RGBA', (400, 600), (40, 40, 60, 255))
-            img.save(save_path, 'PNG')
+            buf = io.BytesIO()
+            img.save(buf, 'PNG')
+            vault.write_bytes(save_path, buf.getvalue())
             write_chara_card_dual(save_path, save_path, card.to_spec_dict())
             card.source_path = str(save_path)
             char_id = self.db.import_card(save_path)

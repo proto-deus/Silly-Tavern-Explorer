@@ -59,6 +59,14 @@ class _DuplicateScanWorker(QThread):
 _LIVE_SCAN_WORKERS: list[_DuplicateScanWorker] = []
 
 
+def _release_scan_worker(worker) -> None:
+    """Drop *worker* from the live registry (callable from any thread)."""
+    try:
+        _LIVE_SCAN_WORKERS.remove(worker)
+    except ValueError:
+        pass
+
+
 def _format_group_label(group: list[dict]) -> str:
     """Build the label for a duplicate-group tree item.
 
@@ -107,7 +115,7 @@ class DuplicateScannerDialog(QDialog):
 
         header_row = QHBoxLayout()
         self._mode_label = QLabel('Scanning by name + creator')
-        self._mode_label.setStyleSheet('font-size: 12px; color: #ccc;')
+        self._mode_label.setStyleSheet('color: #ccc;')
         header_row.addWidget(self._mode_label)
         header_row.addStretch()
         self._image_hash_btn = QPushButton('Scan by Image')
@@ -129,7 +137,7 @@ class DuplicateScannerDialog(QDialog):
         detail_layout = QVBoxLayout(detail_container)
         detail_layout.setContentsMargins(4, 4, 4, 4)
         self._detail_title = QLabel('Select a card to compare')
-        self._detail_title.setStyleSheet('font-size: 14px; font-weight: bold; color: #e0e0e0;')
+        self._detail_title.setStyleSheet('font-weight: bold; color: #e0e0e0;')
         detail_layout.addWidget(self._detail_title)
         self._detail_thumb = QLabel()
         self._detail_thumb.setFixedSize(200, 200)
@@ -139,12 +147,12 @@ class DuplicateScannerDialog(QDialog):
         )
         detail_layout.addWidget(self._detail_thumb)
         self._detail_meta = QLabel('')
-        self._detail_meta.setStyleSheet('font-size: 12px; color: #aaa;')
+        self._detail_meta.setStyleSheet('color: #aaa;')
         detail_layout.addWidget(self._detail_meta)
         self._detail_text = QLabel('')
         self._detail_text.setWordWrap(True)
         self._detail_text.setStyleSheet(
-            'font-size: 12px; color: #b0b0b0; padding: 6px; '
+            'color: #b0b0b0; padding: 6px; '
             'background-color: #222; border-radius: 4px;'
         )
         detail_layout.addWidget(self._detail_text, 1)
@@ -170,7 +178,7 @@ class DuplicateScannerDialog(QDialog):
         layout.addLayout(btn_row)
 
         self._status = QLabel('')
-        self._status.setStyleSheet('color: #aaa; font-size: 11px;')
+        self._status.setStyleSheet('color: #aaa; ')
         layout.addWidget(self._status)
 
         self._refresh()
@@ -204,6 +212,9 @@ class DuplicateScannerDialog(QDialog):
         """Start a background scan; results arrive in the slots below."""
         if self._worker_is_alive(self._scan_worker):
             return  # buttons are disabled while scanning anyway
+        # Drop wrappers of finished scans so the registry cannot grow without
+        # bound even when a dialog was destroyed before its release slot ran.
+        _LIVE_SCAN_WORKERS[:] = [w for w in _LIVE_SCAN_WORKERS if not w.isFinished()]
         use_image = self._image_hash_btn.isChecked()
         self._mode_label.setText(
             'Scanning by image perceptual hash...'
@@ -221,6 +232,12 @@ class DuplicateScannerDialog(QDialog):
         _LIVE_SCAN_WORKERS.append(worker)
         worker.completed.connect(self._on_scan_finished)
         worker.failed.connect(self._on_scan_failed)
+        # Release on the built-in signal, not only from the result handlers.
+        # The lambda is owned by the worker's signal (not the dialog), so a
+        # dialog destroyed mid-scan can no longer sever the release and leave
+        # every finished worker in the module-level registry forever.
+        worker.finished.connect(lambda w=worker: _release_scan_worker(w))
+        worker.finished.connect(self._release_worker)
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
@@ -231,23 +248,24 @@ class DuplicateScannerDialog(QDialog):
     def _on_scan_finished(self, groups) -> None:
         if self.sender() is not self._active_worker:
             return  # stale result from a superseded scan
-        self._release_worker()
         self._populate(groups)
 
     def _on_scan_failed(self, message: str) -> None:
         if self.sender() is not self._active_worker:
             return
-        self._release_worker()
         self._mode_label.setText('Scan failed')
         self._status.setText(f'Scan failed: {message}')
         self._set_scanning(False)
 
     def _release_worker(self) -> None:
-        try:
-            _LIVE_SCAN_WORKERS.remove(self.sender())
-        except ValueError:
-            pass
-        self._scan_worker = None
+        sender = self.sender()
+        if sender is not None:
+            try:
+                _LIVE_SCAN_WORKERS.remove(sender)
+            except ValueError:
+                pass
+        if self._scan_worker is sender:
+            self._scan_worker = None
 
     def _populate(self, groups: list[list[dict]]) -> None:
         self._groups = groups

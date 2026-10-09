@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import math
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Optional
@@ -15,19 +17,36 @@ def _str(val: Any, default: str = '') -> str:
 
 def _list(val: Any) -> list:
     if isinstance(val, list):
-        return val
+        return list(val)
     return []
 
 
-def _float(val: Any, default: float = 0.5) -> float:
-    if isinstance(val, (int, float)) and not isinstance(val, bool):
-        return float(val)
-    if isinstance(val, str):
+def _finite_float(val: Any) -> float | None:
+    """Coerce *val* to a finite float, or None if it isn't one.
+
+    Python's ``json`` accepts the bare tokens ``NaN``/``Infinity`` and
+    ``float('nan')`` parses from a string, but neither survives a round-trip
+    through a strict JSON parser: ``json.dumps`` emits the same non-standard
+    tokens, which SillyTavern (and every other consumer) rejects. Anything
+    non-finite is treated as absent.
+    """
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        f = float(val)
+    elif isinstance(val, str):
         try:
-            return float(val)
+            f = float(val)
         except ValueError:
-            return default
-    return default
+            return None
+    else:
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _float(val: Any, default: float = 0.5) -> float:
+    f = _finite_float(val)
+    return default if f is None else f
 
 
 def _bool(val: Any, default: bool = False) -> bool:
@@ -40,9 +59,30 @@ def _bool(val: Any, default: bool = False) -> bool:
 
 
 def _int(val: Any, default: int = 0) -> int:
-    if isinstance(val, (int, float)) and not isinstance(val, bool):
-        return int(val)
-    return default
+    f = _finite_float(val)
+    if f is None:
+        return default
+    try:
+        return int(f)
+    except (ValueError, OverflowError):
+        return default
+
+
+def _opt_int(val: Any) -> Optional[int]:
+    """Like ``_int`` but returns None for values that don't coerce to an int.
+
+    A corrupt ``"scan_depth": "auto"`` must round-trip as absent rather than
+    being silently rewritten to ``0``.
+    """
+    if val is None:
+        return None
+    f = _finite_float(val)
+    if f is None:
+        return None
+    try:
+        return int(f)
+    except (ValueError, OverflowError):
+        return None
 
 
 @dataclass
@@ -82,7 +122,7 @@ class BookEntry:
             name=_str(raw.get('name', '')),
             keys=_list(raw.get('keys', [])),
             content=_str(raw.get('content', '')),
-            extensions=raw.get('extensions', {}) if isinstance(raw.get('extensions'), dict) else {},
+            extensions=dict(raw.get('extensions')) if isinstance(raw.get('extensions'), dict) else {},
             enabled=_bool(raw.get('enabled', True), default=True),
             insertion_order=_int(raw.get('insertion_order', 0)),
             case_sensitive=_bool(raw.get('case_sensitive', False)),
@@ -103,14 +143,20 @@ class CharacterBook:
     recursive_scanning: bool = False
     extensions: dict[str, Any] = field(default_factory=dict)
     entries: list[BookEntry] = field(default_factory=list)
+    # Unmodeled top-level fields from the source book (ST world-info extras
+    # and third-party keys).  Preserved verbatim through round-trips so
+    # syncing a book never silently deletes fields the app doesn't model.
+    extra_data: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        data: dict[str, Any] = {
+        # Start from the preserved unmodeled fields so unknown keys survive.
+        data: dict[str, Any] = dict(self.extra_data)
+        data.update({
             'name': self.name,
             'description': self.description,
             'extensions': dict(self.extensions),
             'entries': [e.to_dict() for e in self.entries],
-        }
+        })
         if self.scan_depth is not None:
             data['scan_depth'] = self.scan_depth
         if self.token_budget is not None:
@@ -123,6 +169,14 @@ class CharacterBook:
     def from_dict(cls, raw: dict) -> CharacterBook:
         if not isinstance(raw, dict):
             return cls()
+        known = {
+            'name', 'description', 'scan_depth', 'token_budget',
+            'recursive_scanning', 'extensions', 'entries',
+        }
+        extra = {
+            k: v for k, v in raw.items()
+            if k not in known and not callable(v)
+        }
         raw_entries = raw.get('entries', [])
         # Some exporters key entries by uid instead of using a list.
         if isinstance(raw_entries, dict):
@@ -142,14 +196,17 @@ class CharacterBook:
         ext = raw.get('extensions', {})
         if not isinstance(ext, dict):
             ext = {}
+        else:
+            ext = dict(ext)
         return cls(
             name=_str(raw.get('name', '')),
             description=_str(raw.get('description', '')),
-            scan_depth=_int(raw.get('scan_depth')) if raw.get('scan_depth') is not None else None,
-            token_budget=_int(raw.get('token_budget')) if raw.get('token_budget') is not None else None,
+            scan_depth=_opt_int(raw.get('scan_depth')),
+            token_budget=_opt_int(raw.get('token_budget')),
             recursive_scanning=_bool(raw.get('recursive_scanning', False)),
             extensions=ext,
             entries=entries,
+            extra_data=extra,
         )
 
 
@@ -206,6 +263,12 @@ class CharacterCard:
     def __post_init__(self) -> None:
         if not self.create_date:
             self.create_date = date.today().isoformat()
+        # A card carrying NaN/Infinity (accepted by Python's json parser and
+        # reachable via a hand-edited file) would be re-emitted as the bare
+        # tokens NaN/Infinity, which every strict JSON parser - including
+        # SillyTavern's - rejects, making the card unreadable elsewhere.
+        if not math.isfinite(self.talkativeness):
+            self.talkativeness = 0.5
 
     def to_spec_dict(self) -> dict:
         # Start from the preserved unmodeled fields so unknown V3 extras
@@ -230,7 +293,8 @@ class CharacterCard:
                 # Spread existing extensions first, then override with
                 # the card-level fields so they always reflect current values.
                 **{k: v for k, v in self.extensions.items() if k not in ('talkativeness', 'fav')},
-                'talkativeness': self.talkativeness,
+                # ``or`` would rewrite a legitimate 0.0 ("never talk") to 0.5.
+                'talkativeness': 0.5 if _finite_float(self.talkativeness) is None else self.talkativeness,
                 'fav': self.fav,
             },
         })
@@ -240,6 +304,10 @@ class CharacterCard:
         data.setdefault('chat', '')
         if self.character_book is not None:
             data['character_book'] = self.character_book
+        # A field can be mutated after construction (an extension editor, a
+        # generated card), so re-check the float rather than trusting
+        # __post_init__.
+        talkativeness = 0.5 if _finite_float(self.talkativeness) is None else self.talkativeness
 
         return {
             'spec': self.spec,
@@ -252,7 +320,7 @@ class CharacterCard:
             'mes_example': self.mes_example,
             'avatar': 'none',
             'chat': '',
-            'talkativeness': self.talkativeness,
+            'talkativeness': talkativeness,
             'fav': self.fav,
             'tags': list(self.tags),
             'create_date': self.create_date,
@@ -264,8 +332,10 @@ class CharacterCard:
         if not isinstance(raw, dict):
             return cls(source_path=source_path)
 
-        if raw.get('spec') and raw.get('data'):
-            d = raw['data'] if isinstance(raw['data'], dict) else {}
+        # ``data={}`` is falsy but still a V2/V3 payload; only fall back to
+        # the V1 shape when ``data`` is absent or not a dict at all.
+        if raw.get('spec') and isinstance(raw.get('data'), dict):
+            d = raw['data']
             ext = d.get('extensions', {})
             if not isinstance(ext, dict):
                 ext = {}
@@ -297,6 +367,17 @@ class CharacterCard:
                 extra_data=extra,
             )
         else:
+            # V1 (or an unlabelled payload): every V1 field must be read, not
+            # just the nine the legacy format nominally requires. Dropping
+            # creator_notes/system_prompt/alternate_greetings/extensions here
+            # silently destroyed them on the first open+save cycle.
+            ext = raw.get('extensions', {})
+            if not isinstance(ext, dict):
+                ext = {}
+            extra = {
+                k: v for k, v in raw.items()
+                if k not in cls._KNOWN_DATA_KEYS and not callable(v)
+            }
             card = cls(
                 name=_str(raw.get('name', '')),
                 description=_str(raw.get('description', '')),
@@ -304,11 +385,24 @@ class CharacterCard:
                 scenario=_str(raw.get('scenario', '')),
                 first_mes=_str(raw.get('first_mes', '')),
                 mes_example=_str(raw.get('mes_example', '')),
+                creator_notes=_str(raw.get('creator_notes', '')),
+                system_prompt=_str(raw.get('system_prompt', '')),
+                post_history_instructions=_str(raw.get('post_history_instructions', '')),
+                alternate_greetings=_list(raw.get('alternate_greetings', [])),
                 tags=_list(raw.get('tags', [])),
                 creator=_str(raw.get('creator', '')),
+                character_version=_str(raw.get('character_version', '')),
+                talkativeness=_float(ext.get('talkativeness', raw.get('talkativeness', 0.5))),
+                fav=_bool(ext.get('fav', raw.get('fav', False))),
+                extensions=ext,
+                character_book=(
+                    raw.get('character_book')
+                    if isinstance(raw.get('character_book'), dict) else None
+                ),
                 spec='chara_card_v1',
                 spec_version='1.0',
                 create_date=_str(raw.get('create_date', '')),
+                extra_data=extra,
             )
 
         card.source_path = source_path
@@ -361,9 +455,11 @@ def build_duplicate_card(base: CharacterCard) -> CharacterCard:
         talkativeness=base.talkativeness,
         fav=False,
         extensions=dict(base.extensions) if base.extensions else {},
-        character_book=base.character_book,
+        # Deep copies: these are nested structures, and an in-place edit of the
+        # duplicate's book must not reach back into the original card.
+        character_book=copy.deepcopy(base.character_book),
         spec=base.spec,
         spec_version=base.spec_version,
         create_date='',
-        extra_data=dict(base.extra_data) if base.extra_data else {},
+        extra_data=copy.deepcopy(base.extra_data) if base.extra_data else {},
     )

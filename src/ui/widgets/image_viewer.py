@@ -99,13 +99,21 @@ if QAction is not None:
             layout.addLayout(btn_row)
 
         def _load_image(self) -> None:
-            pixmap = QPixmap(self._image_path)
+            from src import vault
+            try:
+                data = vault.read_bytes(self._image_path)
+            except Exception:
+                data = b''
+            pixmap = QPixmap()
+            if data:
+                pixmap.loadFromData(data)
             if pixmap.isNull():
                 # Fall back to Pillow for formats Qt can't read directly.
                 try:
+                    import io
                     from PIL import Image
                     from PIL.ImageQt import ImageQt
-                    img = Image.open(self._image_path).convert('RGBA')
+                    img = Image.open(io.BytesIO(data)).convert('RGBA')
                     pixmap = QPixmap.fromImage(ImageQt(img))
                 except Exception:
                     pass
@@ -152,9 +160,9 @@ if QAction is not None:
             if not dest:
                 return
             try:
-                import shutil
-                shutil.copy2(self._image_path, dest)
-            except OSError as e:
+                from src import vault
+                vault.copy_out(self._image_path, dest)
+            except Exception as e:
                 QMessageBox.critical(self, 'Save Image', f'Failed to save image: {e}')
 
         def wheelEvent(self, event) -> None:

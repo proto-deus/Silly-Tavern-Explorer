@@ -196,7 +196,7 @@ class BatchGenerateDialog(QDialog):
         layout = QVBoxLayout(self)
 
         info = QLabel('Generate tags and/or summaries for all cards that are missing them.')
-        info.setStyleSheet('color: #aaa; font-size: 12px;')
+        info.setStyleSheet('color: #aaa; ')
         info.setWordWrap(True)
         layout.addWidget(info)
 
@@ -237,7 +237,7 @@ class BatchGenerateDialog(QDialog):
         layout.addWidget(self._extra_edit)
 
         self._progress_label = QLabel('')
-        self._progress_label.setStyleSheet('color: #aaa; font-size: 12px;')
+        self._progress_label.setStyleSheet('color: #aaa; ')
         self._progress_label.setVisible(False)
         layout.addWidget(self._progress_label)
         self._progress = QProgressBar()
@@ -315,9 +315,14 @@ class BatchGenerateDialog(QDialog):
         self._generate_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         if getattr(self, '_was_cancelled', False):
-            # The user cancelled: don't pop a "Batch Complete!" box or fire
-            # library_changed for a run they aborted.
+            # The user cancelled: don't pop a "Batch Complete!" box. Cards
+            # updated before the cancel ARE already in the database, so the
+            # library still has to hear about them; and the summary goes to
+            # the status line (hidden by _on_cancel) instead of vanishing.
+            self._progress_label.setVisible(True)
             self._progress_label.setText(f'Cancelled. {done} updated, {errors} errors.')
+            if done:
+                self.library_changed.emit()
             return
         self._progress_label.setText(f"Done! {done} updated, {errors} errors.")
         if done or errors:

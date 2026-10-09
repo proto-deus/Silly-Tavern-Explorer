@@ -61,7 +61,7 @@ class _BarRow(QWidget):
 
         name_label = QLabel(label)
         name_label.setFixedWidth(160)
-        name_label.setStyleSheet('font-size: 12px; color: #d0d0d0;')
+        name_label.setStyleSheet('color: #d0d0d0;')
         layout.addWidget(name_label)
 
         bar_container = QFrame()
@@ -79,7 +79,7 @@ class _BarRow(QWidget):
 
         val_label = QLabel(f'{value:,}')
         val_label.setFixedWidth(60)
-        val_label.setStyleSheet('font-size: 12px; color: #aaa;')
+        val_label.setStyleSheet('color: #aaa;')
         layout.addWidget(val_label)
 
 
@@ -91,7 +91,7 @@ class _Section(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 8, 0, 8)
         header = QLabel(title)
-        header.setStyleSheet('font-size: 14px; font-weight: bold; color: #e0e0e0; border-bottom: 1px solid #3a3a3a;')
+        header.setStyleSheet('font-weight: bold; color: #e0e0e0; border-bottom: 1px solid #3a3a3a;')
         layout.addWidget(header)
         self._body = QVBoxLayout()
         self._body.setSpacing(0)
@@ -103,7 +103,7 @@ class _Section(QWidget):
 
     def add_text(self, text: str) -> None:
         label = QLabel(text)
-        label.setStyleSheet('font-size: 12px; color: #b0b0b0; padding: 4px 0;')
+        label.setStyleSheet('color: #b0b0b0; padding: 4px 0;')
         label.setWordWrap(True)
         self._body.addWidget(label)
 

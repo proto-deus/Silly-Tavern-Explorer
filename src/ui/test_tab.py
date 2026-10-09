@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -66,6 +67,7 @@ from src.settings_manager import (
     load_active_lorebooks,
     load_font_size,
     load_macro_settings,
+    load_provider_models,
     load_test_settings,
     load_user_persona,
     save_active_lorebooks,
@@ -197,7 +199,10 @@ class _SessionsDialog(QDialog):
         self._delete_btn.clicked.connect(self._on_delete)
         btn_row.addWidget(self._delete_btn)
         btn_row.addStretch()
-        close_btn = QPushButton('Cancel')
+        # "Close", not "Cancel": Delete is confirmed and applied immediately,
+        # so closing the dialog is not a rollback (a button labelled Cancel
+        # that still destroys data is a trap).
+        close_btn = QPushButton('Close')
         close_btn.clicked.connect(self.reject)
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
@@ -349,14 +354,21 @@ class TestTab(QWidget):
         self._active_lore_names: list[str] = load_active_lorebooks()
         self._extra_books: list[CharacterBook] = []
 
-        # Temp/Min-P write-through to the saved provider settings so the
-        # Settings -> LLM tab always shows what the Test tab is using.
-        # Debounced because the spinboxes emit valueChanged on every step.
+        # Model/Temp/Min-P/Ctx write-through to the saved provider settings so
+        # the settings dialog always shows what the Test tab is using.
+        # Debounced because the widgets emit changed signals on every step.
         self._suppress_sampling_sync = False
         self._sampling_save_timer = QTimer(self)
         self._sampling_save_timer.setSingleShot(True)
         self._sampling_save_timer.setInterval(300)
         self._sampling_save_timer.timeout.connect(self._flush_sampling_sync)
+
+        # Token recount is O(chat); coalesce the bursts that re-rendering
+        # produces (and the paths that update the label twice in a row).
+        self._token_label_timer = QTimer(self)
+        self._token_label_timer.setSingleShot(True)
+        self._token_label_timer.setInterval(250)
+        self._token_label_timer.timeout.connect(self._recount_tokens)
 
         self._preset = self._load_preset()
         self._font_size = load_font_size()
@@ -401,9 +413,10 @@ class TestTab(QWidget):
         self._apply_font_sizes()
         self._reload_macros()
         self._reload_test_settings()
-        # Sampling overrides track the freshly-loaded preset.
+        # Override widgets track the freshly-loaded preset.
+        self._refresh_model_combo(self._preset.model)
         self._set_sampling_widgets(
-            self._preset.temperature, self._preset.min_p,
+            self._preset.temperature, self._preset.min_p, self._preset.context_size,
         )
         if self._card is not None:
             self._system = self._resolve_system()
@@ -441,24 +454,48 @@ class TestTab(QWidget):
         return post_history_text(self._card, self._user_name, self._custom_macros)
 
     def _effective_preset(self) -> APIPreset:
-        """Preset for the next chat request: per-chat sampling + seed bump."""
+        """Preset for the next chat request: per-chat overrides + seed bump."""
         preset = with_sampling_override(
             self._preset,
             temperature=self._temp_override.value(),
             min_p=self._minp_override.value(),
+            model=self._model_combo.currentText().strip() or None,
+            context_size=self._context_override.value(),
         )
         if self._regen_bump:
             preset = vary_seed(preset, self._regen_bump)
         return preset
 
-    # ---- sampling override sync (Settings -> LLM tab) ----
+    def _effective_context_size(self) -> int:
+        """Context size in effect for token budgeting (the Ctx override)."""
+        return self._context_override.value()
 
-    def _set_sampling_widgets(self, temperature: float, min_p: float) -> None:
-        """Programmatic spinbox update that skips the write-through sync."""
+    # ---- override widget sync (Settings -> API/LLM tabs) ----
+
+    def _refresh_model_combo(self, select: str = '') -> None:
+        """Repopulate the model dropdown from the cached provider model list."""
+        cached = load_provider_models(self._preset.name, self._preset.base_url)
+        self._suppress_sampling_sync = True
+        try:
+            self._model_combo.clear()
+            items = list(cached)
+            if select and select not in items:
+                items.append(select)
+            self._model_combo.addItems(items)
+            self._model_combo.setCurrentText(select)
+        finally:
+            self._suppress_sampling_sync = False
+
+    def _set_sampling_widgets(
+        self, temperature: float, min_p: float, context_size: int | None = None,
+    ) -> None:
+        """Programmatic widget update that skips the write-through sync."""
         self._suppress_sampling_sync = True
         try:
             self._temp_override.setValue(temperature)
             self._minp_override.setValue(min_p)
+            if context_size is not None:
+                self._context_override.setValue(int(context_size))
         finally:
             self._suppress_sampling_sync = False
         self._sampling_save_timer.stop()
@@ -468,14 +505,16 @@ class TestTab(QWidget):
             self._sampling_save_timer.start()
 
     def _flush_sampling_sync(self) -> None:
-        """Write the current Temp/Min-P into the active provider settings."""
+        """Write the current overrides into the active provider settings."""
         self._sampling_save_timer.stop()
         try:
             save_active_sampling(
                 self._temp_override.value(), self._minp_override.value(),
+                model=self._model_combo.currentText().strip() or None,
+                context_size=self._context_override.value(),
             )
         except Exception:
-            logger.exception("Failed to sync sampling overrides to settings")
+            logger.exception("Failed to sync chat overrides to settings")
 
     # ---- UI ----
 
@@ -524,7 +563,7 @@ class TestTab(QWidget):
         header_row = QHBoxLayout()
         header_row.setContentsMargins(8, 2, 20, 4)
         self._header = QLabel('Select a character to start testing')
-        self._header.setStyleSheet('font-size: 16px; font-weight: bold; color: #e0e0e0;')
+        self._header.setStyleSheet('font-weight: bold; color: #e0e0e0;')
         header_row.addWidget(self._header)
         header_row.addStretch()
         right_layout.addLayout(header_row)
@@ -583,6 +622,35 @@ class TestTab(QWidget):
         control_row = QHBoxLayout()
         control_row.setContentsMargins(8, 4, 8, 8)
         small_style = 'color: #777;'
+        model_label = QLabel('Model')
+        model_label.setStyleSheet(small_style)
+        control_row.addWidget(model_label)
+        self._model_combo = QComboBox()
+        self._model_combo.setEditable(True)
+        self._model_combo.setMinimumWidth(200)
+        self._model_combo.setToolTip(
+            'Model used for this chat; saved to Settings -> API when changed.\n'
+            'The dropdown lists models cached from the endpoint - refresh it '
+            'with Settings -> API -> Fetch Models.'
+        )
+        self._refresh_model_combo(self._preset.model)
+        self._model_combo.currentTextChanged.connect(self._on_sampling_changed)
+        control_row.addWidget(self._model_combo)
+        ctx_label = QLabel('Ctx')
+        ctx_label.setStyleSheet(small_style)
+        control_row.addWidget(ctx_label)
+        self._context_override = QSpinBox()
+        self._context_override.setRange(512, 200000)
+        self._context_override.setSingleStep(256)
+        self._context_override.setValue(self._preset.context_size)
+        self._context_override.setToolTip(
+            'Context window size in tokens for the selected model; saved to '
+            'Settings -> LLM when changed.\n'
+            'Controls how much history fits before older messages are '
+            'trimmed or summarized.'
+        )
+        self._context_override.valueChanged.connect(self._on_sampling_changed)
+        control_row.addWidget(self._context_override)
         temp_label = QLabel('Temp')
         temp_label.setStyleSheet(small_style)
         control_row.addWidget(temp_label)
@@ -770,10 +838,15 @@ class TestTab(QWidget):
         for deleted in deleted_ids:
             self._store.delete_session(self._current_id, deleted)
             if deleted == self._session_id:
-                # The active session was deleted; continue with a fresh id so
-                # subsequent turns still auto-save into a new file.
+                # The active session was deleted: clear the conversation too,
+                # otherwise the next send re-saves the "deleted" messages
+                # under a fresh id while the memories summarizing them are
+                # silently lost.
                 self._session_id = ChatSessionStore.new_session_id()
+                self._messages = []
                 self._memories = []
+                self._render_history()
+                self._update_token_label()
                 self._sync_auto_toggle()
                 self._update_memory_button()
 
@@ -911,6 +984,7 @@ class TestTab(QWidget):
             text=msg.get('content', ''),
             attachments=msg.get('attachments') or [],
             show_timestamp=self._show_timestamps,
+            timestamp=msg.get('ts'),
             dialogue_color=self._dialogue_color,
             action_color=self._action_color,
             emphasis_color=self._emphasis_color,
@@ -974,11 +1048,27 @@ class TestTab(QWidget):
         return '\n'.join(lines)
 
     def _update_token_label(self) -> None:
+        """Schedule a token recount (debounced; see _recount_tokens)."""
+        timer = getattr(self, '_token_label_timer', None)
+        if timer is None:
+            self._recount_tokens()
+            return
+        timer.start()
+
+    def _recount_tokens(self) -> None:
         if self._current_id is None or self._card is None:
             self._token_label.setText('')
             return
         system_mem = self._assemble_system()
-        conv = self._conversation_text()
+        # Count each conversation line separately (identical strings are
+        # memoized by count_tokens) and sum: re-rendering one message must
+        # not re-tokenize the entire history. Summing slightly over-counts
+        # versus one joined encode, which is the safe direction for a
+        # context-budget display.
+        lines = []
+        for m in self._messages:
+            role = self._user_name if m.get('role') == 'user' else (self._card.name if self._card else 'Assistant')
+            lines.append(f"{role}: {m.get('content', '')}")
         # Few-shot examples and post-history instructions also ride along
         # in every request; count them so the label matches reality.
         extra_parts = [m.get('content', '') for m in self._example_messages]
@@ -986,10 +1076,11 @@ class TestTab(QWidget):
         if phi:
             extra_parts.append(phi)
         extra = '\n'.join(p for p in extra_parts if p)
-        total = count_tokens(system_mem + '\n\n' + conv) if conv else count_tokens(system_mem)
+        total = count_tokens(system_mem)
+        total += sum(count_tokens(line) for line in lines)
         if extra:
             total += count_tokens(extra)
-        ctx = self._preset.context_size or 0
+        ctx = self._effective_context_size()
         self._apply_font_sizes()
         if ctx:
             self._token_label.setText(f'{total:,} / {ctx:,} tokens')
@@ -1073,7 +1164,7 @@ class TestTab(QWidget):
         so the conversation keeps its continuity instead of hitting an
         amnesia cliff.
         """
-        ctx = self._preset.context_size or 0
+        ctx = self._effective_context_size()
         if not ctx or not self._messages:
             return
         full: list[dict] = [{'role': 'system', 'content': system}]
@@ -1153,7 +1244,22 @@ class TestTab(QWidget):
 
     def _finish_generation(self) -> None:
         self._generating = False
+        worker = self._worker
         self._worker = None
+        if worker is not None:
+            # The worker's run() may already have emitted its result when the
+            # user presses Cancel; without disconnecting, the queued
+            # completed/error would land after this call and append a second
+            # reply next to the restored one.
+            for signal, slot in (
+                (worker.completed, self._on_response),
+                (worker.error, self._on_error),
+                (worker.chunk, self._append_streaming_chunk),
+            ):
+                try:
+                    signal.disconnect(slot)
+                except (TypeError, RuntimeError):
+                    pass   # never connected, or the object is already gone
         self._stream_bubble = None
         restored = self._restore_interrupted_response()
         self._send_btn.setEnabled(True)
@@ -1424,7 +1530,7 @@ class TestTab(QWidget):
             persona=self._persona,
             extra_books=self._extra_books,
         )
-        dialog = ContextInspectorDialog(plan, self._preset.context_size or 0, self)
+        dialog = ContextInspectorDialog(plan, self._effective_context_size(), self)
         dialog.exec()
 
     def _on_memories_changed(self, memories: list) -> None:
@@ -1488,7 +1594,7 @@ class TestTab(QWidget):
             return False
         from src.ai_prompts import build_memory_summary_prompts
         system, user = build_memory_summary_prompts(text)
-        client = AIClient(self._preset)
+        client = AIClient(self._effective_preset())
         self._summarize_source = source
         self._summarize_prefix = prefix
         if end_index is not None:
@@ -1554,14 +1660,22 @@ class TestTab(QWidget):
             self.status_message.emit('Nothing to export.', 3000)
             return
         base = (self._card.name if self._card else 'chat').replace(' ', '_')
-        path, _ = QFileDialog.getSaveFileName(
+        path, selected_filter = QFileDialog.getSaveFileName(
             self, 'Export Chat', base + '.txt',
             'Text (*.txt);;JSON (*.json)',
         )
         if not path:
             return
+        # The chosen filter decides the output format; the extension is
+        # normalised to match (and appended when the user typed none) so the
+        # filter and the file can't disagree.
+        as_json = 'JSON' in (selected_filter or '')
+        p = Path(path)
+        want_ext = '.json' if as_json else '.txt'
+        if not p.suffix or p.suffix.lower() in ('.json', '.txt'):
+            path = str(p.with_suffix(want_ext))
         try:
-            if path.lower().endswith('.json'):
+            if as_json:
                 data = {
                     'title': auto_title(self._messages, fallback=base),
                     'memories': self._memories,

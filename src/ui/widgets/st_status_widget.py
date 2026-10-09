@@ -24,12 +24,20 @@ class _StCountWorker(QThread):
     def __init__(self, path: str, parent=None):
         super().__init__(parent)
         self._path = path
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
 
     def run(self) -> None:
         try:
             count = len(list_st_characters(self._path))
         except Exception:
             count = -1
+        if self._cancelled:
+            # A superseded scan: drop the result instead of publishing a count
+            # for a directory that may since have changed again.
+            return
         self.completed.emit(count)
 
 
@@ -75,9 +83,16 @@ class STStatusWidget(QWidget):
         self._label.setText('ST: Scanning...')
         self._refresh_gen += 1
         gen = self._refresh_gen
-        # Cancel any in-flight count; the old worker is parented so it is
-        # never destroyed while running, and its stale result is dropped
-        # by the generation counter.
+        # Cancel any in-flight count rather than dropping the reference: the
+        # QFileSystemWatcher fires on every PNG the app's own sync writes, so
+        # without this a large ST library accumulates a scan thread per tick.
+        # The worker is parented, so it can never be destroyed while running,
+        # and its stale result is dropped by the generation counter.
+        if self._count_worker is not None:
+            try:
+                self._count_worker.cancel()
+            except RuntimeError:
+                pass   # already destroyed by deleteLater
         worker = _StCountWorker(path, self)
         self._count_worker = worker
         worker.completed.connect(lambda count: self._on_count_finished(count, gen))
@@ -92,6 +107,28 @@ class STStatusWidget(QWidget):
             self._label.setText('ST: Directory missing')
         else:
             self._label.setText(f'ST: Connected ({count} cards)')
+
+    def shutdown(self) -> None:
+        """Stop any in-flight scan.
+
+        Must be called before the widget is destroyed: a running child QThread
+        that gets torn down with its parent aborts the process. Waits briefly
+        so a scan is normally finished well before the app exits.
+        """
+        worker = self._count_worker
+        self._count_worker = None
+        if worker is None:
+            return
+        try:
+            worker.cancel()
+            if worker.isRunning():
+                worker.wait(1500)
+        except RuntimeError:
+            pass   # C++ object already gone
+
+    def closeEvent(self, event) -> None:
+        self.shutdown()
+        super().closeEvent(event)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:

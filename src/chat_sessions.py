@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from src.app_paths import data_dir
-from src.fs_utils import atomic_write_bytes
+from src import vault
 
 logger = logging.getLogger(__name__)
 
@@ -65,10 +65,15 @@ class ChatSessionStore:
         try:
             if not path.exists():
                 return None
-            data = json.loads(path.read_text(encoding='utf-8'))
+            # vault.read_bytes + decode rather than read_text: a file with
+            # invalid UTF-8 raises UnicodeDecodeError, which is a ValueError
+            # and NOT an OSError, so read_text's OSError guard would not catch
+            # it.  The vault helper transparently decrypts sealed sessions.
+            data = json.loads(vault.read_bytes(path).decode('utf-8'))
             if isinstance(data, dict):
                 return data
-        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("Session file %s is not a JSON object", path)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError, vault.VaultError) as e:
             logger.warning("Could not read session file %s: %s", path, e)
         return None
 
@@ -83,11 +88,12 @@ class ChatSessionStore:
                 mtime = path.stat().st_mtime
             except OSError:
                 mtime = 0.0
+            messages = data.get('messages')
             results.append({
                 'id': data.get('id', path.stem),
                 'char_id': char_id,
                 'title': data.get('title', ''),
-                'message_count': len(data.get('messages', [])),
+                'message_count': len(messages) if isinstance(messages, list) else 0,
                 'memory_count': len(_normalize_memories_raw(data)),
                 'created_at': data.get('created_at', ''),
                 'updated_at': data.get('updated_at', ''),
@@ -105,33 +111,43 @@ class ChatSessionStore:
         title: str,
         messages: list[dict],
         memories: list[dict] | None = None,
-        auto_summarize: bool = False,
+        auto_summarize: bool | None = None,
         memory: str = '',
     ) -> None:
-        """Write a session, preserving its original ``created_at``."""
+        """Write a session, preserving its original ``created_at``.
+
+        ``memories=None`` means "keep whatever the file already has" (with a
+        legacy ``memory`` string migrated to the list form); ``auto_summarize``
+        follows the same convention so the flag can be turned off explicitly
+        without also wiping the memory list.
+        """
         path = self._path(char_id, session_id)
         created_at = None
         existing = self._read(path)
         if existing:
             created_at = existing.get('created_at')
-            # Keep existing memories/auto flag if the caller didn't provide
-            # them and the old file used the legacy ``memory`` string field.
-            if memories is None and not auto_summarize and existing.get('memories') is not None:
-                memories = existing.get('memories')
+            if memories is None:
+                # normalize_memories handles both the modern ``memories``
+                # list and the legacy ``memory`` string field, so a
+                # legacy-only file keeps its text across saves.
+                memories = normalize_memories(existing)
+            if auto_summarize is None:
                 auto_summarize = bool(existing.get('auto_summarize', False))
         now = datetime.now().isoformat(timespec='seconds')
         data = {
             'id': session_id,
             'char_id': char_id,
             'title': title,
-            'messages': [dict(m) for m in messages],
-            'memories': [_clean_memory(m) for m in (memories or [])],
+            'messages': [
+                dict(m) for m in messages or [] if isinstance(m, dict)
+            ],
+            'memories': [c for c in (_clean_memory(m) for m in (memories or [])) if c is not None],
             'auto_summarize': bool(auto_summarize),
             'created_at': created_at or now,
             'updated_at': now,
         }
         # Atomic write: a crash mid-save must never truncate the session file.
-        atomic_write_bytes(path, json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8'))
+        vault.write_bytes(path, json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8'))
 
     def load_session(self, char_id: int, session_id: str) -> dict | None:
         return self._read(self._path(char_id, session_id))
@@ -150,7 +166,7 @@ class ChatSessionStore:
 def auto_title(messages: list[dict], fallback: str = 'New session') -> str:
     """Derive a session title from the first user message, else *fallback*."""
     for msg in messages or []:
-        if msg.get('role') == 'user':
+        if isinstance(msg, dict) and msg.get('role') == 'user':
             text = str(msg.get('content', '')).strip()
             if text:
                 return text[:60]
@@ -178,20 +194,37 @@ def new_memory_entry(
     return entry
 
 
+def _coerce_end_index(value) -> int | None:
+    """Coerce a stored ``end_index`` to an int, or None if it isn't numeric.
+
+    Session files are on-disk data that may have been hand-edited or written by
+    an older build, so a non-numeric value must not raise out of a listing.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning("Ignoring non-numeric memory end_index: %r", value)
+        return None
+
+
 def drop_memories_from(memories: list[dict], index: int) -> list[dict]:
     """Return *memories* without entries that summarize messages at/after *index*.
 
     Entries carrying an ``end_index`` >= *index* are dropped because their
     source messages no longer exist after a delete/regenerate truncation.
-    Manual entries (no ``end_index``) are kept.  Pure function.
+    Manual entries (no usable ``end_index``) are kept.  Pure function.
     """
     result: list[dict] = []
     for m in memories or []:
         if not isinstance(m, dict):
             result.append(m)
             continue
-        end = m.get('end_index')
-        if end is not None and int(end) >= index:
+        end = _coerce_end_index(m.get('end_index'))
+        if end is not None and end >= index:
             continue
         result.append(m)
     return result
@@ -221,8 +254,8 @@ def _normalize_memories_raw(data: dict | None) -> list[dict]:
                     'source': str(m.get('source', 'manual')),
                     'created_at': str(m.get('created_at', '')),
                 }
-                if m.get('end_index') is not None:
-                    entry['end_index'] = int(m['end_index'])
+                if _coerce_end_index(m.get('end_index')) is not None:
+                    entry['end_index'] = _coerce_end_index(m.get('end_index'))
                 result.append(entry)
         return result
     legacy = data.get('memory')
@@ -231,13 +264,17 @@ def _normalize_memories_raw(data: dict | None) -> list[dict]:
     return []
 
 
-def _clean_memory(m: dict) -> dict:
+def _clean_memory(m) -> dict | None:
+    """Return a cleaned copy of a memory entry, or None for garbage input."""
+    if not isinstance(m, dict):
+        return None
     cleaned = {
         'id': m.get('id', uuid.uuid4().hex),
         'content': str(m.get('content', '')),
         'source': str(m.get('source', 'manual')),
         'created_at': str(m.get('created_at', '')),
     }
-    if m.get('end_index') is not None:
-        cleaned['end_index'] = int(m['end_index'])
+    end = _coerce_end_index(m.get('end_index'))
+    if end is not None:
+        cleaned['end_index'] = end
     return cleaned
