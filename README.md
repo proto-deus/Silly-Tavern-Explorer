@@ -8,29 +8,19 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 
 ### Application
 - **Keyboard shortcuts** — centralized registry (`src/ui/shortcuts.py`) drives all menu actions
-- **Unsaved-changes guard** — prompts Save/Discard/Cancel when switching tabs or closing with unsaved edits
 - **Full-screen image viewer** — zoomable, pannable dialog with Save As support (Ctrl+=/Ctrl+-/wheel)
-- **Status bar** showing card count, total tokens, and favorites count; transient messages for import/export/save
-- **Shared character sidebar** — a single card list on the left serves the Edit, Generate, and Test tabs (shared selection, search, and favorites filter)
-- **Startup dependency check** — missing packages are reported before Qt loads (native message box on Windows, Qt dialog or terminal message elsewhere)
-- **Single-instance lock** — a second launch detects the running instance and exits
 - **Database backup** — automatic `.bak`/`.bak2` rotation on startup when the DB has changed, plus a manual `backup()` method (File > Backup Now)
 - **Data encryption (opt-in)** — a password-protected vault (Settings > Encryption) encrypts the database, cards, thumbnails, chat sessions, lorebooks, and backups with AES-256-GCM; the app asks for the password at startup and seals the database again on exit. An optional recovery key can unlock the library if the password is forgotten. Exports and SillyTavern sync copies always stay plain text
 - **Duplicate scanner** — finds cards sharing the same name + creator (case-insensitive), or near-identical images via perceptual hashing; tree view with thumbnails, delete selected, or keep one and delete the rest of a group (View > Find Duplicates)
 - **Statistics dashboard** — aggregate metrics rendered as colored bars: total/avg/min/max tokens, top-10 tags, spec version distribution, creator leaderboard, and cards-added-per-week sparkline (View > Statistics)
-- **Font Size** — global application font size (8–32px) configurable via View > Font Size, applied app-wide and persisted across sessions
-- **Session state restore** — window geometry, selected cards, and library scroll position are saved on exit and restored on the next launch
 - **Full-library backup & restore** — File > Backup Library zips the database, all card files, chat sessions, and thumbnails into a single archive with a manifest; File > Restore Library validates and swaps a backup back in atomically, then offers to restart the app. A restore is **non-destructive**: it stages and validates everything first, honours cancellation before touching live data, moves each live directory aside instead of deleting it, and rolls back on failure. Directories the archive doesn't contain are left alone rather than wiped
 - **Library integrity check ("Doctor")** — File > Check Library audits the whole library and reports each problem with its suggested repair: cards whose file is missing, files that hold no character data any more, malformed tag values, stray files in the library folder, chat sessions belonging to deleted cards, SillyTavern links whose file has vanished, stale deletion records, API keys that can no longer be decrypted, and SQLite's own integrity check. Safe problems can be fixed in one click, and no automatic fix ever deletes a card file
+- **Live token count** with debounced updates
 
 ### Library Tab
 - Import character card PNGs (supports V2 `chara` and V3 `ccv3` tEXt chunks) and JSON card files
 - **Drag-and-drop import** — drop PNG or JSON files anywhere on the tab to import them
-- **Async import with progress** — imports run on a background thread (`import_worker.py`) with a cancellable progress dialog, so large batches don't freeze the UI; duplicates are skipped and reported, with a one-click "import anyway" follow-up pass
-- Grid view with thumbnails and favorites indicators
-- **Lazy thumbnail loading** — images load off the UI thread via a thread-pool worker with an LRU pixmap cache (`async_image.py`); the grid stays responsive for large libraries
-- **Thumbnail zoom** (Ctrl+=/Ctrl+-) with View menu controls, clamped to 80–280px; reloads are debounced so rapid zoom only triggers one round of image reloads- **Multi-select** — Ctrl+click toggles individual cards, Shift+click selects a range; the detail pane switches to bulk actions (Bulk Delete / Favorite / Export PNG / Export JSON) when several cards are selected
-- Search by name, description, tags, creator, and creator notes
+- **Search** by name, description, tags, creator, and creator notes
 - **Tag filter dialog** — a popup ("Select Tags…" in the filter bar) lists every known tag as a full-width, word-wrapped checkable list (with Select All / Select None), so long tag names are never clipped; the active filter shows selected tags as removable chips above the grid
 - **Favorites only** checkbox to filter the grid to starred cards (toggle via F key)
 - **Sort dropdown** (Name, Date Added, Token Count, Favorites, Rating, Random) with a synced View > Sort submenu
@@ -39,45 +29,33 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 - Toggle favorites with star indicator
 - Double-click thumbnails for full-size image view with zoom/pan
 - Export cards to PNG files
-- **Open containing folder** button (selects the file in Explorer on Windows; opens the parent folder in Finder/Files on macOS/Linux)
-- **Duplicate card** action (Ctrl+D, or the Duplicate button next to New Character on the Edit tab) clones the selected card with a "(copy)" suffix
-- Duplicate detection on import
 - **Find Duplicates** scanner — groups cards by name+creator or by image hash; delete selected or keep-one-delete-rest (View > Find Duplicates)
+- **Duplicate detection** on import
 - **Statistics** dashboard — library-wide stats with bar charts (View > Statistics)
 
 ### Edit Tab
-- Full character card editor (name, description, personality, scenario, first message, etc.)
-- **Unsaved-changes tracking** — dirty indicator with `_loading` guard prevents false positives during programmatic field population
-- Multi-line alternate greetings editor (preserves embedded newlines)
-- Tag management with add/remove
-- **Tag autocomplete** — the tag input suggests existing tags from the library (contains-match, case-insensitive); the model refreshes whenever the library changes
+- **Full character card editor** (name, description, personality, scenario, first message, etc.)
 - **Tag Manager** dialog — rename, merge, or delete tags across the entire library (each operation is a single atomic transaction)
+- **Tag autocomplete** — the tag input suggests existing tags from the library (contains-match, case-insensitive); the model refreshes whenever the library changes
 - **Character Book editor** — dialog for editing lorebook entries (name, keys, content, insertion order, depth, case-sensitivity, etc.) plus an **Advanced** section with secondary trigger keys and a type-aware editor for unmodeled extension fields (uid, probability, sticky, ...)
 - **Extensions editor** — dialog for editing the card's `extensions` dict with arbitrary JSON values (string/number/bool/object/array/null)
-- Change card image (preserves embedded card data)
-- **Favorite toggle** — a Favorite button next to Preview HTML mirrors the Library tab's star: it reads/writes the DB flag immediately (no save needed), keeps the in-memory card in sync so a later Save can't revert it, and refreshes the sidebar/grid thumbnails
+- **Change card image** (preserves embedded card data)
+- **Favorite toggle** — a Favorite button next to Preview HTML mirrors the Library tab's star: it reads/writes the DB flag immediately (no save needed)
 - **My Notes** — a private per-card notes editor (stored in the local database only; never written to the card file)
-- **Open containing folder** button
-- Live token count with debounced updates (uses tiktoken)
-- Save/Export/Revert functionality (Ctrl+S / Ctrl+R)
 - **Undo / Redo** — whole-form snapshot history (Ctrl+Z / Ctrl+Shift+Z). Edits are coalesced into one undoable step per pause in typing, so undo crosses fields (edit the name, then the description, then undo both). The history is bounded, reseeded on every card load so undo never walks into the previous card, and the menu entries grey out when there's nothing to step to
-- Preserves favorite status, character book, extensions, and spec version on save
 - **Rename file on name change** — saving with a changed character name renames the card file (and thumbnail) in the library and reloads the editor from the renamed file; the card's database id and SillyTavern link stay the same, so chat sessions and syncing are unaffected
 
 ### Generate Tab
 - Connect to any OpenAI-compatible API (LM Studio, Ollama, OpenRouter, OpenAI, Custom)
 - **Multiple provider profiles** — each provider keeps its own base URL, API key, model, and sampling settings; switch the active provider in Settings and all generation/chat uses the selected profile
-- Generate tags for existing characters
+- **Generate tags** for existing characters
 - **Generate Missing Tags** — suggest only new tags not already on the card (existing tags are preserved; never replaces them)
 - Generate summaries (saved to creator notes)
 - **Create New Character wizard** — step-by-step guided creation (name, appearance, personality, scenario, first message) from a concept
 - **Fill Missing Fields** — generate any combination of missing fields (description, personality, scenario, first message, example messages, creator notes, system prompt, post-history instructions, tags, alternate greetings) with per-field target lengths
 - **Batch generate** — missing tags and/or summaries for all cards via a dedicated dialog with progress
 - **Create New Character dialog** — quick blank-card creation (name + optional image) as an alternative to the full step-by-step wizard
-- **Streaming output** — generation results stream into the result pane token-by-token; a "Generating..." indicator shows while a request is in flight
-- Fetch available models from the API endpoint
-- **Cross-platform API key encryption** — keys are encrypted with Windows DPAPI on Windows and with Fernet (AES-CBC + HMAC via the `cryptography` package, key stored owner-only under `~/.st-explorer/secret.key`) on macOS/Linux; plain-text fallback (with a logged warning) only if encryption is unavailable. Keys saved by older versions keep decrypting
-- Cooperative cancellation for all generation tasks
+- **Cross-platform API key encryption** — keys are encrypted with Windows DPAPI on Windows and with Fernet (AES-CBC + HMAC via the `cryptography` package, key stored owner-only under `~/.st-explorer/secret.key`) on macOS/Linux; plain-text fallback (with a logged warning) only if encryption is unavailable.
 
 ### Lorebooks Tab
 - **Standalone lorebook library** — create, duplicate, rename, and delete world-info books stored as JSON under `~/.st-explorer/lorebooks/` (changes autosave)
@@ -88,60 +66,35 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 - **Test-tab injection** — pick active books in the Test tab's Lorebooks button; matching entries are scanned every turn and injected as `[World Info]` alongside the card's own book (per-book scan depth/budget/recursion), visible in the Context inspector
 
 ### Test Tab
-- Per-character chat testing, with a card list on the left and a chat window on the right
-- **Lorebook (world info) injection** — the card's character book is scanned on every turn: enabled entries whose keys match recent messages (honoring case-sensitivity and whole-word options) are appended to the system prompt under `[World Info]`, with recursive scanning support (entries triggering other entries) and the book's token budget enforced
-- **Standalone lorebook injection** — books from the Lorebooks tab can be toggled active via the Lorebooks button; their matching entries join the same `[World Info]` block, each book honoring its own scan depth/budget, and the selection persists across sessions
+- **Per-character chat testing**
+- **Lorebook injection** — books from the Lorebooks tab can be toggled active via the Lorebooks button; their matching entries join the same `[World Info]` block, each book honoring its own scan depth/budget, and the selection persists across sessions
 - **Context inspector** — the Context button shows exactly what the next request will send, section by section (system prompt, world info, chat memory, each message) with per-section and total token counts against the configured context size; its Author's Note and Jailbreak tabs edit the chat's trailing prompt knobs
-- **Streaming chat** with any character card using the configured API; multi-turn history is sent to the API and responses stream in as they arrive
-- **Regenerate** the last assistant reply, and **Cancel** an in-flight response (the cancel button is disabled unless a request is running)
-- Inline formatting rendered in distinct colors: `"dialogue"`, `*action*`, and `_emphasis_`
+- **Inline formatting** rendered in distinct colors: `"dialogue"`, `*action*`, and `_emphasis_`
 - **Per-message actions** — every bubble has Edit (reopen the message in a text dialog), Copy (to clipboard), and Delete (removes that message and everything after it); the last assistant bubble also gets a Regenerate button
-- **File attachments** — attach text files (`.txt`, `.md`, `.json`, `.csv`, code, etc.) or images (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`) to a message via the Attach button. Text is inlined as a labelled block; images are downscaled, JPEG-encoded, and sent as multimodal `image_url` parts. Pending attachments appear as removable chips above the input
+- **File attachments** — attach text files (`.txt`, `.md`, `.json`, `.csv`, code, etc.) or images (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`) to a message via the Attach button.
 - **Inline URL images** — image URLs in assistant responses are fetched asynchronously and shown as clickable thumbnails (click to open in browser)
 - **Chat memory** — a Memory dialog manages per-session memory entries (add/edit/delete), which are appended as a `[Chat memory]` bullet list to the system prompt (most recent 20 entries)
 - **Auto-summarize** — toggle to automatically summarize each exchange into a memory entry after every assistant reply; "Summarize Now" summarizes the current conversation on demand
 - **Auto-saved chats** — each card's conversation is saved automatically (JSON files under `~/.st-explorer/sessions/`); a **Chats** button opens a popup to load, export, import, or delete saved chats (with title, message count, and timestamps), and **New Chat** starts fresh
 - **Chat export** — export any saved chat from the Chats window as `.txt`, `.json` (messages, memories, and metadata), or a SillyTavern `.jsonl` chat
-
-### Test Tab — SillyTavern parity
-- **SillyTavern-style prompt assembly** — the main prompt (card `system_prompt` or the chat template) is followed by separate `[World Info]` (before/after character), `[Description]` / `[Personality]` / `[Scenario]`, `[User persona]`, and `[Chat memory]` blocks, so cards with their own system prompt still get their character definition
 - **Author's Note** — per-chat note injected as a message at a configurable depth (default 4) and role (system/user/assistant), exactly like SillyTavern; edited on the **Context** window's Author's Note tab and stored with the session
-- **World-info entry placement** — entry `position` / `depth` / `role` are honored: `before_char` / `after_char` wrap the character definition, `before_EM` / `after_EM` (top/bottom of the Author's Note) ride the note's depth, and `at_depth` entries inject at their own depth and role
 - **Example dialogue as a block** — the card's `mes_example` is sent as a labelled `<START>` block (in the system prompt, after the history, or as legacy chat turns — Settings > Test)
-- **SillyTavern macros** — `{{time}}`, `{{date}}`, `{{datetime}}`, `{{random:a|b|c}}` / `{{pick: a, b}}`, and dice rolls `{{roll: 2d6+3}}` on top of `{{user}}` / `{{char}}` and custom macros
+- **Macros** — `{{time}}`, `{{date}}`, `{{datetime}}`, `{{random:a|b|c}}` / `{{pick: a, b}}`, and dice rolls `{{roll: 2d6+3}}` on top of `{{user}}` / `{{char}}` and custom macros
 - **Impersonate** — the model writes `{{user}}`'s next message (added as a user turn to edit or keep); **Continue** — extends the last assistant reply in place
 - **Persona manager** — named `{{user}}` personas (name + description) with a per-chat selection, injected as the `[User persona]` block
 - **Jailbreak box** — your own trailing instructions per chat, sent after the card's post-history instructions (both at depth 0); edited on the **Context** window's Jailbreak tab
-- **Stop sequences** — custom stopping strings per provider (Settings > LLM), sent as `stop` on the wire; leaked `{{user}}` / `{{char}}` macros are cleaned out of generated replies
 - **Trim normalization** — when the context window evicts old messages, orphaned replies are dropped with their question and the rest is summarized into `[Chat memory]`
-- **SillyTavern chat import/export** — export the conversation as a SillyTavern `.jsonl` chat (swipes preserved) or import an ST chat as a new chat (Chats window)
-- `{{user}}` / `{{char}}` and custom macros are substituted automatically; double-click a card to open its full-size image
-
-### Settings
-- A single **Settings** dialog (menu bar **Settings > Settings...** or the gear button on the Generate/Test tabs) groups every option:
-   - **API** — active provider selector plus per-provider base URL, API key, and model (with fetch-models)
-   - **LLM** — temperature, top-p, top-k, min-p, context size, output length (max tokens), frequency/presence penalties, seed, stop sequences, automatic retries (0–5) with exponential backoff for connection errors, timeouts, rate limits (HTTP 429), and server errors
-  - **Macros** — the `{{user}}` value plus custom `{{macro}}` overrides (SillyTavern's `{{time}}` / `{{date}}` / `{{random}}` / `{{roll}}` macros work everywhere)
-  - **Prompts** — the tag/summary/character/fill/wizard/chat/memory-summary prompt templates
-  - **Test** — chat display colors, timestamps, auto-scroll, first-message greeting, example-dialogue placement
-  - **Encryption** — enable/disable data encryption, change the password, and manage the optional recovery key. Enabling encrypts the whole library in place (with a progress dialog); the database itself is sealed when the app closes and unlocked with the password at the next startup
 
 ### SillyTavern Integration
 - **File-system sync** with a SillyTavern character library directory — works whether ST is running or not (ST doesn't lock or watch files; it picks up external changes via its mtime-keyed cache)
 - **Two-way sync dialog** (SillyTavern > Sync Library, `Ctrl+Shift+L`) — grouped tree view showing every card pair classified as: Only in ST Explorer, Only in SillyTavern, In Sync, Changed in ST, Changed in Explorer, Conflict (both changed), or Unlinked Match
 - **Two-way lorebook sync** (SillyTavern > Sync Lorebooks..., `Ctrl+Shift+W`) — compares the Lorebooks tab against ST's `worlds/` directory by filename, classifies each book as Only Explorer / Only ST / In Sync / Changed per side / Conflict using an ST-normalized content hash plus a baseline state file, and pushes/pulls through the native world-info converter; per-book Push/Pull plus bulk Pull All / Push All / Sync All with cancellable progress. The worlds directory is auto-derived from the characters path and overridable in Configure
-- **Per-card actions** — Pull from ST, Push to ST, Link, Unlink directly from the sync dialog
-- **Bulk "Sync All"** — executes a background sync plan (Pull new/changed-from-ST, Push new/changed-from-Explorer, Link matching pairs) with a cancellable progress dialog
-- **Push/Pull selected** — push the currently selected card to ST or pull its ST version via the SillyTavern menu (background worker, never blocks the UI)
-- **Push/Pull All** — one-click bulk push (all new/changed Explorer cards) or pull (all new/changed ST cards) from the SillyTavern menu, with a cancellable progress dialog. Bulk operations are non-destructive: they only copy/import and never delete files on either side; cards changed locally are skipped by Pull All so unpushed edits can't be overwritten
 - **Refresh ST Status** — re-scan the ST directory and update the status-bar indicator on demand
 - **Change detection** — content-hash baseline tracking identifies which side changed since the last sync; conflicts are flagged for manual resolution
 - **Linking** — cards can be linked to specific ST character files (by avatar URL); linked cards always sync to/from the same file (case-insensitive on Windows)
-- **Filename convention** — pushed cards use ST's sanitize-filename + collision suffix (`_1`, `_2`, …) naming so they drop in cleanly (Windows reserved device names like `CON`/`NUL` are handled)
 - **Favorites sync** — favorites are stored inside the card PNG (`fav` / `data.extensions.fav`), so they travel automatically with push/pull — no special handling needed
 - **Auto-detect** — on first launch, common SillyTavern install locations are scanned; if exactly one is found, it's auto-configured
 - **Directory watcher** — a `QFileSystemWatcher` monitors the ST characters directory and shows a status-bar message when changes are detected
-- **Status bar indicator** — permanent widget showing ST connection state and card count
 
 ## Installation
 
@@ -326,105 +279,3 @@ This includes `st/characters_path` for the SillyTavern directory and `st/worlds_
 | Atomic writes | Retry transient locks | Direct replace | Direct replace |
 
 Keyboard shortcuts use the platform modifier automatically (Qt maps Ctrl to Cmd on macOS).
-
-## Tech Stack
-
-- **PyQt6** - GUI framework
-- **Pillow** - PNG image handling
-- **tiktoken** - Token counting (with byte-length fallback)
-- **requests** - API client
-- **cryptography** - Cross-platform API-key encryption (Fernet on macOS/Linux)
-- **SQLite** - Library database
-
-## Project Structure
-
-```
-main.py                    Entry point, logging setup, dep check, single-instance
-requirements.txt           Runtime dependencies
-src/
-    ai_client.py           OpenAI-compatible API client (sync/stream/chat)
-    ai_prompts.py          Prompt templates + builders (tags/summary/character/fill/chat/wizard/memory), substitution, load/save
-    attachments.py         File attachment preparation (text/image downscale + base64)
-    card_models.py         CharacterCard, BookEntry, CharacterBook dataclasses + parse_character_book
-    card_parser.py         PNG chunk read/write, card data encoding
-    chat_builder.py        Chat message builder, {{user}}/{{char}}/custom macros, memory/attachment API conversion (Phase 6D)
-    chat_formatting.py     Chat text -> colored HTML ("..." / *...* / _..._) formatting
-    chat_sessions.py       Per-card chat session persistence (JSON files) + memory entries
-    database.py            SQLite library database (search, sort, stats, backup, tag ops, duplicate scanning)
-    lorebook_store.py      Standalone lorebook storage, ST world-info conversion, AI-output parsing
-    path_utils.py          Open-containing-folder helpers (testable, OS-aware)
-    settings_manager.py    QSettings + cross-platform key encryption (DPAPI/Fernet) + API/LLM/macro/test settings (multi-provider)
-    vault.py               Password-based data encryption: AES-256-GCM envelope, Scrypt KDF, transparent read/write, DB seal/unseal
-    sillytavern_sync.py    Pure sync logic: compare, push, pull, bulk_sync (Phase ST)
-    single_instance.py     OS lock-file single-instance enforcement
-    fs_utils.py            Atomic file writes (temp + os.replace, Windows retry)
-    library_backup.py      Whole-library zip backup/restore with manifest + validation
-    tag_ops.py             Pure tag-list manipulation (rename/merge/remove/count) (Phase 6A)
-    token_counter.py       Token counting with tiktoken
-    resources/
-        icons/
-            app.png        Application icon (Phase 8B)
-            app.ico        Windows application icon (Phase 8B)
-        chat_bubble.py      Message bubble widget (name, attachments, formatting, actions)
-        ui/
-            main_window.py     Main window with tabs, menu bar, status bar, dirty guard, shared character sidebar
-            library_tab.py     Card library, search, sort, filter, drag-drop import, async import, multi-select/bulk ops, zoom
-            edit_tab.py        Card editor with dirty-state tracking, tag autocomplete, character book + extensions editors
-            ai_tab.py          Generate tab (tags, missing tags, summary, fill-missing, wizard, batch) with streaming
-            test_tab.py        Test tab: per-card chats with formatting, streaming, attachments, memory
-            widgets/
-                lorebooks_tab.py  Standalone lorebook editor with AI generation + ST world-info import/export
-                card_thumbnail.py   Thumbnail widget with zoom + async lazy loading
-            async_image.py      AsyncImageLoader (QRunnable), LruCache + cache_key (pure)
-            flow_layout.py      Flow layout for grid/tag chips
-            tag_widget.py       Tag chips (editable and read-only)
-            tag_filter_dialog.py  Checkable tag-list filter popup (replaces inline checkbox strip)
-            tag_manager.py      Tag Manager dialog (rename/merge/delete) (Phase 6A)
-            prompt_settings_dialog.py  Prompt template editor with live preview (Phase 6C)
-            settings_dialog.py  Master settings dialog (API / LLM / Macros / Prompts / Test / Encryption)
-            unlock_dialog.py    Startup password prompt for an encrypted library
-            encryption_dialogs.py  Enable/disable/change-password dialogs + seal/unseal migration worker
-            character_sidebar.py  Shared card list for the Edit / Generate / Test tabs
-            character_book_editor.py  Character Book (lorebook) entry editor
-            extensions_editor.py  Card extensions (JSON dict) editor
-            character_wizard.py  Step-by-step guided character creation wizard
-            new_character_dialog.py  Quick blank-card creation (name + image)
-            batch_generate_dialog.py  Batch generate dialog with progress + import-skip reporting
-            image_viewer.py     Zoomable/pannable image viewer dialog
-            duplicate_scanner.py  Duplicate scanner dialog with image-hash mode (Phase 7A)
-            stats_dialog.py      Statistics dashboard with bar charts (Phase 7B)
-            import_worker.py    Async ImportWorker (QThread) + ImportSummary (pure) (Phase 8A)
-        chat_bubble.py      Message bubble widget (name, attachments, formatting, actions)
-            chat_image_loader.py  Async URL image loader + clickable label
-            context_inspector_dialog.py  Context tabs (outgoing prompt view + Author's Note + Jailbreak editors)
-            author_note_editor.py  Author's Note editor (text, depth, injection role)
-            edit_message_dialog.py  Multiline text-editor dialog (messages + memory)
-            memory_dialog.py    Chat memory manager (add/edit/delete, summarize)
-            rating_widget.py    Five-star rating widget (pure helpers unit-tested)
-            collections_dialog.py  Collection manager + per-card assignment dialogs
-            st_config_dialog.py   SillyTavern path configuration dialog
-            st_sync_dialog.py     SillyTavern sync dialog (tree, per-card + bulk actions)
-            st_status_widget.py   Status-bar ST connection indicator
-            sync_worker.py        Async SyncWorker (QThread) for bulk sync operations
-            doctor_dialog.py      Library Check ("Doctor") results + automatic fixes
-    doctor.py              Library integrity checks (missing files, orphans, stale links, ...)
-    form_undo.py           Whole-form snapshot undo/redo history (Qt-free, unit-tested)
-    dialog_helper.py       Modal-dialog helper that disposes of the dialog after use
-```
-
-## Development
-
-```bash
-pip install -r requirements.txt -r requirements-dev.txt
-
-python -m pytest -q      # 1270+ tests; QT_QPA_PLATFORM=offscreen is set by the suite
-python -m ruff check .   # lint (config in pyproject.toml)
-```
-
-`.github/workflows/ci.yml` runs the suite on Linux and Windows (Python 3.11 and
-3.12), lints with ruff, and smoke-tests the PyInstaller build.
-
-The lint configuration deliberately selects bug-finding rules (pyflakes,
-bugbear, bandit, ruff) rather than a style wish-list, so enabling it surfaces
-real defects instead of thousands of auto-fixable nits. Ignored rules carry a
-comment explaining why.
