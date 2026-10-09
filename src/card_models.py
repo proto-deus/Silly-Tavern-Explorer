@@ -99,6 +99,9 @@ class BookEntry:
     match_whole_words: bool = False
     depth: int = 4
     position: str = 'before_char'
+    # SillyTavern ``role`` for at_depth entries: 0 = system, 1 = user,
+    # 2 = assistant.  Kept as the raw ST int so cards round-trip.
+    role: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -112,23 +115,28 @@ class BookEntry:
             'match_whole_words': self.match_whole_words,
             'depth': self.depth,
             'position': self.position,
+            'role': self.role,
         }
 
     @classmethod
     def from_dict(cls, raw: dict) -> BookEntry:
         if not isinstance(raw, dict):
             return cls()
+        extensions = dict(raw.get('extensions')) if isinstance(raw.get('extensions'), dict) else {}
+        # Some exporters nest ``role`` under extensions instead of the entry.
+        role_raw = raw.get('role', extensions.get('role', 0))
         return cls(
             name=_str(raw.get('name', '')),
             keys=_list(raw.get('keys', [])),
             content=_str(raw.get('content', '')),
-            extensions=dict(raw.get('extensions')) if isinstance(raw.get('extensions'), dict) else {},
+            extensions=extensions,
             enabled=_bool(raw.get('enabled', True), default=True),
             insertion_order=_int(raw.get('insertion_order', 0)),
             case_sensitive=_bool(raw.get('case_sensitive', False)),
             match_whole_words=_bool(raw.get('match_whole_words', False)),
             depth=_int(raw.get('depth', 4), default=4),
             position=_str(raw.get('position', 'before_char')),
+            role=_int(role_raw, default=0),
         )
 
 

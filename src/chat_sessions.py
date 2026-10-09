@@ -113,13 +113,18 @@ class ChatSessionStore:
         memories: list[dict] | None = None,
         auto_summarize: bool | None = None,
         memory: str = '',
+        author_note: dict | None = None,
+        jailbreak: str | None = None,
+        persona_id: str | None = None,
     ) -> None:
         """Write a session, preserving its original ``created_at``.
 
         ``memories=None`` means "keep whatever the file already has" (with a
         legacy ``memory`` string migrated to the list form); ``auto_summarize``
         follows the same convention so the flag can be turned off explicitly
-        without also wiping the memory list.
+        without also wiping the memory list.  ``author_note`` / ``jailbreak`` /
+        ``persona_id`` are likewise kept unchanged when ``None``, so callers
+        that don't manage them (import paths, older code) can't wipe them.
         """
         path = self._path(char_id, session_id)
         created_at = None
@@ -133,6 +138,14 @@ class ChatSessionStore:
                 memories = normalize_memories(existing)
             if auto_summarize is None:
                 auto_summarize = bool(existing.get('auto_summarize', False))
+            if author_note is None:
+                author_note = normalize_author_note(existing.get('author_note'))
+            if jailbreak is None:
+                stored_jb = existing.get('jailbreak')
+                jailbreak = stored_jb if isinstance(stored_jb, str) else ''
+            if persona_id is None:
+                stored_pid = existing.get('persona_id')
+                persona_id = stored_pid if isinstance(stored_pid, str) else ''
         now = datetime.now().isoformat(timespec='seconds')
         data = {
             'id': session_id,
@@ -143,6 +156,9 @@ class ChatSessionStore:
             ],
             'memories': [c for c in (_clean_memory(m) for m in (memories or [])) if c is not None],
             'auto_summarize': bool(auto_summarize),
+            'author_note': normalize_author_note(author_note),
+            'jailbreak': jailbreak or '',
+            'persona_id': persona_id or '',
             'created_at': created_at or now,
             'updated_at': now,
         }
@@ -163,7 +179,7 @@ class ChatSessionStore:
         return False
 
 
-def auto_title(messages: list[dict], fallback: str = 'New session') -> str:
+def auto_title(messages: list[dict], fallback: str = 'New chat') -> str:
     """Derive a session title from the first user message, else *fallback*."""
     for msg in messages or []:
         if isinstance(msg, dict) and msg.get('role') == 'user':
@@ -228,6 +244,34 @@ def drop_memories_from(memories: list[dict], index: int) -> list[dict]:
             continue
         result.append(m)
     return result
+
+
+DEFAULT_AUTHOR_NOTE_DEPTH = 4
+_AUTHOR_NOTE_ROLES = ('system', 'user', 'assistant')
+
+
+def normalize_author_note(raw) -> dict:
+    """Coerce a stored ``author_note`` value into ``{text, depth, role}``.
+
+    Session files are on-disk data that may have been hand-edited or written
+    by an older build: a bare string is treated as the note text, out-of-range
+    depths fall back to :data:`DEFAULT_AUTHOR_NOTE_DEPTH`, and unknown roles
+    become ``system``.  Pure function.
+    """
+    if isinstance(raw, str):
+        raw = {'text': raw}
+    if not isinstance(raw, dict):
+        raw = {}
+    text = raw.get('text', '')
+    text = text if isinstance(text, str) else str(text or '')
+    try:
+        depth = int(raw.get('depth', DEFAULT_AUTHOR_NOTE_DEPTH))
+    except (TypeError, ValueError):
+        depth = DEFAULT_AUTHOR_NOTE_DEPTH
+    depth = max(0, min(99, depth))
+    role = raw.get('role', 'system')
+    role = role if role in _AUTHOR_NOTE_ROLES else 'system'
+    return {'text': text, 'depth': depth, 'role': role}
 
 
 def normalize_memories(data: dict | None) -> list[dict]:

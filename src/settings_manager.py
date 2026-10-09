@@ -6,6 +6,7 @@ import ctypes.wintypes
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -23,7 +24,7 @@ def _get_settings() -> QSettings:
 _PROVIDER_KEYS = (
     'base_url', 'model', 'temperature', 'max_tokens', 'top_p', 'top_k',
     'min_p', 'context_size', 'frequency_penalty', 'presence_penalty', 'seed',
-    'retry_attempts',
+    'retry_attempts', 'stop',
 )
 
 _LEGACY_KEYS = _PROVIDER_KEYS + ('preset_name',)
@@ -41,6 +42,7 @@ _PROVIDER_DEFAULTS: dict = {
     'presence_penalty': 0.0,
     'seed': -1,
     'retry_attempts': 2,
+    'stop': '',
 }
 
 
@@ -167,8 +169,39 @@ def _read_config(s: QSettings, prefix: str, name: str = '') -> dict:
         # Matches the Settings spinbox range so a corrupted value can't produce
         # an effectively infinite retry loop.
         'retry_attempts': _clamp(_safe_int(s.value(prefix + 'retry_attempts', 2), 2), 0, 5, 2),
+        'stop': _parse_stop_value(s.value(prefix + 'stop', '')),
     }
     return result
+
+
+def _parse_stop_value(value) -> list[str]:
+    """Normalise a stored ``stop`` value into a list of stop strings.
+
+    Accepts the JSON-array form written by :func:`save_provider_settings`, a
+    QSettings string list, or a plain comma/newline separated string.
+    """
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        text = str(value).strip()
+        if not text:
+            return []
+        if text.startswith('['):
+            try:
+                parsed = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            raw_items = parsed if isinstance(parsed, list) else [text]
+        else:
+            raw_items = re.split(r'[,;\n]', text)
+    out: list[str] = []
+    for item in raw_items:
+        s = str(item).strip()
+        if s and s not in out:
+            out.append(s)
+    return out
 
 
 def save_provider_settings(name: str, config: dict) -> None:
@@ -176,6 +209,10 @@ def save_provider_settings(name: str, config: dict) -> None:
     prefix = _provider_prefix(name)
     for key in _PROVIDER_KEYS:
         s.setValue(prefix + key, config.get(key, _PROVIDER_DEFAULTS[key]))
+    stop = config.get('stop', _PROVIDER_DEFAULTS['stop'])
+    if isinstance(stop, (list, tuple)):
+        stop = json.dumps([str(x).strip() for x in stop if str(x).strip()])
+    s.setValue(prefix + 'stop', stop if stop else '')
     _write_api_key(s, prefix, config.get('api_key', ''))
 
 
@@ -358,6 +395,10 @@ DEFAULT_TEST_SETTINGS: dict = {
     'show_timestamps': False,
     'auto_scroll': True,
     'include_first_message': True,
+    # Where the card's few-shot example dialogue rides in the request:
+    # 'system' (SillyTavern-style labelled block in the system prompt),
+    # 'post_history' (block after the history), or 'history' (real turns).
+    'example_placement': 'system',
 }
 
 
@@ -382,14 +423,114 @@ def save_test_settings(settings: dict) -> None:
     s.setValue('test/settings', json.dumps(settings or {}))
 
 
+# ---------------------------------------------------------------------------
+# User personas (named; the active one backs the {{user}} persona description)
+# ---------------------------------------------------------------------------
+
+_PERSONAS_KEY = 'chat/personas'
+_ACTIVE_PERSONA_KEY = 'chat/active_persona_id'
+_LEGACY_PERSONA_KEY = 'chat/user_persona'
+_DEFAULT_PERSONA_ID = 'default'
+
+
+def _read_personas() -> list[dict]:
+    raw = _get_settings().value(_PERSONAS_KEY, '')
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("Corrupted persona list; resetting to default")
+        return []
+    personas: list[dict] = []
+    if isinstance(parsed, list):
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            personas.append({
+                'id': str(item.get('id') or ''),
+                'name': str(item.get('name') or 'Persona'),
+                'text': str(item.get('text') or ''),
+            })
+    return [p for p in personas if p['id']]
+
+
+def save_personas(personas: list[dict]) -> None:
+    """Persist the named persona list (id/name/text triples)."""
+    clean: list[dict] = []
+    for item in personas or []:
+        if not isinstance(item, dict):
+            continue
+        clean.append({
+            'id': str(item.get('id') or ''),
+            'name': str(item.get('name') or 'Persona'),
+            'text': str(item.get('text') or ''),
+        })
+    _get_settings().setValue(_PERSONAS_KEY, json.dumps(clean, ensure_ascii=False))
+
+
+def load_personas() -> list[dict]:
+    """Return the named user personas (always at least one).
+
+    On first use the legacy single ``chat/user_persona`` string migrates into
+    a "Default" persona so existing setups keep their text.
+    """
+    personas = _read_personas()
+    if personas:
+        return personas
+    legacy = _get_settings().value(_LEGACY_PERSONA_KEY, '')
+    legacy = legacy if isinstance(legacy, str) else ''
+    personas = [{'id': _DEFAULT_PERSONA_ID, 'name': 'Default', 'text': legacy}]
+    save_personas(personas)
+    return personas
+
+
+def load_active_persona_id() -> str:
+    """Return the id of the active persona (falls back to the first one)."""
+    pid = _get_settings().value(_ACTIVE_PERSONA_KEY, '')
+    if isinstance(pid, str) and pid:
+        return pid
+    personas = load_personas()
+    return personas[0]['id'] if personas else _DEFAULT_PERSONA_ID
+
+
+def save_active_persona_id(persona_id: str) -> None:
+    """Persist which persona is active (used as the chat's {{user}} persona)."""
+    _get_settings().setValue(_ACTIVE_PERSONA_KEY, str(persona_id or ''))
+
+
+def get_persona(persona_id: str | None = None) -> dict:
+    """Return the persona dict for *persona_id* (default: the active one)."""
+    pid = persona_id or load_active_persona_id()
+    for p in load_personas():
+        if p['id'] == pid:
+            return p
+    personas = load_personas()
+    return personas[0] if personas else {'id': _DEFAULT_PERSONA_ID, 'name': 'Default', 'text': ''}
+
+
 def save_user_persona(persona: str) -> None:
-    """Persist the {{user}} persona description shown to the model."""
-    _get_settings().setValue('chat/user_persona', persona or '')
+    """Persist the {{user}} persona description shown to the model.
+
+    Writes the text of the active persona (the Settings dialog edits that
+    one) and keeps the legacy key in sync for older builds.
+    """
+    text = persona or ''
+    _get_settings().setValue(_LEGACY_PERSONA_KEY, text)
+    personas = load_personas()
+    pid = load_active_persona_id()
+    for p in personas:
+        if p['id'] == pid:
+            p['text'] = text
+            break
+    else:
+        personas.append({'id': pid or _DEFAULT_PERSONA_ID, 'name': 'Default', 'text': text})
+    save_personas(personas)
 
 
 def load_user_persona() -> str:
-    persona = _get_settings().value('chat/user_persona', '')
-    return persona if isinstance(persona, str) else ''
+    """Return the active persona's text (the model's {{user}} persona)."""
+    return get_persona().get('text', '')
 
 
 def save_active_lorebooks(filenames: list[str]) -> None:

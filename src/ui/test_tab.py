@@ -42,15 +42,15 @@ from src.card_models import CharacterBook, CharacterCard
 from src.card_parser import read_card_data
 from src.chat_builder import (
     append_message,
-    apply_lorebook,
-    apply_memories,
-    apply_persona,
+    assemble_system,
     build_context_plan,
     build_initial_messages,
+    clean_generated_text,
+    example_block_text,
     example_messages_for_card,
     history_for_api,
+    injections_for_chat,
     post_history_text,
-    resolve_system_prompt,
     substitute_macros,
 )
 from src.chat_sessions import (
@@ -58,26 +58,33 @@ from src.chat_sessions import (
     auto_title,
     drop_memories_from,
     new_memory_entry,
+    normalize_author_note,
     normalize_memories,
 )
 from src.database import LibraryDatabase
 from src import lorebook_store
+from src import st_chat_io
 from src.settings_manager import (
-    load_api_settings,
+    get_persona,
     load_active_lorebooks,
+    load_api_settings,
+    load_active_persona_id,
     load_font_size,
     load_macro_settings,
+    load_personas,
     load_provider_models,
     load_test_settings,
-    load_user_persona,
     save_active_lorebooks,
+    save_active_persona_id,
     save_active_sampling,
+    save_personas,
 )
 from src.token_counter import count_tokens
 from src.ui.widgets.chat_bubble import MessageBubble
 from src.ui.widgets.context_inspector_dialog import ContextInspectorDialog
 from src.ui.widgets.edit_message_dialog import TextEditDialog
 from src.ui.widgets.memory_dialog import MemoryDialog
+from src.ui.widgets.persona_dialog import PersonaDialog
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +96,32 @@ def _format_session_ts(iso: str) -> str:
         return datetime.fromisoformat(iso).strftime('%Y-%m-%d %H:%M')
     except Exception:
         return iso
+
+
+# Chat export formats offered by the save dialog: (file filter, extension).
+_EXPORT_FILTERS: tuple[tuple[str, str], ...] = (
+    ('Text (*.txt)', '.txt'),
+    ('JSON (*.json)', '.json'),
+    ('SillyTavern chat (*.jsonl)', '.jsonl'),
+)
+_EXPORT_FILE_FILTER = ';;'.join(f for f, _ in _EXPORT_FILTERS)
+_EXPORT_EXTENSIONS = {ext for _, ext in _EXPORT_FILTERS}
+
+
+def _resolve_export_format(path: str, selected_filter: str) -> tuple[str, str]:
+    """Normalise the destination path and derive its export format.
+
+    The format is the one whose file-type filter the user picked in the save
+    dialog; a destination with no suffix (or one of the known export suffixes)
+    is rewritten to that format's extension.  Pure so the mapping is
+    unit-testable without a file dialog.
+    """
+    ext_by_filter = {f: ext for f, ext in _EXPORT_FILTERS}
+    ext = ext_by_filter.get(selected_filter, '.txt')
+    p = Path(path)
+    if not p.suffix or p.suffix.lower() in _EXPORT_EXTENSIONS:
+        path = str(p.with_suffix(ext))
+    return path, ext.lstrip('.')
 
 
 class _ChatWorker(QThread):
@@ -106,12 +139,23 @@ class _ChatWorker(QThread):
         messages: list[dict],
         parent=None,
         post_history: str = '',
+        jailbreak: str = '',
+        examples_block: str = '',
+        injections: list | None = None,
+        mode: str = 'assistant',
     ):
         super().__init__(parent)
         self.client = client
         self.system = system
         self.messages = messages
         self.post_history = post_history
+        self.jailbreak = jailbreak
+        self.examples_block = examples_block
+        self.injections = list(injections or [])
+        # How the completed text is applied: 'assistant' appends a new reply,
+        # 'user' appends the model-written {{user}} message (Impersonate), and
+        # 'continue' extends the last assistant reply.
+        self.mode = mode
         self._cancel = False
 
     def cancel(self):
@@ -126,6 +170,9 @@ class _ChatWorker(QThread):
             for piece in self.client.generate_chat(
                 history_for_api(self.messages), self.system, stream=True,
                 post_history=self.post_history,
+                jailbreak=self.jailbreak,
+                examples_block=self.examples_block,
+                injections=self.injections,
             ):
                 if self._cancel:
                     return
@@ -167,16 +214,25 @@ class _SummarizeWorker(QThread):
 
 
 class _SessionsDialog(QDialog):
-    """Popup listing saved sessions for a card, with Load / Delete."""
+    """Popup listing saved chats for a card: Load / Export / Delete / Import.
+
+    Export and Import emit signals instead of doing file I/O here: the parent
+    owns the session store and the chat formats, and the file dialogs it opens
+    must be parented to this dialog so they stack above it.
+    """
+
+    export_requested = pyqtSignal(str)
+    import_requested = pyqtSignal()
 
     def __init__(self, sessions: list[dict], parent: QWidget | None = None):
         super().__init__(parent)
-        self.setWindowTitle('Sessions')
+        self.setWindowTitle('Chats')
         self.setMinimumSize(480, 320)
         self._sessions = sessions
 
         layout = QVBoxLayout(self)
         self._list = QListWidget()
+        self._empty_label = QLabel('No saved chats for this character.')
         for s in sessions:
             title = s.get('title') or '(untitled)'
             count = s.get('message_count', 0)
@@ -189,15 +245,29 @@ class _SessionsDialog(QDialog):
             self._list.addItem(item)
         if self._list.count():
             self._list.setCurrentRow(0)
+        self._list.itemSelectionChanged.connect(self._sync_buttons)
         layout.addWidget(self._list)
+        layout.addWidget(self._empty_label)
 
         btn_row = QHBoxLayout()
         self._load_btn = QPushButton('Load')
         self._load_btn.clicked.connect(self.accept)
         btn_row.addWidget(self._load_btn)
+        self._export_btn = QPushButton('Export')
+        self._export_btn.setToolTip(
+            'Save the selected chat as text, JSON, or a SillyTavern .jsonl chat.'
+        )
+        self._export_btn.clicked.connect(self._on_export)
+        btn_row.addWidget(self._export_btn)
         self._delete_btn = QPushButton('Delete')
         self._delete_btn.clicked.connect(self._on_delete)
         btn_row.addWidget(self._delete_btn)
+        self._import_btn = QPushButton('Import...')
+        self._import_btn.setToolTip(
+            'Import a SillyTavern .jsonl chat as a new chat for this character.'
+        )
+        self._import_btn.clicked.connect(self.import_requested.emit)
+        btn_row.addWidget(self._import_btn)
         btn_row.addStretch()
         # "Close", not "Cancel": Delete is confirmed and applied immediately,
         # so closing the dialog is not a rollback (a button labelled Cancel
@@ -206,6 +276,19 @@ class _SessionsDialog(QDialog):
         close_btn.clicked.connect(self.reject)
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
+        self._sync_buttons()
+
+    def _sync_buttons(self) -> None:
+        has_selection = self._list.currentItem() is not None
+        self._load_btn.setEnabled(has_selection)
+        self._export_btn.setEnabled(has_selection)
+        self._delete_btn.setEnabled(has_selection)
+        self._empty_label.setVisible(self._list.count() == 0)
+
+    def _on_export(self) -> None:
+        session_id = self.selected_id()
+        if session_id is not None:
+            self.export_requested.emit(session_id)
 
     def _on_delete(self) -> None:
         item = self._list.currentItem()
@@ -213,14 +296,13 @@ class _SessionsDialog(QDialog):
             return
         session_id = item.data(Qt.ItemDataRole.UserRole)
         if QMessageBox.question(
-            self, 'Delete Session', 'Delete this saved session?',
+            self, 'Delete Chat', 'Delete this saved chat?',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         ) == QMessageBox.StandardButton.Yes:
             self._list.takeItem(self._list.row(item))
             self._deleted_ids = getattr(self, '_deleted_ids', [])
             self._deleted_ids.append(session_id)
-            if self._list.count() == 0:
-                self._load_btn.setEnabled(False)
+            self._sync_buttons()
 
     def selected_id(self) -> str | None:
         item = self._list.currentItem()
@@ -324,7 +406,6 @@ class TestTab(QWidget):
         self._card: CharacterCard | None = None
         self._session_id: str | None = None
         self._messages: list[dict[str, str]] = []
-        self._system = ''
         self._memories: list[dict] = []
         self._auto_summarize = False
         self._summarize_source = 'summary'
@@ -338,8 +419,14 @@ class TestTab(QWidget):
         self._stream_bubble: MessageBubble | None = None
         self._pending_attachments: list[dict] = []
         self._greeting_index = 0
-        # Few-shot messages derived from the card's mes_example.
-        self._example_messages: list[dict[str, str]] = []
+        # SillyTavern-style per-chat prompt knobs (persisted per session):
+        # Author's Note injection, user jailbreak block, active persona.
+        self._author_note: dict = normalize_author_note(None)
+        self._jailbreak = ''
+        self._persona_id = load_active_persona_id()
+        self._persona = get_persona(self._persona_id).get('text', '')
+        # How the next response is applied (see _ChatWorker.mode).
+        self._response_mode = 'assistant'
         # Number of leading messages already covered by a rolling summary.
         self._summarized_through = 0
         # Seed bump applied per regeneration so fixed seeds still vary.
@@ -388,14 +475,7 @@ class TestTab(QWidget):
         macro = load_macro_settings()
         self._user_name = macro.get('user_name') or 'User'
         self._custom_macros = macro.get('macros') or {}
-        persona = load_user_persona()
-        if persona != getattr(self, '_persona', None):
-            self._persona = persona
-            if self._card is not None:
-                self._system = self._resolve_system()
-                self._example_messages = example_messages_for_card(
-                    self._card, self._user_name, self._custom_macros,
-                )
+        self._persona = get_persona(self._persona_id).get('text', '')
 
     def _reload_test_settings(self) -> None:
         settings = load_test_settings()
@@ -405,6 +485,10 @@ class TestTab(QWidget):
         self._show_timestamps = bool(settings.get('show_timestamps', False))
         self._auto_scroll = bool(settings.get('auto_scroll', True))
         self._include_first = bool(settings.get('include_first_message', True))
+        placement = settings.get('example_placement', 'system')
+        self._example_placement = (
+            placement if placement in ('system', 'post_history', 'history') else 'system'
+        )
 
     def reload_preset(self) -> None:
         """Reload API preset + macros + test settings (after settings change)."""
@@ -418,40 +502,62 @@ class TestTab(QWidget):
         self._set_sampling_widgets(
             self._preset.temperature, self._preset.min_p, self._preset.context_size,
         )
-        if self._card is not None:
-            self._system = self._resolve_system()
-            self._example_messages = example_messages_for_card(
-                self._card, self._user_name, self._custom_macros,
-            )
         self._render_history()
-
-    def _resolve_system(self) -> str:
-        if self._card is None:
-            return ''
-        return resolve_system_prompt(
-            self._card, self._user_name, custom_macros=self._custom_macros,
-        )
 
     def _assemble_system(self) -> str:
         """Single source of truth for the system prompt sent to the API.
 
-        Layers: base card prompt -> user persona -> lorebook (world info)
-        -> chat memory.  Used both for sending and for the context inspector
-        so the two can never drift apart.
+        Layers (SillyTavern order, see ``chat_builder.system_prompt_blocks``):
+        main prompt -> world info -> description/personality/scenario ->
+        user persona -> chat memory, plus the example dialogue block when the
+        placement setting keeps it in the system prompt.  The context
+        inspector shares these blocks so the two can never drift apart.
         """
         if self._card is None:
             return ''
-        with_persona = apply_persona(self._system, self._persona, self._user_name)
-        with_lore = apply_lorebook(
-            with_persona, self._card, self._messages, extra_books=self._extra_books,
+        system = assemble_system(
+            self._card,
+            self._messages,
+            user_name=self._user_name,
+            persona=self._persona,
+            memories=self._memories,
+            custom_macros=self._custom_macros,
+            extra_books=self._extra_books,
         )
-        return apply_memories(with_lore, self._memories)
+        if self._example_placement == 'system':
+            block = self._examples_block()
+            if block:
+                system = f'{system}\n\n{block}' if system.strip() else block
+        return system
+
+    def _examples_block(self) -> str:
+        """Few-shot example dialogue as one labelled text block ('' = none)."""
+        if self._card is None:
+            return ''
+        return example_block_text(self._card, self._user_name, self._custom_macros)
+
+    def _examples_for_history(self) -> list[dict]:
+        """Few-shot examples as fake history turns (legacy placement only)."""
+        if self._card is None or self._example_placement != 'history':
+            return []
+        return example_messages_for_card(
+            self._card, self._user_name, self._custom_macros,
+        )
 
     def _post_history_text(self) -> str:
         """Macro-substituted post-history instructions (may be empty)."""
         if self._card is None:
             return ''
         return post_history_text(self._card, self._user_name, self._custom_macros)
+
+    def _jailbreak_text(self) -> str:
+        """Macro-substituted user jailbreak block (may be empty)."""
+        if not self._jailbreak.strip():
+            return ''
+        return substitute_macros(
+            self._jailbreak, self._user_name,
+            self._card.name if self._card else '', self._custom_macros,
+        )
 
     def _effective_preset(self) -> APIPreset:
         """Preset for the next chat request: per-chat overrides + seed bump."""
@@ -529,10 +635,13 @@ class TestTab(QWidget):
         toolbar_row = QHBoxLayout()
         toolbar_row.setContentsMargins(8, 8, 20, 2)
         toolbar_row.addStretch()
-        self._new_session_btn = QPushButton('New Session')
+        self._new_session_btn = QPushButton('New Chat')
         self._new_session_btn.clicked.connect(self._on_new_session)
         toolbar_row.addWidget(self._new_session_btn)
-        self._sessions_btn = QPushButton('Sessions')
+        self._sessions_btn = QPushButton('Chats')
+        self._sessions_btn.setToolTip(
+            'Load, export, import, or delete this character\'s saved chats.'
+        )
         self._sessions_btn.clicked.connect(self._on_sessions)
         toolbar_row.addWidget(self._sessions_btn)
         self._memory_btn = QPushButton('Memory')
@@ -545,16 +654,24 @@ class TestTab(QWidget):
         )
         self._lore_btn.clicked.connect(self._on_lorebooks)
         toolbar_row.addWidget(self._lore_btn)
+        self._persona_btn = QPushButton('Persona')
+        self._persona_btn.setToolTip(
+            'Manage named {{user}} personas and pick the one for this chat.'
+        )
+        self._persona_btn.clicked.connect(self._on_persona)
+        toolbar_row.addWidget(self._persona_btn)
         self._context_btn = QPushButton('Context')
+        self._context_btn.setToolTip(
+            'Inspect the exact context the next request will send.\n'
+            'The Author\'s Note and Jailbreak tabs edit this chat\'s '
+            'trailing instructions.'
+        )
         self._context_btn.clicked.connect(self._on_context_inspect)
         toolbar_row.addWidget(self._context_btn)
         self._auto_summarize_btn = QPushButton('Auto-Summarize')
         self._auto_summarize_btn.setCheckable(True)
         self._auto_summarize_btn.clicked.connect(self._on_auto_summarize_toggled)
         toolbar_row.addWidget(self._auto_summarize_btn)
-        self._export_btn = QPushButton('Export')
-        self._export_btn.clicked.connect(self._on_export)
-        toolbar_row.addWidget(self._export_btn)
         self._settings_btn = QPushButton('Settings')
         self._settings_btn.clicked.connect(self._on_settings)
         toolbar_row.addWidget(self._settings_btn)
@@ -619,12 +736,40 @@ class TestTab(QWidget):
         message_row.addWidget(self._input, 1)
         right_layout.addLayout(message_row)
 
-        control_row = QHBoxLayout()
-        control_row.setContentsMargins(8, 4, 8, 8)
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(8, 4, 8, 2)
+        button_row.addStretch()
+        self._impersonate_btn = QPushButton('Impersonate')
+        self._impersonate_btn.setToolTip(
+            'Have the model write {{user}}\'s next message; it is added to '
+            'the chat for you to edit or send.'
+        )
+        self._impersonate_btn.clicked.connect(self._on_impersonate)
+        button_row.addWidget(self._impersonate_btn)
+        self._continue_btn = QPushButton('Continue')
+        self._continue_btn.setToolTip(
+            'Continue the last reply instead of starting a new message.'
+        )
+        self._continue_btn.clicked.connect(self._on_continue)
+        button_row.addWidget(self._continue_btn)
+        self._attach_btn = QPushButton('Attach')
+        self._attach_btn.clicked.connect(self._on_attach)
+        button_row.addWidget(self._attach_btn)
+        self._send_btn = QPushButton('Send')
+        self._send_btn.clicked.connect(self._on_send)
+        button_row.addWidget(self._send_btn)
+        self._cancel_btn = QPushButton('Cancel')
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        button_row.addWidget(self._cancel_btn)
+        right_layout.addLayout(button_row)
+
+        settings_row = QHBoxLayout()
+        settings_row.setContentsMargins(8, 2, 8, 8)
         small_style = 'color: #777;'
         model_label = QLabel('Model')
         model_label.setStyleSheet(small_style)
-        control_row.addWidget(model_label)
+        settings_row.addWidget(model_label)
         self._model_combo = QComboBox()
         self._model_combo.setEditable(True)
         self._model_combo.setMinimumWidth(200)
@@ -635,10 +780,10 @@ class TestTab(QWidget):
         )
         self._refresh_model_combo(self._preset.model)
         self._model_combo.currentTextChanged.connect(self._on_sampling_changed)
-        control_row.addWidget(self._model_combo)
+        settings_row.addWidget(self._model_combo)
         ctx_label = QLabel('Ctx')
         ctx_label.setStyleSheet(small_style)
-        control_row.addWidget(ctx_label)
+        settings_row.addWidget(ctx_label)
         self._context_override = QSpinBox()
         self._context_override.setRange(512, 200000)
         self._context_override.setSingleStep(256)
@@ -650,10 +795,10 @@ class TestTab(QWidget):
             'trimmed or summarized.'
         )
         self._context_override.valueChanged.connect(self._on_sampling_changed)
-        control_row.addWidget(self._context_override)
+        settings_row.addWidget(self._context_override)
         temp_label = QLabel('Temp')
         temp_label.setStyleSheet(small_style)
-        control_row.addWidget(temp_label)
+        settings_row.addWidget(temp_label)
         self._temp_override = QDoubleSpinBox()
         self._temp_override.setRange(0.0, 2.0)
         self._temp_override.setSingleStep(0.05)
@@ -665,10 +810,10 @@ class TestTab(QWidget):
             'Higher = more creative/varied, lower = more focused/accurate.'
         )
         self._temp_override.valueChanged.connect(self._on_sampling_changed)
-        control_row.addWidget(self._temp_override)
+        settings_row.addWidget(self._temp_override)
         minp_label = QLabel('Min-P')
         minp_label.setStyleSheet(small_style)
-        control_row.addWidget(minp_label)
+        settings_row.addWidget(minp_label)
         self._minp_override = QDoubleSpinBox()
         self._minp_override.setRange(0.0, 1.0)
         self._minp_override.setSingleStep(0.05)
@@ -681,26 +826,18 @@ class TestTab(QWidget):
             'creativity — a good companion to a higher temperature.'
         )
         self._minp_override.valueChanged.connect(self._on_sampling_changed)
-        control_row.addWidget(self._minp_override)
-        control_row.addStretch()
-        self._attach_btn = QPushButton('Attach')
-        self._attach_btn.clicked.connect(self._on_attach)
-        control_row.addWidget(self._attach_btn)
-        self._send_btn = QPushButton('Send')
-        self._send_btn.clicked.connect(self._on_send)
-        control_row.addWidget(self._send_btn)
-        self._cancel_btn = QPushButton('Cancel')
-        self._cancel_btn.setEnabled(False)
-        self._cancel_btn.clicked.connect(self._on_cancel)
-        control_row.addWidget(self._cancel_btn)
-        right_layout.addLayout(control_row)
+        settings_row.addWidget(self._minp_override)
+        settings_row.addStretch()
+        right_layout.addLayout(settings_row)
 
         layout.addWidget(right_container)
 
         self._input_widgets = [
             self._input, self._send_btn, self._attach_btn,
             self._new_session_btn, self._sessions_btn, self._memory_btn,
-            self._context_btn, self._auto_summarize_btn, self._export_btn,
+            self._context_btn, self._auto_summarize_btn,
+            self._impersonate_btn, self._continue_btn,
+            self._persona_btn, self._lore_btn,
         ]
 
     def _set_inputs_enabled(self, enabled: bool) -> None:
@@ -744,10 +881,6 @@ class TestTab(QWidget):
         self._current_id = char_id
         self._card = CharacterCard.from_spec_dict(raw, source)
         self._greeting_index = 0
-        self._system = self._resolve_system()
-        self._example_messages = example_messages_for_card(
-            self._card, self._user_name, self._custom_macros,
-        )
         self._summarized_through = 0
         self._regen_bump = 0
         self._header.setTextFormat(Qt.TextFormat.PlainText)
@@ -772,9 +905,14 @@ class TestTab(QWidget):
         self._regen_bump = 0
         # Restore the persisted Auto-Summarize toggle for this session.
         self._auto_summarize = bool(data.get('auto_summarize', False))
+        self._author_note = normalize_author_note(data.get('author_note'))
+        self._jailbreak = data.get('jailbreak') or ''
+        self._persona_id = data.get('persona_id') or load_active_persona_id()
+        self._persona = get_persona(self._persona_id).get('text', '')
         self._sync_auto_toggle()
         self._update_memory_button()
         self._refresh_memory_dialog()
+        self._update_prompt_buttons()
         self._at_bottom = True
         self._render_history()
 
@@ -785,8 +923,13 @@ class TestTab(QWidget):
         self._greeting_index = 0
         self._summarized_through = 0
         self._regen_bump = 0
+        self._author_note = normalize_author_note(None)
+        self._jailbreak = ''
+        self._persona_id = load_active_persona_id()
+        self._persona = get_persona(self._persona_id).get('text', '')
         self._sync_auto_toggle()
         self._update_memory_button()
+        self._update_prompt_buttons()
         if self._include_first and self._card is not None and self._card.first_mes:
                 self._messages = build_initial_messages(
                     self._card, self._user_name, custom_macros=self._custom_macros,
@@ -794,17 +937,27 @@ class TestTab(QWidget):
         self._at_bottom = True
         self._render_history()
 
+    def _update_prompt_buttons(self) -> None:
+        """Reflect note/jailbreak/persona state on their toolbar buttons."""
+        if getattr(self, '_context_btn', None) is not None:
+            has_note = bool((self._author_note.get('text') or '').strip())
+            has_jb = bool(self._jailbreak.strip())
+            self._context_btn.setText('Context*' if (has_note or has_jb) else 'Context')
+        if getattr(self, '_persona_btn', None) is not None:
+            name = get_persona(self._persona_id).get('name', '') or 'Persona'
+            self._persona_btn.setText(f'Persona: {name}')
+
     def _on_new_session(self) -> None:
         if self._current_id is None:
             return
         if self._is_generating():
-            # A response is streaming into the current session; starting a
+            # A response is streaming into the current chat; starting a
             # new one now would deliver the reply into the wrong session
             # file when it completes.
             QMessageBox.information(
                 self, 'Test',
                 'A response is still generating.\n'
-                'Cancel it before starting a new session.',
+                'Cancel it before starting a new chat.',
             )
             return
         self._save_current_session()
@@ -818,15 +971,14 @@ class TestTab(QWidget):
             QMessageBox.information(
                 self, 'Test',
                 'A response is still generating.\n'
-                'Cancel it before switching sessions.',
+                'Cancel it before switching chats.',
             )
             return
         self._save_current_session()
         sessions = self._store.list_sessions(self._current_id)
-        if not sessions:
-            QMessageBox.information(self, 'Sessions', 'No saved sessions for this character.')
-            return
         dlg = _SessionsDialog(sessions, self)
+        dlg.export_requested.connect(lambda sid: self._on_export_session(sid, dlg))
+        dlg.import_requested.connect(self._on_import_st_chat)
         # Snapshot dialog state before deleteLater: exec() + WA_DeleteOnClose
         # would destroy the C++ object before the getters below run.
         accepted = dlg.exec() == QDialog.DialogCode.Accepted
@@ -894,6 +1046,24 @@ class TestTab(QWidget):
         save_active_lorebooks(selected)
         self._reload_extra_books()
         self._update_token_label()
+
+    # ---- SillyTavern prompt knobs (persona; note/jailbreak live in Context) ----
+
+    def _on_persona(self) -> None:
+        dlg = PersonaDialog(load_personas(), self._persona_id, self)
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        personas = dlg.personas()
+        selected = dlg.selected_id()
+        dlg.deleteLater()
+        if not accepted:
+            return
+        save_personas(personas)
+        self._persona_id = selected
+        save_active_persona_id(selected)
+        self._persona = get_persona(selected).get('text', '')
+        self._update_prompt_buttons()
+        self._update_token_label()
+        self._save_current_session()
 
     # ---- chat rendering ----
 
@@ -1040,9 +1210,10 @@ class TestTab(QWidget):
         self._bubble_layout.insertWidget(self._bubble_layout.count() - 1, label)
         self._maybe_scroll_to_bottom()
 
-    def _conversation_text(self) -> str:
+    def _conversation_text(self, messages: list[dict] | None = None) -> str:
+        msgs = self._messages if messages is None else messages
         lines = []
-        for m in self._messages:
+        for m in msgs:
             role = self._user_name if m.get('role') == 'user' else (self._card.name if self._card else 'Assistant')
             lines.append(f"{role}: {m.get('content', '')}")
         return '\n'.join(lines)
@@ -1059,27 +1230,22 @@ class TestTab(QWidget):
         if self._current_id is None or self._card is None:
             self._token_label.setText('')
             return
-        system_mem = self._assemble_system()
-        # Count each conversation line separately (identical strings are
-        # memoized by count_tokens) and sum: re-rendering one message must
-        # not re-tokenize the entire history. Summing slightly over-counts
-        # versus one joined encode, which is the safe direction for a
-        # context-budget display.
-        lines = []
-        for m in self._messages:
-            role = self._user_name if m.get('role') == 'user' else (self._card.name if self._card else 'Assistant')
-            lines.append(f"{role}: {m.get('content', '')}")
-        # Few-shot examples and post-history instructions also ride along
-        # in every request; count them so the label matches reality.
-        extra_parts = [m.get('content', '') for m in self._example_messages]
-        phi = self._post_history_text()
-        if phi:
-            extra_parts.append(phi)
-        extra = '\n'.join(p for p in extra_parts if p)
-        total = count_tokens(system_mem)
-        total += sum(count_tokens(line) for line in lines)
-        if extra:
-            total += count_tokens(extra)
+        # The plan is the exact payload the send path builds (system blocks,
+        # example dialogue, history + depth injections, post-history and
+        # jailbreak), so the label can't drift from what is actually sent.
+        plan = build_context_plan(
+            self._card,
+            self._messages,
+            memories=self._memories,
+            user_name=self._user_name,
+            custom_macros=self._custom_macros,
+            persona=self._persona,
+            extra_books=self._extra_books,
+            example_placement=self._example_placement,
+            author_note=self._author_note,
+            jailbreak=self._jailbreak,
+        )
+        total = plan.total_tokens
         ctx = self._effective_context_size()
         self._apply_font_sizes()
         if ctx:
@@ -1128,26 +1294,67 @@ class TestTab(QWidget):
         self._save_current_session()
         self._start_generation()
 
-    def _start_generation(self) -> None:
+    def _on_impersonate(self) -> None:
+        """Have the model write {{user}}'s next message (added as a user turn)."""
+        if self._current_id is None or self._is_generating():
+            return
+        self._regen_bump = 0
+        self._start_generation(mode='user')
+
+    def _on_continue(self) -> None:
+        """Extend the last assistant reply instead of starting a new one."""
+        if self._current_id is None or self._is_generating():
+            return
+        if not any(m.get('role') == 'assistant' for m in self._messages):
+            self.status_message.emit('Nothing to continue.', 3000)
+            return
+        self._regen_bump = 0
+        self._start_generation(mode='continue')
+
+    def _start_generation(self, mode: str = 'assistant') -> None:
         client = AIClient(self._effective_preset())
         self._generating = True
+        self._response_mode = mode
         self._send_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._input.setEnabled(False)
         self._attach_btn.setEnabled(False)
 
+        # Impersonate streams a user-side message; everything else replies
+        # as the character.
+        bubble_role = 'user' if mode == 'user' else 'assistant'
         self._stream_bubble = self._add_bubble(len(self._messages), {
-            'role': 'assistant', 'content': '',
+            'role': bubble_role, 'content': '',
         })
         self._set_bubble_controls_enabled(False)
         # Explicit send/regenerate always shows the new exchange.
         self._scroll_to_bottom()
 
         system = self._assemble_system()
-        self._summarize_evicted(system)
+        api_history = self._examples_for_history() + self._messages
+        injections = injections_for_chat(
+            self._card,
+            self._messages,
+            author_note=self._author_note,
+            extra_books=self._extra_books,
+            user_name=self._user_name,
+            custom_macros=self._custom_macros,
+        )
+        self._summarize_evicted(system, api_history, injections)
+        jailbreak = self._jailbreak_text()
+        mode_prompt = self._mode_prompt(mode)
+        if mode_prompt:
+            jailbreak = f'{jailbreak}\n\n{mode_prompt}' if jailbreak.strip() else mode_prompt
+        examples_block = (
+            self._examples_block() if self._example_placement == 'post_history' else ''
+        )
         self._worker = _ChatWorker(
-            client, system, self._example_messages + self._messages, self,
+            client, system, api_history, self,
             post_history=self._post_history_text(),
+            jailbreak=jailbreak,
+            examples_block=examples_block,
+            injections=injections,
+            mode=mode,
         )
         self._worker.chunk.connect(self._append_streaming_chunk)
         self._worker.completed.connect(self._on_response)
@@ -1156,21 +1363,42 @@ class TestTab(QWidget):
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
 
-    def _summarize_evicted(self, system: str) -> None:
+    def _mode_prompt(self, mode: str) -> str:
+        """Trailing instruction for Impersonate / Continue ('' = none)."""
+        if mode not in ('user', 'continue'):
+            return ''
+        from src.ai_prompts import load_prompt
+        key = 'impersonate_user' if mode == 'user' else 'continue_user'
+        return substitute_macros(
+            load_prompt(key), self._user_name,
+            self._card.name if self._card else '', self._custom_macros,
+        )
+
+    def _summarize_evicted(self, system: str, api_history: list[dict] | None = None,
+                           injections: list | None = None) -> None:
         """Rolling-summary fallback for messages the context window evicts.
 
         Mirrors the trimming inside ``AIClient.generate_chat``: when older
         messages no longer fit, they are summarized into a chat-memory entry
         so the conversation keeps its continuity instead of hitting an
-        amnesia cliff.
+        amnesia cliff.  *api_history* is the exact history the request sends
+        (examples + conversation); *injections* are reserved against the
+        budget like in the real trim.
         """
         ctx = self._effective_context_size()
         if not ctx or not self._messages:
             return
+        if api_history is None:
+            api_history = list(self._messages)
+        injections = list(injections or [])
         full: list[dict] = [{'role': 'system', 'content': system}]
-        full.extend(history_for_api(self._example_messages + self._messages))
-        _, dropped = split_for_context(full, ctx, self._preset.max_tokens)
-        evicted = max(0, len(dropped) - len(self._example_messages))
+        full.extend(history_for_api(api_history))
+        reserve = sum(count_tokens(i.content) for i in injections)
+        _, dropped = split_for_context(
+            full, ctx, self._preset.max_tokens, reserve=reserve,
+        )
+        leading_examples = max(0, len(api_history) - len(self._messages))
+        evicted = max(0, len(dropped) - leading_examples)
         if evicted <= self._summarized_through:
             return
         char_name = self._card.name if self._card else 'Assistant'
@@ -1198,12 +1426,23 @@ class TestTab(QWidget):
 
     @pyqtSlot(str)
     def _on_response(self, response: str) -> None:
+        response = clean_generated_text(
+            response, self._user_name,
+            self._card.name if self._card else '',
+        )
+        mode = getattr(self, '_response_mode', 'assistant')
+        if mode == 'continue':
+            self._finish_generation()
+            self._append_continuation(response)
+            self._save_current_session()
+            return
+        role = 'user' if mode == 'user' else 'assistant'
         self._messages = append_message(
-            self._messages, 'assistant', response,
+            self._messages, role, response,
             self._user_name, self._card.name if self._card else '',
             custom_macros=self._custom_macros,
         )
-        if self._regen_tried is not None and self._messages:
+        if role == 'assistant' and self._regen_tried is not None and self._messages:
             # A regenerate/try-again produced this reply: keep every earlier
             # attempt browsable and land on the newest one.
             tried = list(self._regen_tried)
@@ -1215,8 +1454,21 @@ class TestTab(QWidget):
         self._render_history()
         self._finish_generation()
         self._save_current_session()
-        if self._auto_summarize:
+        if role == 'assistant' and self._auto_summarize:
             self._start_summarize(self._last_exchange_text(), source='auto')
+
+    def _append_continuation(self, text: str) -> None:
+        """Extend the last assistant message with a Continue result."""
+        if not text.strip():
+            self._render_history()
+            return
+        for msg in reversed(self._messages):
+            if msg.get('role') == 'assistant':
+                content = msg.get('content', '')
+                joined = f'{content}{text}' if content.endswith(('\n', ' ', '\t')) or text.startswith(('\n', ' ', '\t')) else f'{content}\n{text}'
+                self._set_message_content(msg, joined)
+                break
+        self._render_history()
 
     @pyqtSlot(str)
     def _on_error(self, error: str) -> None:
@@ -1244,6 +1496,7 @@ class TestTab(QWidget):
 
     def _finish_generation(self) -> None:
         self._generating = False
+        self._response_mode = 'assistant'
         worker = self._worker
         self._worker = None
         if worker is not None:
@@ -1518,20 +1771,47 @@ class TestTab(QWidget):
         self._memory_dialog.activateWindow()
 
     def _on_context_inspect(self) -> None:
-        """Show the exact context the next request will send."""
+        """Show the exact context the next request will send.
+
+        The dialog's Author's Note / Jailbreak tabs edit this chat's trailing
+        instructions; OK applies them, Cancel discards.
+        """
         if self._card is None:
             return
-        plan = build_context_plan(
-            self._card,
-            self._messages,
-            memories=self._memories,
-            user_name=self._user_name,
-            custom_macros=self._custom_macros,
-            persona=self._persona,
-            extra_books=self._extra_books,
+
+        def plan_factory(author_note: dict, jailbreak: str):
+            return build_context_plan(
+                self._card,
+                self._messages,
+                memories=self._memories,
+                user_name=self._user_name,
+                custom_macros=self._custom_macros,
+                persona=self._persona,
+                extra_books=self._extra_books,
+                example_placement=self._example_placement,
+                author_note=author_note,
+                jailbreak=jailbreak,
+            )
+
+        dialog = ContextInspectorDialog(
+            plan_factory(self._author_note, self._jailbreak),
+            self._effective_context_size(),
+            self,
+            author_note=self._author_note,
+            jailbreak=self._jailbreak,
+            plan_factory=plan_factory,
         )
-        dialog = ContextInspectorDialog(plan, self._effective_context_size(), self)
-        dialog.exec()
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        note = dialog.author_note()
+        jailbreak = dialog.jailbreak()
+        dialog.deleteLater()
+        if not accepted:
+            return
+        self._author_note = note
+        self._jailbreak = jailbreak
+        self._update_prompt_buttons()
+        self._update_token_label()
+        self._save_current_session()
 
     def _on_memories_changed(self, memories: list) -> None:
         self._memories = [dict(m) for m in memories]
@@ -1655,52 +1935,118 @@ class TestTab(QWidget):
 
     # ---- export ----
 
-    def _on_export(self) -> None:
-        if self._current_id is None or not self._messages:
-            self.status_message.emit('Nothing to export.', 3000)
+    def _on_export_session(self, session_id: str, parent: QWidget | None = None) -> None:
+        """Export one saved chat (selected in the Chats dialog) to a file.
+
+        The destination format comes from the save dialog's file-type filter.
+        """
+        if self._current_id is None:
             return
+        data = self._store.load_session(self._current_id, session_id) or {}
+        messages = [m for m in data.get('messages') or [] if isinstance(m, dict)]
+        if not messages:
+            self.status_message.emit('That chat is empty - nothing to export.', 3000)
+            return
+        memories = normalize_memories(data)
+        author_note = normalize_author_note(data.get('author_note'))
+        raw_jb = data.get('jailbreak')
+        jailbreak = raw_jb.strip() if isinstance(raw_jb, str) else ''
         base = (self._card.name if self._card else 'chat').replace(' ', '_')
         path, selected_filter = QFileDialog.getSaveFileName(
-            self, 'Export Chat', base + '.txt',
-            'Text (*.txt);;JSON (*.json)',
+            parent or self, 'Export Chat', base + '.txt', _EXPORT_FILE_FILTER,
         )
         if not path:
             return
-        # The chosen filter decides the output format; the extension is
-        # normalised to match (and appended when the user typed none) so the
-        # filter and the file can't disagree.
-        as_json = 'JSON' in (selected_filter or '')
-        p = Path(path)
-        want_ext = '.json' if as_json else '.txt'
-        if not p.suffix or p.suffix.lower() in ('.json', '.txt'):
-            path = str(p.with_suffix(want_ext))
+        path, fmt = _resolve_export_format(path, selected_filter)
+        title = data.get('title') or auto_title(messages, fallback=base)
         try:
-            if as_json:
-                data = {
-                    'title': auto_title(self._messages, fallback=base),
-                    'memories': self._memories,
-                    'auto_summarize': self._auto_summarize,
-                    'messages': self._messages,
+            if fmt == 'json':
+                payload = {
+                    'title': title,
+                    'memories': memories,
+                    'auto_summarize': bool(data.get('auto_summarize', False)),
+                    'author_note': author_note,
+                    'jailbreak': jailbreak,
+                    'messages': messages,
                 }
                 Path(path).write_text(
-                    json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8',
+                    json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8',
+                )
+            elif fmt == 'jsonl':
+                Path(path).write_text(
+                    st_chat_io.export_st_chat(
+                        messages,
+                        user_name=self._user_name,
+                        char_name=self._card.name if self._card else 'Assistant',
+                        chat_name=title,
+                    ),
+                    encoding='utf-8',
                 )
             else:
-                Path(path).write_text(self._conversation_text(), encoding='utf-8')
+                Path(path).write_text(self._conversation_text(messages), encoding='utf-8')
             self.status_message.emit(f'Exported chat to {path}', 5000)
         except OSError as e:
-            QMessageBox.critical(self, 'Export', f'Failed to export: {e}')
+            QMessageBox.critical(parent or self, 'Export', f'Failed to export: {e}')
+
+    def _on_import_st_chat(self) -> None:
+        """Import a SillyTavern ``.jsonl`` chat as a fresh session."""
+        if self._current_id is None:
+            self.status_message.emit('Select a character first.', 3000)
+            return
+        if self._is_generating():
+            QMessageBox.information(
+                self, 'Test',
+                'A response is still generating.\n'
+                'Cancel it before importing.',
+            )
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Import SillyTavern Chat', '',
+            'SillyTavern chats (*.jsonl);;All files (*)',
+        )
+        if not path:
+            return
+        try:
+            text = Path(path).read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError) as e:
+            QMessageBox.critical(self, 'Import', f'Failed to read chat file: {e}')
+            return
+        messages = st_chat_io.import_st_chat(text)
+        if not messages:
+            self.status_message.emit('No messages found in that chat file.', 5000)
+            return
+        self._save_current_session()
+        self._session_id = ChatSessionStore.new_session_id()
+        self._messages = messages
+        self._memories = []
+        self._greeting_index = 0
+        self._summarized_through = 0
+        self._regen_bump = 0
+        self._author_note = normalize_author_note(None)
+        self._jailbreak = ''
+        self._persona_id = load_active_persona_id()
+        self._persona = get_persona(self._persona_id).get('text', '')
+        self._sync_auto_toggle()
+        self._update_memory_button()
+        self._update_prompt_buttons()
+        self._at_bottom = True
+        self._render_history()
+        self._save_current_session()
+        self.status_message.emit(f'Imported {len(messages)} message(s).', 5000)
 
     # ---- persistence ----
 
     def _save_current_session(self) -> None:
         if self._current_id is None or self._session_id is None:
             return
-        title = auto_title(self._messages, fallback=(self._card.name if self._card else 'New session'))
+        title = auto_title(self._messages, fallback=(self._card.name if self._card else 'New chat'))
         self._store.save_session(
             self._current_id, self._session_id, title, self._messages,
             memories=self._memories,
             auto_summarize=self._auto_summarize,
+            author_note=self._author_note,
+            jailbreak=self._jailbreak,
+            persona_id=self._persona_id,
         )
 
     def refresh_font_size(self) -> None:

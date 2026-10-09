@@ -175,6 +175,11 @@ DEFAULT_WIZARD_USER = (
 )
 
 # Default chat-preview system prompt (Phase 6D).
+# The character definition (description/personality/scenario) is injected as
+# its own labelled blocks by ``chat_builder.system_prompt_blocks`` — keeping
+# it out of the template means a card with its own ``system_prompt`` (which
+# replaces this template) still gets its definition, exactly as in
+# SillyTavern.
 DEFAULT_CHAT_SYSTEM = (
     'You are roleplaying as {name} in an ongoing, never-ending roleplay chat. '
     'Stay fully in character at all times and never mention being an AI.\n'
@@ -183,10 +188,21 @@ DEFAULT_CHAT_SYSTEM = (
     'Respond with vivid, specific detail; move the scene forward; and vary '
     'sentence structure so replies never feel repetitive.\n'
     'Never write dialogue, actions, thoughts, or decisions for {{user}} — '
-    'end your turn to give them room to respond. Keep replies focused.\n\n'
-    'Description: {description}\n'
-    'Personality: {personality}\n'
-    'Scenario: {scenario}'
+    'end your turn to give them room to respond. Keep replies focused.'
+)
+
+# Trailing instruction for Impersonate: the model writes the *user*'s reply.
+DEFAULT_IMPERSONATE_USER = (
+    'Write the next message as {{user}}, not as {{char}}. Match {{user}}\'s '
+    'voice, knowledge, and the flow of the conversation. Output ONLY the '
+    'message text — no name prefix, no narration as {{char}}, no commentary.'
+)
+
+# Trailing instruction for Continue: extend the last reply in place.
+DEFAULT_CONTINUE_USER = (
+    'Continue {{char}}\'s last message exactly from where it stopped. Do not '
+    'repeat any text that was already written and do not start a new message '
+    '— just continue seamlessly.'
 )
 
 DEFAULT_MEMORY_SUMMARY_SYSTEM = (
@@ -263,6 +279,8 @@ PROMPT_KEYS: list[str] = [
     'character_system',
     'character_user',
     'chat_system',
+    'impersonate_user',
+    'continue_user',
     'fill_system',
     'fill_user',
     'wizard_system',
@@ -287,6 +305,8 @@ _DEFAULTS: dict[str, str] = {
     'character_system': DEFAULT_CHARACTER_SYSTEM,
     'character_user': DEFAULT_CHARACTER_USER,
     'chat_system': DEFAULT_CHAT_SYSTEM,
+    'impersonate_user': DEFAULT_IMPERSONATE_USER,
+    'continue_user': DEFAULT_CONTINUE_USER,
     'fill_system': DEFAULT_FILL_SYSTEM,
     'fill_user': DEFAULT_FILL_USER,
     'wizard_system': DEFAULT_WIZARD_SYSTEM,

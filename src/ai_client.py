@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Generator, Optional
 
 import requests
@@ -177,6 +177,8 @@ class APIPreset:
     presence_penalty: float = 0.0
     seed: int = -1
     retry_attempts: int = 2
+    # Custom stop sequences (SillyTavern's "Custom Stopping Strings").
+    stop: list[str] = field(default_factory=list)
 
 
 PRESETS: dict[str, APIPreset] = {
@@ -228,6 +230,28 @@ PRESETS: dict[str, APIPreset] = {
 }
 
 
+def _parse_stop_sequences(value) -> list[str]:
+    """Normalise a saved ``stop`` value into a list of non-empty strings.
+
+    Accepts the ``APIPreset`` list form or the comma/semicolon/newline
+    separated string a user may type into the settings field.
+    """
+    if not value:
+        return []
+    if isinstance(value, str):
+        parts = re.split(r'[,;\n]', value)
+    elif isinstance(value, (list, tuple)):
+        parts = list(value)
+    else:
+        return []
+    out: list[str] = []
+    for part in parts:
+        text = str(part).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
 def preset_from_saved(saved: dict) -> APIPreset:
     """Build an effective :class:`APIPreset` from a saved settings dict.
 
@@ -251,6 +275,7 @@ def preset_from_saved(saved: dict) -> APIPreset:
         presence_penalty=saved.get('presence_penalty', base.presence_penalty),
         seed=saved.get('seed', base.seed),
         retry_attempts=saved.get('retry_attempts', base.retry_attempts),
+        stop=_parse_stop_sequences(saved.get('stop')),
     )
 
 
@@ -446,6 +471,9 @@ class AIClient:
             payload['presence_penalty'] = p.presence_penalty
         if p.seed is not None and p.seed >= 0:
             payload['seed'] = p.seed
+        stops = [s for s in (p.stop or []) if s]
+        if stops:
+            payload['stop'] = stops
         return payload
 
     def _generate_sync(self, payload: dict) -> str:
@@ -668,34 +696,131 @@ class AIClient:
         system: str,
         stream: bool = False,
         post_history: str = '',
+        jailbreak: str = '',
+        examples_block: str = '',
+        injections: Optional[list] = None,
     ) -> str | Generator[str, None, None]:
         """Generate a chat completion over a full message history.
 
         Unlike :meth:`generate`, this accepts an arbitrary message list so the
         chat-preview dialog can accumulate a multi-turn conversation.  The
-        system message is prepended to *messages*.  When *post_history* is
-        non-empty it is appended as a final system-level message *after*
-        trimming, mirroring SillyTavern's depth-0 injection: instructions
+        system message is prepended to *messages*.  Trailing system blocks are
+        appended after the history in this order: *examples_block* (few-shot
+        example dialogue), *post_history* (the card's post-history
+        instructions), *jailbreak* (the user's own trailing instructions).
+        Each is injected at depth 0, mirroring SillyTavern: instructions
         placed after the history steer the model far more strongly than the
         same text buried in the system prompt.
+
+        *injections* are depth-targeted messages (Author's Note, ``at_depth``
+        world info — see ``chat_builder.PromptInjection``) spliced into the
+        history *after* trimming at ``depth`` messages from the end.  Their
+        tokens are reserved from the trim budget so the payload cannot
+        overshoot the context window.
         """
         full_messages: list[dict[str, Any]] = []
         if system and system.strip():
             full_messages.append({'role': 'system', 'content': system})
         full_messages.extend(messages)
-        if post_history and post_history.strip():
-            full_messages.append({'role': 'system', 'content': post_history})
-        # Trim with the post-history text already in place: it used to be
+        trailing = [
+            block for block in (examples_block, post_history, jailbreak)
+            if block and block.strip()
+        ]
+        for block in trailing:
+            full_messages.append({'role': 'system', 'content': block})
+        # Trim with the trailing blocks already in place: they used to be
         # appended afterwards, so unbounded card-controlled PHI text was never
         # charged against the context budget and the request could overshoot
         # by its full length. trim_messages keeps a trailing system message.
+        injections = list(injections or [])
+        from src.token_counter import count_tokens
+        reserve = sum(
+            _message_token_cost(
+                {'role': _injection_role(inj), 'content': _injection_content(inj)},
+                count_tokens,
+            )
+            for inj in injections
+        )
         full_messages = trim_messages(
             full_messages, self.preset.context_size, self.preset.max_tokens,
+            reserve=reserve,
         )
+        if injections:
+            full_messages = splice_injections(full_messages, injections)
         payload = self._build_payload(full_messages, stream)
         if stream:
             return self._generate_stream(payload)
         return self._generate_sync(payload)
+
+
+def _injection_parts(inj: Any) -> tuple[str, str, int]:
+    """Normalise an injection (dict or ``PromptInjection``-like) to its fields."""
+    if isinstance(inj, dict):
+        return (
+            str(inj.get('role', 'system')),
+            str(inj.get('content', '') or ''),
+            int(inj.get('depth', 0) or 0),
+        )
+    return (
+        str(getattr(inj, 'role', 'system')),
+        str(getattr(inj, 'content', '') or ''),
+        int(getattr(inj, 'depth', 0) or 0),
+    )
+
+
+def _injection_role(inj: Any) -> str:
+    return _injection_parts(inj)[0]
+
+
+def _injection_content(inj: Any) -> str:
+    return _injection_parts(inj)[1]
+
+
+def _injection_title(inj: Any) -> str:
+    if isinstance(inj, dict):
+        return str(inj.get('title', '') or '')
+    return str(getattr(inj, 'title', '') or '')
+
+
+def splice_injections(
+    messages: list[dict[str, Any]],
+    injections: Optional[list] = None,
+    with_titles: bool = False,
+) -> list[dict[str, Any]]:
+    """Return *messages* with each injection spliced at its depth from the end.
+
+    Depth counts the messages that follow the insertion point (0 = appended
+    after everything, 4 = four messages from the end — SillyTavern's
+    Author's Note / ``at_depth`` world-info semantics).  Deeper injections
+    are placed first so shallower ones stay anchored to the end.  A leading
+    system message keeps its position at the front.  With *with_titles* the
+    spliced dicts carry an extra ``_title`` key (for the context inspector;
+    ``history_for_api`` drops it).  Pure function.
+    """
+    injections = list(injections or [])
+    if not injections:
+        return list(messages)
+    lead: list[dict[str, Any]] = []
+    rest = list(messages)
+    if rest and rest[0].get('role') == 'system':
+        lead = [rest.pop(0)]
+    by_depth: dict[int, list] = {}
+    for inj in injections:
+        depth = max(0, _injection_parts(inj)[2])
+        by_depth.setdefault(depth, []).append(inj)
+    for depth in sorted(by_depth, reverse=True):
+        pos = min(max(0, len(rest) - depth), len(rest))
+        chunk: list[dict[str, Any]] = []
+        for inj in by_depth[depth]:
+            msg: dict[str, Any] = {
+                'role': _injection_role(inj),
+                'content': _injection_content(inj),
+            }
+            if with_titles:
+                msg['_title'] = _injection_title(inj) or f'Injection (depth {depth})'
+            chunk.append(msg)
+        rest[pos:pos] = chunk
+    return lead + rest
 
 
 def _content_text(content: Any) -> str:
@@ -770,13 +895,16 @@ def split_for_context(
     context_size: int,
     max_tokens: int = 0,
     token_fn=None,
+    reserve: int = 0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split *messages* into ``(kept, dropped)`` for the context window.
 
     The system message (first element, if its role is ``system``) is always
     kept, as is the most recent message even if it alone exceeds the budget.
-    Older messages are dropped from the front.  :func:`trim_messages` returns
-    just the kept half; callers that need to know *what* was evicted (e.g. to
+    Older messages are dropped from the front.  *reserve* subtracts tokens
+    from the budget up-front (for depth injections spliced in later) so the
+    final payload cannot overshoot.  :func:`trim_messages` returns just the
+    kept half; callers that need to know *what* was evicted (e.g. to
     summarize it into memory) use this function directly.
     """
     if not messages or not context_size or context_size <= 0:
@@ -787,7 +915,7 @@ def split_for_context(
     # 32768 output length is a guaranteed 400 from every provider, and left
     # unclamped it made the budget calculation below meaningless.
     reserved = max(0, min(max_tokens, max(1, context_size - 1)))
-    budget = context_size - reserved
+    budget = context_size - reserved - max(0, int(reserve or 0))
     if budget <= 1:
         budget = max(1, context_size // 2)
 
@@ -822,6 +950,18 @@ def split_for_context(
         kept.insert(0, msg)
         total += cost
 
+    # Trim normalization: when older messages were evicted and the kept
+    # history now opens on an assistant reply whose turn is gone, drop that
+    # orphan too so the history starts on a user turn (an assistant-first
+    # fragment reads like the character speaking unprompted).  The newest
+    # message always survives.
+    if dropped:
+        moved: list[dict[str, Any]] = []
+        while len(kept) > 1 and kept[0].get('role') == 'assistant':
+            moved.append(kept.pop(0))
+        if moved:
+            dropped = dropped + moved
+
     result = ([system] + kept) if system is not None else kept
     return result, dropped
 
@@ -831,13 +971,16 @@ def trim_messages(
     context_size: int,
     max_tokens: int = 0,
     token_fn=None,
+    reserve: int = 0,
 ) -> list[dict[str, Any]]:
     """Trim a message list so it fits within *context_size* tokens.
 
     See :func:`split_for_context` for the exact retention rules.  Pure
     function (token counting injectable via *token_fn* for tests).
     """
-    kept, _ = split_for_context(messages, context_size, max_tokens, token_fn)
+    kept, _ = split_for_context(
+        messages, context_size, max_tokens, token_fn, reserve=reserve,
+    )
     return kept
 
 

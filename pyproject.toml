@@ -90,6 +90,8 @@ ignore = [
 "tests/*" = ["S", "B011", "F401", "F811", "RUF015"]
 # Random is used for shuffle-only content, not cryptography.
 "src/ui/widgets/duplicate_scanner.py" = ["S311"]
+# Random powers {{random}}/{{roll}} macros (dice + flavor picks), not crypto.
+"src/chat_builder.py" = ["S311"]
 # The QApplication reference is held on purpose: without it a freshly created
 # instance could be garbage-collected before the message box is shown.
 "main.py" = ["F841"]

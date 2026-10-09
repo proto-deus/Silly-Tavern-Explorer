@@ -259,6 +259,11 @@ class EditTab(QWidget):
         self._fav_btn.clicked.connect(self._on_toggle_favorite)
         header_row.addWidget(self._fav_btn)
         header_row.addStretch()
+        self._duplicate_btn = QPushButton('Duplicate')
+        self._duplicate_btn.setEnabled(False)
+        self._duplicate_btn.setToolTip('Clone the current card into the library with a "(copy)" suffix.')
+        self._duplicate_btn.clicked.connect(self.duplicate_card)
+        header_row.addWidget(self._duplicate_btn)
         new_character_btn = QPushButton('New Character')
         new_character_btn.clicked.connect(self._on_new_character)
         header_row.addWidget(new_character_btn)
@@ -797,6 +802,7 @@ class EditTab(QWidget):
             self._change_img_btn.setEnabled(True)
             self._open_folder_btn.setEnabled(True)
             self._preview_html_btn.setEnabled(True)
+            self._duplicate_btn.setEnabled(True)
             # The DB flag is the user-facing source of truth for favorites
             # (library/sidebar toggles update it directly). Mirror it onto
             # both the button and the in-memory card so a later save() can
@@ -1382,6 +1388,7 @@ class EditTab(QWidget):
             self._change_img_btn.setEnabled(False)
             self._open_folder_btn.setEnabled(False)
             self._preview_html_btn.setEnabled(False)
+            self._duplicate_btn.setEnabled(False)
             self._fav_btn.setEnabled(False)
             self._fav_btn.setChecked(False)
             self._char_book_btn.setEnabled(False)

@@ -156,7 +156,6 @@ class _DetailContainer(QWidget):
 class LibraryTab(QWidget):
     card_selected = pyqtSignal(int)
     edit_requested = pyqtSignal(int)
-    generate_tags_requested = pyqtSignal(int)
     library_changed = pyqtSignal()
     status_message = pyqtSignal(str, int)
     sort_label_changed = pyqtSignal(str)
@@ -387,11 +386,6 @@ class LibraryTab(QWidget):
         self._collections_btn.clicked.connect(self._on_assign_collections)
         btn_row.addWidget(self._collections_btn)
 
-        self._gen_tags_btn = QPushButton('Generate Tags')
-        self._gen_tags_btn.setEnabled(False)
-        self._gen_tags_btn.clicked.connect(self._on_gen_tags)
-        btn_row.addWidget(self._gen_tags_btn)
-
         self._delete_btn = QPushButton('Delete')
         self._delete_btn.setEnabled(False)
         self._delete_btn.clicked.connect(self._on_delete)
@@ -406,11 +400,6 @@ class LibraryTab(QWidget):
         self._export_json_btn.setEnabled(False)
         self._export_json_btn.clicked.connect(self._on_export_json)
         btn_row.addWidget(self._export_json_btn)
-
-        self._duplicate_btn = QPushButton('Duplicate')
-        self._duplicate_btn.setEnabled(False)
-        self._duplicate_btn.clicked.connect(self.duplicate_card)
-        btn_row.addWidget(self._duplicate_btn)
 
         self._open_folder_btn = QPushButton('Open Folder')
         self._open_folder_btn.setEnabled(False)
@@ -444,9 +433,8 @@ class LibraryTab(QWidget):
 
         self._single_btns = [
             self._fav_btn, self._edit_btn, self._collections_btn,
-            self._gen_tags_btn, self._delete_btn,
+            self._delete_btn,
             self._export_png_btn, self._export_json_btn,
-            self._duplicate_btn,
             self._open_folder_btn,
         ]
         self._bulk_btns = [
@@ -745,11 +733,9 @@ class LibraryTab(QWidget):
         self._delete_btn.setEnabled(True)
         self._export_png_btn.setEnabled(True)
         self._export_json_btn.setEnabled(True)
-        self._duplicate_btn.setEnabled(True)
         self._open_folder_btn.setEnabled(True)
         self._fav_btn.setEnabled(True)
         self._collections_btn.setEnabled(True)
-        self._gen_tags_btn.setEnabled(True)
         self._fav_btn.setChecked(bool(entry.get('is_favorite')))
         self._detail_rating.setEnabled(True)
         try:
@@ -1288,10 +1274,6 @@ class LibraryTab(QWidget):
         except OSError as e:
             logger.exception("JSON export failed")
             QMessageBox.critical(self, 'Export', f"Failed to export JSON: {e}")
-
-    def _on_gen_tags(self) -> None:
-        if self._selected_id is not None:
-            self.generate_tags_requested.emit(self._selected_id)
 
     def _on_open_folder(self) -> None:
         if self._selected_id is None:

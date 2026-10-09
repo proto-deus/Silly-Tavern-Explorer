@@ -119,7 +119,6 @@ class MainWindow(QMainWindow):
         self._stats_label.setStyleSheet('color: #aaa; padding: 0 6px;')
 
         self._library_tab.edit_requested.connect(self._go_to_edit)
-        self._library_tab.generate_tags_requested.connect(self._go_to_ai_tags)
         self._library_tab.library_changed.connect(self._update_status)
         self._library_tab.library_changed.connect(self._edit_tab.refresh_tag_completer)
         self._library_tab.library_changed.connect(self._sidebar.load_cards)
@@ -1133,13 +1132,6 @@ class MainWindow(QMainWindow):
         self._ai_tab.select_card(char_id)
         self._lorebooks_tab.set_selected_card(char_id)
         self._tabs.setCurrentWidget(self._edit_tab)
-
-    def _go_to_ai_tags(self, char_id: int) -> None:
-        self._sidebar.select_card(char_id)
-        self._ai_tab.select_card(char_id)
-        self._edit_tab.set_selected_id(char_id)
-        self._lorebooks_tab.set_selected_card(char_id)
-        self._tabs.setCurrentWidget(self._ai_tab)
 
     def _on_card_selected(self, char_id: int) -> None:
         """Sync a Library-grid selection to the shared sidebar and the tabs."""

@@ -251,7 +251,7 @@ def _st_entry_to_book_entry(raw: dict) -> BookEntry:
     known = {
         'uid', 'key', 'keysecondary', 'comment', 'content', 'constant',
         'disable', 'order', 'position', 'depth', 'caseSensitive',
-        'matchWholeWords',
+        'matchWholeWords', 'role',
     }
     extensions = {k: v for k, v in raw.items() if k not in known}
 
@@ -291,6 +291,8 @@ def _st_entry_to_book_entry(raw: dict) -> BookEntry:
         match_whole_words=bool(raw.get('matchWholeWords', False)),
         depth=depth,
         position=position,
+        # ST roles: 0 = system, 1 = user, 2 = assistant.
+        role=_safe_int(raw.get('role'), 0),
     )
 
 
@@ -394,9 +396,11 @@ def book_to_st_world_info(book: CharacterBook) -> dict:
             'depth': entry.depth,
             'caseSensitive': entry.case_sensitive,
             'matchWholeWords': entry.match_whole_words,
+            'role': int(entry.role or 0),
             'addMemo': True,
             'group': '',
         }
+        ext.pop('role', None)
         out.update(ext)
         entries_out[str(uid)] = out
     data: dict = dict(book.extra_data)

@@ -89,8 +89,8 @@ def ui_font_px(delta: int = 0) -> int:
     return max(7, _base_font_size + delta)
 
 
-def _spin_arrow_path(name: str) -> str:
-    """Absolute POSIX-style path of a bundled spin-button arrow image.
+def _arrow_path(name: str) -> str:
+    """Absolute POSIX-style path of a bundled arrow image.
 
     Works both from source and frozen (PyInstaller keeps the icons
     directory under ``sys._MEIPASS`` with the same relative layout).
@@ -206,8 +206,17 @@ QLineEdit:focus, QComboBox:focus {
 }
 
 QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 22px;
     border: none;
     padding-right: 8px;
+}
+
+QComboBox::down-arrow {
+    image: url("__COMBO_ARROW_DOWN__");
+    width: 10px;
+    height: 6px;
 }
 
 QComboBox QAbstractItemView {
@@ -426,5 +435,6 @@ QToolTip {
     padding: 4px;
 }
 """.replace('__FONT_SIZE__', str(font_size)) \
-   .replace('__SPIN_ARROW_UP__', _spin_arrow_path('spin_arrow_up.png')) \
-   .replace('__SPIN_ARROW_DOWN__', _spin_arrow_path('spin_arrow_down.png'))
+   .replace('__SPIN_ARROW_UP__', _arrow_path('spin_arrow_up.png')) \
+   .replace('__SPIN_ARROW_DOWN__', _arrow_path('spin_arrow_down.png')) \
+   .replace('__COMBO_ARROW_DOWN__', _arrow_path('combo_arrow_down.png'))

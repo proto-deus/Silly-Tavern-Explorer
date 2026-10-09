@@ -391,6 +391,18 @@ class _LLMPanel(QWidget):
         )
         form.addRow('Retries on failure:', self._retries)
 
+        self._stop = QLineEdit()
+        stop_value = config.get('stop', [])
+        if isinstance(stop_value, (list, tuple)):
+            stop_value = ', '.join(str(s) for s in stop_value)
+        self._stop.setText(str(stop_value or ''))
+        self._stop.setPlaceholderText('e.g. <|user|>, <|end_of_turn|>')
+        self._stop.setToolTip(
+            'Custom stopping strings (comma-separated): generation stops as '
+            'soon as one of them is produced, and the text up to it is kept.'
+        )
+        form.addRow('Stop sequences:', self._stop)
+
         layout.addWidget(group)
         layout.addStretch()
 
@@ -415,7 +427,11 @@ class _LLMPanel(QWidget):
             'presence_penalty': self._pres_pen.value(),
             'seed': self._seed.value(),
             'retry_attempts': self._retries.value(),
+            'stop': self._stop_text_list(),
         }
+
+    def _stop_text_list(self) -> list[str]:
+        return [s.strip() for s in self._stop.text().split(',') if s.strip()]
 
     def load_values(self, config: dict) -> None:
         self._temp.setValue(config.get('temperature', 1.0))
@@ -428,6 +444,10 @@ class _LLMPanel(QWidget):
         self._pres_pen.setValue(config.get('presence_penalty', 0.0))
         self._seed.setValue(config.get('seed', -1))
         self._retries.setValue(config.get('retry_attempts', 2))
+        stop_value = config.get('stop', [])
+        if isinstance(stop_value, (list, tuple)):
+            stop_value = ', '.join(str(s) for s in stop_value)
+        self._stop.setText(str(stop_value or ''))
 
 
 class _MacrosPanel(QWidget):
@@ -585,6 +605,22 @@ class _TestPanel(QWidget):
         self._include_first = QCheckBox('Include first message as greeting')
         self._include_first.setChecked(bool(settings.get('include_first_message', True)))
         options_layout.addWidget(self._include_first)
+
+        placement_row = QHBoxLayout()
+        placement_row.addWidget(QLabel('Example dialogue:'))
+        self._example_placement = QComboBox()
+        self._example_placement.addItem('In system prompt (block)', 'system')
+        self._example_placement.addItem('After history (block)', 'post_history')
+        self._example_placement.addItem('As chat turns (legacy)', 'history')
+        self._example_placement.setToolTip(
+            'Where the card\'s few-shot example dialogue rides in the request.\n'
+            'SillyTavern sends it as a labelled <START> block rather than as '
+            'real conversation turns.'
+        )
+        idx = self._example_placement.findData(settings.get('example_placement', 'system'))
+        self._example_placement.setCurrentIndex(idx if idx >= 0 else 0)
+        placement_row.addWidget(self._example_placement, 1)
+        options_layout.addLayout(placement_row)
         layout.addWidget(options_group)
         layout.addStretch()
 
@@ -612,6 +648,7 @@ class _TestPanel(QWidget):
             'show_timestamps': self._show_timestamps.isChecked(),
             'auto_scroll': self._auto_scroll.isChecked(),
             'include_first_message': self._include_first.isChecked(),
+            'example_placement': self._example_placement.currentData(),
         }
 
 

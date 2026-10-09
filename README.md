@@ -40,7 +40,7 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 - Double-click thumbnails for full-size image view with zoom/pan
 - Export cards to PNG files
 - **Open containing folder** button (selects the file in Explorer on Windows; opens the parent folder in Finder/Files on macOS/Linux)
-- **Duplicate card** action (Ctrl+D) clones the selected card with a "(copy)" suffix
+- **Duplicate card** action (Ctrl+D, or the Duplicate button next to New Character on the Edit tab) clones the selected card with a "(copy)" suffix
 - Duplicate detection on import
 - **Find Duplicates** scanner — groups cards by name+creator or by image hash; delete selected or keep-one-delete-rest (View > Find Duplicates)
 - **Statistics** dashboard — library-wide stats with bar charts (View > Statistics)
@@ -91,7 +91,7 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 - Per-character chat testing, with a card list on the left and a chat window on the right
 - **Lorebook (world info) injection** — the card's character book is scanned on every turn: enabled entries whose keys match recent messages (honoring case-sensitivity and whole-word options) are appended to the system prompt under `[World Info]`, with recursive scanning support (entries triggering other entries) and the book's token budget enforced
 - **Standalone lorebook injection** — books from the Lorebooks tab can be toggled active via the Lorebooks button; their matching entries join the same `[World Info]` block, each book honoring its own scan depth/budget, and the selection persists across sessions
-- **Context inspector** — the Context button shows exactly what the next request will send, section by section (system prompt, world info, chat memory, each message) with per-section and total token counts against the configured context size
+- **Context inspector** — the Context button shows exactly what the next request will send, section by section (system prompt, world info, chat memory, each message) with per-section and total token counts against the configured context size; its Author's Note and Jailbreak tabs edit the chat's trailing prompt knobs
 - **Streaming chat** with any character card using the configured API; multi-turn history is sent to the API and responses stream in as they arrive
 - **Regenerate** the last assistant reply, and **Cancel** an in-flight response (the cancel button is disabled unless a request is running)
 - Inline formatting rendered in distinct colors: `"dialogue"`, `*action*`, and `_emphasis_`
@@ -100,17 +100,30 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 - **Inline URL images** — image URLs in assistant responses are fetched asynchronously and shown as clickable thumbnails (click to open in browser)
 - **Chat memory** — a Memory dialog manages per-session memory entries (add/edit/delete), which are appended as a `[Chat memory]` bullet list to the system prompt (most recent 20 entries)
 - **Auto-summarize** — toggle to automatically summarize each exchange into a memory entry after every assistant reply; "Summarize Now" summarizes the current conversation on demand
-- **Auto-saved sessions** — each card's conversation is saved automatically (JSON files under `~/.st-explorer/sessions/`); a **Sessions** button opens a popup to load or delete saved sessions (with title, message count, and timestamps), and **New Session** starts fresh
-- **Chat export** — export the current conversation as `.txt` or `.json` (JSON includes messages, memories, and metadata)
+- **Auto-saved chats** — each card's conversation is saved automatically (JSON files under `~/.st-explorer/sessions/`); a **Chats** button opens a popup to load, export, import, or delete saved chats (with title, message count, and timestamps), and **New Chat** starts fresh
+- **Chat export** — export any saved chat from the Chats window as `.txt`, `.json` (messages, memories, and metadata), or a SillyTavern `.jsonl` chat
+
+### Test Tab — SillyTavern parity
+- **SillyTavern-style prompt assembly** — the main prompt (card `system_prompt` or the chat template) is followed by separate `[World Info]` (before/after character), `[Description]` / `[Personality]` / `[Scenario]`, `[User persona]`, and `[Chat memory]` blocks, so cards with their own system prompt still get their character definition
+- **Author's Note** — per-chat note injected as a message at a configurable depth (default 4) and role (system/user/assistant), exactly like SillyTavern; edited on the **Context** window's Author's Note tab and stored with the session
+- **World-info entry placement** — entry `position` / `depth` / `role` are honored: `before_char` / `after_char` wrap the character definition, `before_EM` / `after_EM` (top/bottom of the Author's Note) ride the note's depth, and `at_depth` entries inject at their own depth and role
+- **Example dialogue as a block** — the card's `mes_example` is sent as a labelled `<START>` block (in the system prompt, after the history, or as legacy chat turns — Settings > Test)
+- **SillyTavern macros** — `{{time}}`, `{{date}}`, `{{datetime}}`, `{{random:a|b|c}}` / `{{pick: a, b}}`, and dice rolls `{{roll: 2d6+3}}` on top of `{{user}}` / `{{char}}` and custom macros
+- **Impersonate** — the model writes `{{user}}`'s next message (added as a user turn to edit or keep); **Continue** — extends the last assistant reply in place
+- **Persona manager** — named `{{user}}` personas (name + description) with a per-chat selection, injected as the `[User persona]` block
+- **Jailbreak box** — your own trailing instructions per chat, sent after the card's post-history instructions (both at depth 0); edited on the **Context** window's Jailbreak tab
+- **Stop sequences** — custom stopping strings per provider (Settings > LLM), sent as `stop` on the wire; leaked `{{user}}` / `{{char}}` macros are cleaned out of generated replies
+- **Trim normalization** — when the context window evicts old messages, orphaned replies are dropped with their question and the rest is summarized into `[Chat memory]`
+- **SillyTavern chat import/export** — export the conversation as a SillyTavern `.jsonl` chat (swipes preserved) or import an ST chat as a new chat (Chats window)
 - `{{user}}` / `{{char}}` and custom macros are substituted automatically; double-click a card to open its full-size image
 
 ### Settings
 - A single **Settings** dialog (menu bar **Settings > Settings...** or the gear button on the Generate/Test tabs) groups every option:
    - **API** — active provider selector plus per-provider base URL, API key, and model (with fetch-models)
-   - **LLM** — temperature, top-p, top-k, min-p, context size, output length (max tokens), frequency/presence penalties, seed, automatic retries (0–5) with exponential backoff for connection errors, timeouts, rate limits (HTTP 429), and server errors
-  - **Macros** — the `{{user}}` value plus custom `{{macro}}` overrides
+   - **LLM** — temperature, top-p, top-k, min-p, context size, output length (max tokens), frequency/presence penalties, seed, stop sequences, automatic retries (0–5) with exponential backoff for connection errors, timeouts, rate limits (HTTP 429), and server errors
+  - **Macros** — the `{{user}}` value plus custom `{{macro}}` overrides (SillyTavern's `{{time}}` / `{{date}}` / `{{random}}` / `{{roll}}` macros work everywhere)
   - **Prompts** — the tag/summary/character/fill/wizard/chat/memory-summary prompt templates
-  - **Test** — chat display colors, timestamps, auto-scroll, max history, first-message greeting
+  - **Test** — chat display colors, timestamps, auto-scroll, first-message greeting, example-dialogue placement
   - **Encryption** — enable/disable data encryption, change the password, and manage the optional recovery key. Enabling encrypts the whole library in place (with a progress dialog); the database itself is sealed when the app closes and unlocked with the password at the next startup
 
 ### SillyTavern Integration
@@ -188,7 +201,7 @@ python main.py
 3. Type a message and press Enter — responses stream back token-by-token
 4. Use **Regenerate** to redo the last reply or **Cancel** to interrupt an in-flight response
 5. Use **Attach** to add text/image files, and the **Memory** button to manage persistent memory (or toggle **Auto-Summarize**)
-6. Sessions auto-save per character; use **Sessions** to load or delete past conversations, and **Export** to save as `.txt`/`.json`
+6. Chats auto-save per character; use **Chats** to load, export, import, or delete past conversations
 
 ### SillyTavern Sync
 1. Go to **SillyTavern > Configure** and set the path to your SillyTavern `characters/` directory (e.g. `C:\SillyTavern\data\default-user\characters`), or use Auto-Detect
@@ -358,7 +371,7 @@ src/
             library_tab.py     Card library, search, sort, filter, drag-drop import, async import, multi-select/bulk ops, zoom
             edit_tab.py        Card editor with dirty-state tracking, tag autocomplete, character book + extensions editors
             ai_tab.py          Generate tab (tags, missing tags, summary, fill-missing, wizard, batch) with streaming
-            test_tab.py        Test tab: per-card chat with sessions, formatting, streaming, attachments, memory
+            test_tab.py        Test tab: per-card chats with formatting, streaming, attachments, memory
             widgets/
                 lorebooks_tab.py  Standalone lorebook editor with AI generation + ST world-info import/export
                 card_thumbnail.py   Thumbnail widget with zoom + async lazy loading
@@ -383,7 +396,8 @@ src/
             import_worker.py    Async ImportWorker (QThread) + ImportSummary (pure) (Phase 8A)
         chat_bubble.py      Message bubble widget (name, attachments, formatting, actions)
             chat_image_loader.py  Async URL image loader + clickable label
-            context_inspector_dialog.py  Read-only per-section view of the outgoing chat context
+            context_inspector_dialog.py  Context tabs (outgoing prompt view + Author's Note + Jailbreak editors)
+            author_note_editor.py  Author's Note editor (text, depth, injection role)
             edit_message_dialog.py  Multiline text-editor dialog (messages + memory)
             memory_dialog.py    Chat memory manager (add/edit/delete, summarize)
             rating_widget.py    Five-star rating widget (pure helpers unit-tested)
