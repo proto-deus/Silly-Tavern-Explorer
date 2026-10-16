@@ -19,7 +19,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -108,8 +107,23 @@ def _state_path() -> Path:
     return lorebook_store._base_data_dir() / STATE_FILENAME
 
 
+def _fs_key(name: str) -> str:
+    """Case-folded key for comparing lorebook filenames on the filesystem.
+
+    ``os.path.normcase`` is a **no-op on POSIX**, yet the default macOS volume
+    (APFS/HFS+) is case-insensitive - matching with it meant ``MyWorld.json``
+    (Explorer) and ``myworld.json`` (ST) looked like two unrelated books and
+    a push then wrote ``worlds/MyWorld.json`` over the different book
+    ``worlds/myworld.json``.  Case-fold unconditionally, mirroring
+    :func:`src.sillytavern_sync._fs_key`: over-resolving on a case-sensitive
+    volume only costs an odd pairing, whereas under-resolving destroys a
+    book.
+    """
+    return (name or '').casefold()
+
+
 def load_sync_state() -> dict[str, dict[str, str]]:
-    """Load the baseline state: ``{normcase(filename): {'explorer': h, 'st': h}}``."""
+    """Load the baseline state: ``{_fs_key(filename): {'explorer': h, 'st': h}}``."""
     path = _state_path()
     try:
         raw = json.loads(vault.read_text(path))
@@ -153,13 +167,13 @@ def _update_sync_state(mutate) -> dict[str, dict[str, str]]:
 
 def forget_pair(filename: str) -> None:
     """Drop the baseline for *filename* (e.g. after an unlink/delete)."""
-    key = os.path.normcase(filename)
+    key = _fs_key(filename)
     _update_sync_state(lambda st: st.pop(key, None))
 
 
 def _mark_pair_synced(filename: str, explorer_semantic: str, st_semantic: str) -> None:
     def _apply(state: dict[str, dict[str, str]]) -> None:
-        state[os.path.normcase(filename)] = {
+        state[_fs_key(filename)] = {
             'explorer': explorer_semantic,
             'st': st_semantic,
         }
@@ -204,7 +218,8 @@ def _entry_from_file(path: Path) -> LorebookFileEntry | None:
         # Explorer copy and its plaintext ST twin hash identically even when
         # the library is encrypted at rest.
         raw_bytes = vault.read_bytes(path)
-        raw = json.loads(raw_bytes.decode('utf-8'))
+        from src.fs_utils import decode_text
+        raw = json.loads(decode_text(raw_bytes))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError, vault.VaultError) as exc:
         logger.warning("Skipping unreadable lorebook file %s: %s", path.name, exc)
         return None
@@ -283,19 +298,19 @@ def compare_lorebooks(
 ) -> list[LorebookSyncPair]:
     """Compare both libraries and classify each lorebook pair.
 
-    Matching is by filename (case-insensitive via ``os.path.normcase``).
+    Matching is by filename (case-insensitive via ``_fs_key``).
     Change detection uses each side's semantic hash against the baseline
     recorded at the last successful push/pull.
     """
     state = state if state is not None else {}
     st_by_filename: dict[str, LorebookFileEntry] = {
-        os.path.normcase(e.filename): e for e in st_entries
+        _fs_key(e.filename): e for e in st_entries
     }
     pairs: list[LorebookSyncPair] = []
     consumed: set[str] = set()
 
     for ex in explorer_entries:
-        key = os.path.normcase(ex.filename)
+        key = _fs_key(ex.filename)
         st = st_by_filename.get(key)
         if st is None:
             pairs.append(LorebookSyncPair(
@@ -309,7 +324,7 @@ def compare_lorebooks(
         ))
 
     for st in st_entries:
-        if os.path.normcase(st.filename) not in consumed:
+        if _fs_key(st.filename) not in consumed:
             pairs.append(LorebookSyncPair(
                 category=LorebookSyncCategory.ONLY_ST, st=st,
             ))
@@ -335,7 +350,8 @@ def pull_lorebook(st_entry: LorebookFileEntry) -> str | None:
     success or an error string.
     """
     try:
-        raw = json.loads(Path(st_entry.path).read_text(encoding='utf-8'))
+        from src.fs_utils import decode_text
+        raw = json.loads(decode_text(Path(st_entry.path).read_bytes()))
         book = lorebook_store.parse_book_json(raw)
         lorebook_store.save_lorebook(st_entry.filename, book)
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:

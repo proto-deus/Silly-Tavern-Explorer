@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -80,6 +81,19 @@ def resolve_st_filename(
     """
     existing_norm = {_fs_key(f) for f in existing}
     if linked_name:
+        # The link comes from the DB (st_avatar_url) and is joined onto the
+        # characters dir below: a crafted or legacy value containing ``..``
+        # or a directory part could write outside it. Reduce to one safe
+        # component; a plain file name is kept verbatim so the link still
+        # resolves to the same file.
+        from src.fs_utils import safe_filename_component
+        base_link = safe_filename_component(linked_name)
+        if not base_link:
+            logger.warning("Ignoring unsafe ST link name %r", linked_name)
+            linked_name = None
+        elif base_link != linked_name:
+            linked_name = sanitize_st_filename(base_link) or None
+    if linked_name:
         # The link names the file this card owns. Reuse it unless a
         # *different* existing file would be overwritten.
         if _fs_key(linked_name) not in existing_norm or linked_name in existing:
@@ -108,10 +122,17 @@ def _canonical_json_value(value):
     through another tool changed an int to a float or an int to its string form
     (``1`` vs ``1.0`` vs ``"1"``); otherwise every ST re-save looks like a change
     on both sides and the pair is permanently reported as a conflict.
+
+    Non-finite floats (``NaN`` / ``Infinity``, which ``json.loads`` accepts
+    even though JSON itself has no such tokens) become ``None``: they would
+    otherwise make the final ``json.dumps(..., allow_nan=False)`` raise and
+    abort the whole sync scan over one hand-edited card.
     """
     if isinstance(value, bool) or value is None:
         return value
     if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
         return int(value) if value.is_integer() else value
     if isinstance(value, int):
         return value
@@ -804,6 +825,19 @@ def pull_card_from_st(st_entry: StCardEntry, db) -> PullResult:
                         "Could not migrate chat sessions from superseded card %s", char_id,
                     )
                 try:
+                    # The gallery belongs to the character as well: re-point
+                    # its rows and move gallery/<old_id>/ before the old row
+                    # goes away.
+                    migrate_rows = getattr(db, 'migrate_gallery_images', None)
+                    if migrate_rows is not None:
+                        migrate_rows(char_id, new_id)
+                    from src import gallery_store
+                    gallery_store.migrate_gallery_files(char_id, new_id)
+                except Exception:
+                    logger.warning(
+                        "Could not migrate gallery images from superseded card %s", char_id,
+                    )
+                try:
                     db.remove_card(
                         char_id,
                         delete_files=False,
@@ -856,6 +890,48 @@ def link_pair(pair: SyncPair, db) -> bool:
     if pair.explorer.current_hash == pair.st.card_hash:
         db.mark_st_synced(pair.explorer.char_id, pair.st.card_hash)
     return True
+
+
+def _explorer_changed_since(entry: ExplorerSyncEntry) -> str:
+    """Return a reason string when the Explorer card changed after the scan.
+
+    Empty string means "unchanged or unverifiable" (missing/unreadable source
+    is left to the pull path, which repairs rather than clobbers).
+    """
+    source = entry.source_path
+    if not source or not Path(source).exists():
+        return ''
+    raw = read_card_data(source)
+    if raw is None:
+        return ''
+    try:
+        fresh = compute_card_hash(raw)
+    except ValueError as e:
+        return f'Explorer card no longer hashes cleanly ({e})'
+    if fresh != entry.current_hash:
+        return 'Explorer copy changed since the sync scan'
+    return ''
+
+
+def _st_changed_since(entry: StCardEntry) -> str:
+    """Return a reason string when the ST card changed after the scan.
+
+    A missing ST file is fine (the push (re)creates it); a file that exists
+    but no longer matches its scan-time hash must not be overwritten.
+    """
+    path = Path(entry.path)
+    if not path.exists():
+        return ''
+    raw = read_card_data(path)
+    if raw is None:
+        return 'ST file is no longer readable card data'
+    try:
+        fresh = compute_card_hash(raw)
+    except ValueError as e:
+        return f'ST card no longer hashes cleanly ({e})'
+    if fresh != entry.card_hash:
+        return 'SillyTavern copy changed since the sync scan'
+    return ''
 
 
 def bulk_sync(
@@ -914,6 +990,19 @@ def bulk_sync(
             if pair.st is None:
                 summary.errors.append("Cannot pull: no ST card")
                 continue
+            # A plan scanned minutes earlier can go stale: if the Explorer
+            # side was edited after the scan, pulling would silently destroy
+            # those newer local edits (DELETE_ST already re-verifies for the
+            # same reason). Only the overwrite path needs the check - when the
+            # source is missing/unreadable the pull is a repair, not a clobber.
+            if pair.explorer is not None:
+                stale = _explorer_changed_since(pair.explorer)
+                if stale:
+                    summary.errors.append(
+                        f"{pair.st.filename}: {stale}; not pulled "
+                        "(re-run the scan to pick up the newer state)"
+                    )
+                    continue
             result = pull_card_from_st(pair.st, db)
             if result.succeeded:
                 summary.pulled += 1
@@ -924,6 +1013,16 @@ def bulk_sync(
             if pair.explorer is None:
                 summary.errors.append("Cannot push: no explorer card")
                 continue
+            # Symmetric guard: don't overwrite an ST copy that changed after
+            # the plan was built (its edits would be lost with no backup).
+            if pair.st is not None:
+                stale = _st_changed_since(pair.st)
+                if stale:
+                    summary.errors.append(
+                        f"{pair.explorer.name}: {stale}; not pushed "
+                        "(re-run the scan to pick up the newer state)"
+                    )
+                    continue
             source = pair.explorer.source_path
             raw = read_card_data(source)
             if raw is None:

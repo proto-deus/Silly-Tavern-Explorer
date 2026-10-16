@@ -276,7 +276,14 @@ class DisableEncryptionDialog(QDialog):
         layout.addWidget(buttons)
 
     def _validate(self) -> None:
-        if not vault.get_vault().verify_password(self._password.text()):
+        try:
+            ok = vault.get_vault().verify_password(self._password.text())
+        except vault.VaultError as exc:
+            # Corrupt metadata, not a wrong password: an uncaught exception
+            # here would escape the slot and abort the process.
+            QMessageBox.critical(self, 'Disable Encryption', str(exc))
+            return
+        if not ok:
             QMessageBox.warning(self, 'Disable Encryption', 'Incorrect password.')
             return
         self.accept()

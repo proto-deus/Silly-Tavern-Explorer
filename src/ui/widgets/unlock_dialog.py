@@ -82,16 +82,24 @@ class UnlockDialog(QDialog):
         if not secret:
             self._show_error('Please enter a value.')
             return
-        if self._recovery_toggle.isChecked():
-            ok = vault.get_vault().unlock_with_recovery(secret)
-            what = 'recovery key'
-        else:
-            ok = vault.get_vault().unlock(secret)
-            what = 'password'
+        which = 'recovery key' if self._recovery_toggle.isChecked() else 'password'
+        try:
+            if self._recovery_toggle.isChecked():
+                ok = vault.get_vault().unlock_with_recovery(secret)
+            else:
+                ok = vault.get_vault().unlock(secret)
+        except vault.VaultError as exc:
+            # Corrupt metadata: no amount of guessing helps, so say so
+            # instead of repeating "Incorrect password".
+            self._show_error(
+                f'{exc} The vault cannot be unlocked. Restore '
+                '~/.st-explorer/vault.json from a backup if you have one.'
+            )
+            return
         if ok:
             self.accept()
         else:
-            self._show_error(f'Incorrect {what}. Please try again.')
+            self._show_error(f'Incorrect {which}. Please try again.')
             self._password.selectAll()
             self._password.setFocus()
 

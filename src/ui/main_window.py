@@ -41,6 +41,7 @@ from src.ui.ai_tab import AITab
 from src.ui.edit_tab import EditTab
 from src.ui.library_tab import LibraryTab
 from src.ui.test_tab import TestTab
+from src.ui.widgets.gallery_tab import GalleryTab
 from src.ui.widgets.lorebooks_tab import LorebooksTab
 from src.ui.shortcuts import ACTIONS
 from src.ui.widgets.character_sidebar import CharacterSidebar
@@ -105,12 +106,14 @@ class MainWindow(QMainWindow):
 
         self._library_tab = LibraryTab(db)
         self._edit_tab = EditTab(db)
+        self._gallery_tab = GalleryTab(db)
         self._ai_tab = AITab(db)
         self._lorebooks_tab = LorebooksTab(db)
         self._test_tab = TestTab(db)
 
         self._tabs.addTab(self._library_tab, 'Library')
         self._tabs.addTab(self._edit_tab, 'Edit')
+        self._tabs.addTab(self._gallery_tab, 'Gallery')
         self._tabs.addTab(self._ai_tab, 'Generate')
         self._tabs.addTab(self._lorebooks_tab, 'Lorebooks')
         self._tabs.addTab(self._test_tab, 'Test')
@@ -128,6 +131,10 @@ class MainWindow(QMainWindow):
         self._edit_tab.card_deleted.connect(self._on_edit_card_deleted)
         self._edit_tab.card_updated.connect(self._on_edit_card_updated)
         self._edit_tab.card_added.connect(self._on_edit_card_added)
+        self._gallery_tab.status_message.connect(self._show_status_message)
+        self._gallery_tab.settings_requested.connect(self._on_settings)
+        self._gallery_tab.card_updated.connect(self._on_edit_card_updated)
+        self._gallery_tab.card_updated.connect(self._on_gallery_card_updated)
         self._library_tab.card_selected.connect(self._on_card_selected)
         self._ai_tab.settings_requested.connect(self._on_settings)
         self._ai_tab.library_changed.connect(self._on_ai_library_changed)
@@ -607,6 +614,11 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _on_ai_library_changed(self) -> None:
+        # Generate-tab batch writes mutate cards in place; the parsed-card
+        # cache must go with the grid rebuild or the detail pane keeps
+        # serving the pre-batch card (the sync path invalidates for the
+        # same reason).
+        self._library_tab.invalidate_card_cache()
         self._library_tab.load_cards()
         # library_changed already triggers a sidebar rebuild via the signal
         # wiring — an explicit second load_cards() here would rebuild the
@@ -620,6 +632,11 @@ class MainWindow(QMainWindow):
         self._sidebar.refresh_card(char_id)
         self._library_tab._refresh_single_thumbnail(char_id)
         self._update_status()
+
+    def _on_gallery_card_updated(self, char_id: int) -> None:
+        """A Gallery 'Set as Card Image' changed the PNG under the editor."""
+        if self._edit_tab.form_loaded_for_id == char_id and not self._edit_tab.is_dirty():
+            self._edit_tab.reload_current()
 
     def _on_edit_find(self) -> None:
         self._tabs.setCurrentWidget(self._library_tab)
@@ -676,6 +693,7 @@ class MainWindow(QMainWindow):
             widget.refresh_books()
 
     def _on_view_font_size(self) -> None:
+        from src.ui.dialog_helper import exec_dialog_with
         dlg = QDialog(self)
         dlg.setWindowTitle('Font Size')
         dlg.setMinimumWidth(250)
@@ -693,8 +711,13 @@ class MainWindow(QMainWindow):
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         layout.addWidget(buttons)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            size = spin.value()
+
+        def _collect(d: QDialog):
+            accepted = d.result() == QDialog.DialogCode.Accepted
+            return spin.value() if accepted else None
+
+        size = exec_dialog_with(dlg, _collect)
+        if size is not None:
             save_font_size(size)
             from PyQt6.QtWidgets import QApplication
             from src.ui.styles import apply_theme
@@ -754,7 +777,11 @@ class MainWindow(QMainWindow):
         close_btn = QPushButton('Close')
         close_btn.clicked.connect(dlg.accept)
         layout.addWidget(close_btn)
-        dlg.exec()
+        # exec_dialog (not dlg.exec()): a parented dialog without
+        # WA_DeleteOnClose leaks one viewer (and its 20 KB of text) per
+        # invocation for the life of the main window.
+        from src.ui.dialog_helper import exec_dialog
+        exec_dialog(dlg)
 
     # ---- SillyTavern handlers ----
 
@@ -1130,6 +1157,7 @@ class MainWindow(QMainWindow):
         self._sidebar.select_card(char_id)
         self._edit_tab.set_selected_id(char_id)
         self._ai_tab.select_card(char_id)
+        self._gallery_tab.set_selected_card(char_id)
         self._lorebooks_tab.set_selected_card(char_id)
         self._tabs.setCurrentWidget(self._edit_tab)
 
@@ -1138,6 +1166,7 @@ class MainWindow(QMainWindow):
         self._sidebar.set_selected_id(char_id)
         self._ai_tab.select_card(char_id)
         self._edit_tab.set_selected_id(char_id)
+        self._gallery_tab.set_selected_card(char_id)
         self._lorebooks_tab.set_selected_card(char_id)
 
     def _on_sidebar_card_selected(self, char_id: int) -> None:
@@ -1150,15 +1179,17 @@ class MainWindow(QMainWindow):
         self._sidebar.set_selected_id(char_id)
         self._edit_tab.set_selected_id(char_id)
         self._ai_tab.select_card(char_id)
+        self._gallery_tab.set_selected_card(char_id)
         self._lorebooks_tab.set_selected_card(char_id)
         widget = self._tabs.currentWidget()
         if isinstance(widget, EditTab):
             self._edit_tab.load_card_by_id(char_id)
         elif isinstance(widget, TestTab):
             self._test_tab.select_card(char_id)
-        # AITab is intentionally NOT re-selected here: select_card() above
-        # already ran, and calling it again re-parsed the PNG and re-counted its
-        # tokens for no reason.
+        # GalleryTab is intentionally NOT re-touched here: set_selected_card()
+        # above already refreshed it while visible (or deferred the load).
+        # AITab likewise: select_card() above already ran, and calling it again
+        # re-parsed the PNG and re-counted its tokens for no reason.
 
     def _on_settings(self) -> None:
         from src.ui.widgets.settings_dialog import SettingsDialog
@@ -1171,6 +1202,9 @@ class MainWindow(QMainWindow):
         self._ai_tab.reload_preset()
         self._test_tab.reload_preset()
         self._lorebooks_tab.reload_preset()
+        from src.ui.spell_check import apply_enabled_to_all
+
+        apply_enabled_to_all()
 
     def _on_tab_changed(self, index: int) -> None:
         if self._suppress_tab_change:
@@ -1202,6 +1236,11 @@ class MainWindow(QMainWindow):
         elif isinstance(widget, AITab):
             if sid is not None:
                 widget.select_card(sid)
+        elif isinstance(widget, GalleryTab):
+            # Cheap when already current; loads when the sidebar's restored
+            # selection has never reached the gallery.
+            if sid is not None:
+                widget.set_selected_card(sid)
         elif isinstance(widget, TestTab):
             if sid is not None:
                 widget.select_card(sid)
@@ -1242,6 +1281,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, 'Import In Progress',
                 'A card import did not cancel in time.\n'
+                'The window stays open — please wait for it to finish or try again.',
+            )
+            event.ignore()
+            return
+        # Cancel any running gallery image import worker.
+        if not self._gallery_tab.cleanup_workers(timeout_ms=3000):
+            logger.warning("Gallery import worker did not finish within timeout; keeping window open")
+            QMessageBox.warning(
+                self, 'Import In Progress',
+                'A gallery import did not cancel in time.\n'
                 'The window stays open — please wait for it to finish or try again.',
             )
             event.ignore()

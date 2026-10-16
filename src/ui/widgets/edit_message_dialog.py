@@ -3,10 +3,11 @@ from __future__ import annotations
 from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
-    QPlainTextEdit,
     QVBoxLayout,
     QWidget,
 )
+
+from src.ui.spell_check import SpellCheckPlainTextEdit
 
 
 class TextEditDialog(QDialog):
@@ -24,7 +25,7 @@ class TextEditDialog(QDialog):
         self.setMinimumSize(520, 360)
 
         layout = QVBoxLayout(self)
-        self._edit = QPlainTextEdit(text or '')
+        self._edit = SpellCheckPlainTextEdit(text or '')
         self._edit.setPlaceholderText(placeholder)
         layout.addWidget(self._edit, 1)
 

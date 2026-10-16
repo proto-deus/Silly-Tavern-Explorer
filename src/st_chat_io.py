@@ -37,6 +37,29 @@ def _parse_send_date(value) -> str:
         return datetime.now().isoformat(timespec='seconds')
 
 
+def _variant_position(value, default: int) -> int:
+    """Coerce a stored ``variant_pos``/``swipe_id`` to a safe int.
+
+    Hand-edited session/chat files can carry a non-numeric value; the old
+    bare ``int()`` aborted the whole export (and, in Qt slots, the process).
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _variant_list(value) -> list[str]:
+    """Coerce a stored ``variants``/``swipes`` field to a list of strings.
+
+    A dict-valued field used to be iterated as its keys; anything but a
+    list/tuple is treated as "no variants".
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(v) for v in value]
+
+
 def export_st_chat(
     messages: list[dict],
     user_name: str = 'User',
@@ -69,10 +92,13 @@ def export_st_chat(
             'send_date': _st_send_date(m.get('ts')),
             'mes': str(m.get('content', '') or ''),
         }
-        variants = [str(v) for v in (m.get('variants') or [])]
+        variants = _variant_list(m.get('variants'))
         if len(variants) > 1:
             entry['swipes'] = variants
-            entry['swipe_id'] = int(m.get('variant_pos', len(variants) - 1) or 0)
+            pos = _variant_position(
+                m.get('variant_pos', len(variants) - 1), len(variants) - 1,
+            )
+            entry['swipe_id'] = max(0, min(pos, len(variants) - 1))
         lines.append(json.dumps(entry, ensure_ascii=False))
     return '\n'.join(lines) + '\n'
 

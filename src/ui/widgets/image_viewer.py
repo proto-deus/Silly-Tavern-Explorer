@@ -20,6 +20,16 @@ def clamp_thumb_size(size: int, lo: int = 80, hi: int = 280) -> int:
     return int(max(lo, min(hi, size)))
 
 
+def wrap_index(current: int, step: int, count: int) -> int:
+    """Return the index *step* away from *current*, wrapping over *count*.
+
+    Pure function so the lightbox navigation can be unit-tested without Qt.
+    """
+    if count <= 0:
+        return 0
+    return (current + step) % count
+
+
 try:
     from PyQt6.QtCore import QRectF, Qt
     from PyQt6.QtGui import QAction, QPainter, QPixmap, QTransform
@@ -198,3 +208,77 @@ if QAction is not None:
             if self._fit_mode:
                 self._fit_to_window()
             super().resizeEvent(event)
+
+
+    class GalleryLightbox(ImageViewer):
+        """A multi-image viewer with arrow-key navigation.
+
+        The list can mix gallery and expression images; ``labels`` names each
+        entry in the window title (e.g. the expression name), and
+        ``on_index_changed`` lets the calling grid keep its selection in sync
+        while the user browses.
+        """
+
+        def __init__(self, image_paths: list[str], start_index: int = 0,
+                     labels: list[str] | None = None,
+                     title: str = 'Gallery',
+                     on_index_changed=None,
+                     parent=None):
+            self._paths = list(image_paths or [])
+            self._labels = list(labels or [])
+            self._on_index_changed = on_index_changed
+            self._base_title = title
+            if not self._paths:
+                raise ValueError('GalleryLightbox needs at least one image')
+            index = min(max(0, start_index), len(self._paths) - 1)
+            super().__init__(self._paths[index], title, parent)
+            self._index = index
+            self._update_title()
+
+        def _entry_label(self) -> str:
+            if self._index < len(self._labels) and self._labels[self._index]:
+                return self._labels[self._index]
+            from pathlib import Path
+            return Path(self._paths[self._index]).stem
+
+        def _update_title(self) -> None:
+            self.setWindowTitle(
+                f'{self._entry_label()} — {self._index + 1}/{len(self._paths)}'
+            )
+
+        def _show_index(self, index: int) -> None:
+            if index == self._index or not self._paths:
+                return
+            self._index = index
+            self._image_path = self._paths[index]
+            self._scene.clear()
+            self._load_image()
+            self._update_title()
+            if self._on_index_changed is not None:
+                try:
+                    self._on_index_changed(index)
+                except Exception:
+                    pass
+
+        def next_image(self) -> None:
+            self._show_index(wrap_index(self._index, 1, len(self._paths)))
+
+        def previous_image(self) -> None:
+            self._show_index(wrap_index(self._index, -1, len(self._paths)))
+
+        def keyPressEvent(self, event) -> None:
+            key = event.key()
+            if key in (Qt.Key.Key_Right, Qt.Key.Key_Down, Qt.Key.Key_PageDown):
+                self.next_image()
+                event.accept()
+            elif key in (Qt.Key.Key_Left, Qt.Key.Key_Up, Qt.Key.Key_PageUp):
+                self.previous_image()
+                event.accept()
+            elif key == Qt.Key.Key_Home:
+                self._show_index(0)
+                event.accept()
+            elif key == Qt.Key.Key_End:
+                self._show_index(len(self._paths) - 1)
+                event.accept()
+            else:
+                super().keyPressEvent(event)

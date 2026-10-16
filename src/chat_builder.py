@@ -71,6 +71,11 @@ def substitute_macros(
     and without escaping a card named ``{description}`` would silently have
     its own name replaced by its description (third-party card text must not
     become template syntax).
+
+    Dynamic macros are evaluated on the *template* before any name or custom
+    value is inserted: a character named ``{{random:alpha|beta}}`` must render
+    literally, not be rolled.  A custom macro shadows the dynamic macro of the
+    same name (SillyTavern behaviour), so a custom ``{{time}}`` still wins.
     """
     if not text:
         return ''
@@ -79,16 +84,24 @@ def substitute_macros(
         s = v if isinstance(v, str) else str(v)
         return s.replace('{', '{{').replace('}', '}}') if escape_for_format else s
 
+    custom_macros = custom_macros or {}
+    shadowed = {
+        str(name).strip().lower()
+        for name in custom_macros
+        if str(name).strip()
+    }
+    text = _sub_dynamic_macros(
+        text, escape_for_format=escape_for_format, rng=rng, now=now, skip=shadowed,
+    )
     text = _sub_literal(_USER_RE, _value(user_name or ''), text)
     text = _sub_literal(_CHAR_RE, _value(char_name or ''), text)
-    if custom_macros:
-        for name, value in custom_macros.items():
-            key = str(name).strip()
-            if not key:
-                continue
-            pattern = r'\{\{\s*' + re.escape(key) + r'\s*\}\}'
-            text = _sub_literal(pattern, _value(value), text)
-    return _sub_dynamic_macros(text, escape_for_format=escape_for_format, rng=rng, now=now)
+    for name, value in custom_macros.items():
+        key = str(name).strip()
+        if not key:
+            continue
+        pattern = r'\{\{\s*' + re.escape(key) + r'\s*\}\}'
+        text = _sub_literal(pattern, _value(value), text)
+    return text
 
 
 def _sub_dynamic_macros(
@@ -96,20 +109,31 @@ def _sub_dynamic_macros(
     escape_for_format: bool = False,
     rng: Optional[random.Random] = None,
     now: Optional[datetime] = None,
+    skip: Optional[set[str]] = None,
 ) -> str:
-    """Evaluate ``{{time}}`` / ``{{date}}`` / ``{{random}}`` / ``{{roll}}``."""
+    """Evaluate ``{{time}}`` / ``{{date}}`` / ``{{random}}`` / ``{{roll}}``.
+
+    *skip* names macro keywords to leave alone (lowercased): a custom macro
+    shadows the dynamic macro of the same name.
+    """
     if not text:
         return ''
     moment = now or datetime.now()
     dice = rng or random.Random()
+    skip = {str(s).lower() for s in (skip or set())}
 
     def _value(v) -> str:
         s = v if isinstance(v, str) else str(v)
         return s.replace('{', '{{').replace('}', '}}') if escape_for_format else s
 
-    text = _DATE_RE.sub(lambda _m: _value(moment.strftime('%Y-%m-%d')), text)
-    text = _TIME_RE.sub(lambda _m: _value(moment.strftime('%H:%M')), text)
-    text = _DATETIME_RE.sub(lambda _m: _value(moment.strftime('%Y-%m-%d %H:%M')), text)
+    if 'date' not in skip:
+        text = _DATE_RE.sub(lambda _m: _value(moment.strftime('%Y-%m-%d')), text)
+    if 'time' not in skip:
+        text = _TIME_RE.sub(lambda _m: _value(moment.strftime('%H:%M')), text)
+    if 'datetime' not in skip:
+        text = _DATETIME_RE.sub(
+            lambda _m: _value(moment.strftime('%Y-%m-%d %H:%M')), text,
+        )
 
     def _replace_random(m: 're.Match') -> str:
         options = _macro_options(m.group(1))
@@ -117,13 +141,16 @@ def _sub_dynamic_macros(
             return ''
         return _value(dice.choice(options))
 
-    text = _RANDOM_RE.sub(_replace_random, text)
+    if not {'random', 'pick'} & skip:
+        text = _RANDOM_RE.sub(_replace_random, text)
 
     def _replace_roll(m: 're.Match') -> str:
         rolled = _roll_macro(m.group(1), dice)
         return m.group(0) if rolled is None else _value(str(rolled))
 
-    return _ROLL_RE.sub(_replace_roll, text)
+    if 'roll' not in skip:
+        text = _ROLL_RE.sub(_replace_roll, text)
+    return text
 
 
 def _macro_options(payload: str) -> list[str]:
@@ -190,34 +217,41 @@ def resolve_system_prompt(
     chat_template: str | None = None,
     custom_macros: dict[str, str] | None = None,
 ) -> str:
-    """Build the system prompt for a chat with *card*.
+    """Build the main prompt for a chat with *card*.
 
-    Prefers the card's own ``system_prompt`` (with macro substitution).
-    Falls back to the chat template (loaded from settings when
-    *chat_template* is None) when the card doesn't define one.
+    The system prompt template (*chat_template*, or the active template from
+    :mod:`src.prompt_templates` when ``None``) is the main prompt; the card's
+    own ``system_prompt`` is appended after it as extra character-specific
+    instructions (SillyTavern's "Prefer Char. Instructions" ordering).  A
+    blank template leaves just the card prompt, and vice versa.
 
     Macros (``{{user}}`` / ``{{char}}``) are substituted *before* the
     ``{name}``-style format placeholders so the double-brace macros aren't
-    consumed by ``str.format`` escaping.
+    consumed by ``str.format`` escaping.  The card's own prompt is raw user
+    text: only macro substitution, never ``format_map`` (it may contain
+    literal braces).
     """
-    if card.system_prompt and card.system_prompt.strip():
-        # Raw user text — only macro-sub (don't format_map: might have literal braces).
-        return substitute_macros(card.system_prompt, user_name, card.name, custom_macros)
-
     if chat_template is not None:
         raw = chat_template
     else:
-        from src.ai_prompts import load_prompt
-        raw = load_prompt('chat_system')
+        from src.prompt_templates import active_template_content
+        raw = active_template_content()
 
-    # Escape braces in the macro values: ``substitute`` below runs
-    # format_map over this string, and card/user text must not become
-    # template syntax.
-    macroed = substitute_macros(
-        raw, user_name, card.name, custom_macros, escape_for_format=True,
-    )
-    from src.ai_prompts import substitute
-    return substitute(macroed, **_card_fields(card))
+    parts: list[str] = []
+    if raw and raw.strip():
+        # Escape braces in the macro values: ``substitute`` below runs
+        # format_map over this string, and card/user text must not become
+        # template syntax.
+        macroed = substitute_macros(
+            raw, user_name, card.name, custom_macros, escape_for_format=True,
+        )
+        from src.ai_prompts import substitute
+        parts.append(substitute(macroed, **_card_fields(card)).strip())
+    if card.system_prompt and card.system_prompt.strip():
+        parts.append(substitute_macros(
+            card.system_prompt, user_name, card.name, custom_macros,
+        ).strip())
+    return '\n\n'.join(p for p in parts if p)
 
 
 def build_initial_messages(
@@ -403,6 +437,125 @@ def history_for_api(messages: list[dict]) -> list[dict]:
     return result
 
 
+# ---- Strict chat-template role normalisation ----
+
+# Header prepended when a leading assistant turn (the card greeting) has to
+# move into the system message.  Macro-free on purpose: normalisation runs on
+# the wire payload where every macro has already been substituted.
+CONVERSATION_START_HEADER = '[Conversation start]'
+
+
+def _content_parts(content: Any) -> list[dict]:
+    """Normalise a message ``content`` field into OpenAI-style parts."""
+    if isinstance(content, list):
+        return [p for p in content if isinstance(p, dict)]
+    text = content if isinstance(content, str) else ('' if content is None else str(content))
+    return [{'type': 'text', 'text': text}] if text else []
+
+
+def _merge_contents(contents: list[Any]) -> Any:
+    """Combine several message contents into one.
+
+    All-text contents collapse to a single ``\\n\\n``-joined string (so plain
+    messages stay plain strings on the wire); anything carrying multimodal
+    parts becomes one concatenated parts list.
+    """
+    parts: list[dict] = []
+    for content in contents:
+        parts.extend(_content_parts(content))
+    if all(p.get('type') == 'text' for p in parts):
+        return '\n\n'.join(p.get('text', '') for p in parts if p.get('text', ''))
+    return parts
+
+
+def _split_text_parts(content: Any) -> tuple[str, list[dict]]:
+    """Split *content* into its plain text and its non-text parts.
+
+    Used when a message has to fold into the system string: text can ride
+    along, but image parts are handed back so they become their own turn.
+    """
+    parts = _content_parts(content)
+    texts = [p.get('text', '') for p in parts if p.get('type') == 'text']
+    rest = [p for p in parts if p.get('type') != 'text']
+    return '\n\n'.join(t for t in texts if t), rest
+
+
+def _merge_same_role(messages: list[dict]) -> list[dict]:
+    """Return *messages* with every run of equal roles merged into one."""
+    out: list[dict] = []
+    for m in messages:
+        role = m.get('role', 'user')
+        if out and out[-1].get('role', 'user') == role:
+            merged = dict(out[-1])
+            merged['content'] = _merge_contents(
+                [out[-1].get('content', ''), m.get('content', '')],
+            )
+            out[-1] = merged
+        else:
+            out.append(dict(m))
+    return out
+
+
+def normalize_chat_roles(messages: list[dict]) -> list[dict]:
+    """Rewrite *messages* into the shape strict chat templates require.
+
+    Llama 3.x / Gemma Jinja templates reject any request whose roles are not
+    exactly: one optional ``system`` message first, then ``user`` /
+    ``assistant`` strictly alternating and starting with ``user``.  The send
+    path legitimately builds shapes that violate this - trailing
+    post-history / jailbreak system blocks, ``system`` injections spliced at
+    depth (Author's Note, world info), the card greeting as a leading
+    ``assistant`` turn, consecutive same-role turns from Impersonate or a
+    failed send - so the wire payload is repaired here without losing text:
+
+    1. Only the first message stays ``system``; every later ``system``
+       message becomes ``user`` (a trailing block then glues onto the
+       preceding user turn, SillyTavern's "invisible user injection", or
+       alternates legally after an ``assistant`` turn).
+    2. Consecutive same-role messages merge (blank-line joined; multimodal
+       ``content`` part-lists concatenate).
+    3. A leading ``assistant`` run - the greeting - moves into the system
+       message under :data:`CONVERSATION_START_HEADER` so history can start
+       on a ``user`` turn; any image parts it carried become a ``user``
+       message of their own.
+
+    The result is idempotent: roles alternate from the second message on, so
+    re-running changes nothing.  Pure function.
+    """
+    msgs = [dict(m) for m in (messages or []) if isinstance(m, dict)]
+    lead: dict | None = None
+    if msgs and msgs[0].get('role') == 'system':
+        lead = msgs.pop(0)
+    for m in msgs:
+        if m.get('role') == 'system':
+            m['role'] = 'user'
+    msgs = _merge_same_role(msgs)
+
+    head: list[dict] = []
+    while msgs and msgs[0].get('role') == 'assistant':
+        head.append(msgs.pop(0))
+    if head:
+        texts: list[str] = []
+        leftovers: list[dict] = []
+        for m in head:
+            text, rest = _split_text_parts(m.get('content', ''))
+            if text:
+                texts.append(text)
+            if rest:
+                leftovers.append({'role': 'user', 'content': rest})
+        if texts:
+            body = f"{CONVERSATION_START_HEADER}\n" + '\n\n'.join(texts)
+            if lead is None:
+                lead = {'role': 'system', 'content': body}
+            else:
+                lead = dict(lead)
+                lead['content'] = _merge_contents([lead.get('content', ''), body])
+        if leftovers:
+            msgs = _merge_same_role(leftovers + msgs)
+
+    return ([lead] if lead is not None else []) + msgs
+
+
 def apply_memory(system: str, memory: str) -> str:
     """Append a chat-memory block to *system* when *memory* is non-empty.
 
@@ -445,6 +598,35 @@ def apply_memories(system: str, memories: list[dict], limit: int = 20) -> str:
     return section
 
 
+def _attributes_section(attributes: list[dict] | None) -> Optional[str]:
+    """Build the ``[Persistent attributes]`` block, or None when nothing to include."""
+    items = [
+        a for a in (attributes or [])
+        if isinstance(a, dict)
+        and a.get('enabled', True)
+        and (a.get('name') or '').strip()
+        and (a.get('value') or '').strip()
+    ]
+    if not items:
+        return None
+    lines = [f"{a['name'].strip()}: {a['value'].strip()}" for a in items]
+    return "[Persistent attributes]\n" + '\n'.join(lines)
+
+
+def apply_attributes(system: str, attributes: list[dict] | None) -> str:
+    """Append the persistent-attribute state to *system* when any are set.
+
+    Pure function.  Returns the original *system* untouched when no
+    attribute carries a value.
+    """
+    section = _attributes_section(attributes)
+    if section is None:
+        return system or ''
+    if system and system.strip():
+        return f"{system}\n\n{section}"
+    return section
+
+
 # ---- Lorebook (world info) injection ----
 
 def _entry_matches(entry: BookEntry, scan_text: str) -> bool:
@@ -460,7 +642,11 @@ def _entry_matches(entry: BookEntry, scan_text: str) -> bool:
     for key in keys:
         escaped = re.escape(key.strip())
         if entry.match_whole_words:
-            pattern = r'\b' + escaped + r'\b'
+            # Not \b: that requires a word/non-word transition, so keys that
+            # start or end with a non-word character ('.hack', 'C++', '#tag')
+            # could never match at that edge and the entry silently never
+            # fired. The lookarounds accept any non-word neighbour instead.
+            pattern = r'(?<!\w)' + escaped + r'(?!\w)'
         else:
             pattern = escaped
         if re.search(pattern, scan_text, flags):
@@ -684,6 +870,36 @@ _SYSTEM_BLOCK_TITLES = (
 )
 
 
+def _template_field_refs(template: str) -> set[str]:
+    """Format-field names referenced by *template* as real placeholders.
+
+    ``string.Formatter`` reports ``{description}`` as a field but treats
+    ``{{description}}`` as an escaped literal, which is exactly the split the
+    inline-field check needs. Never raises: malformed templates report no
+    references (blocks are then all emitted, which is safe).
+    """
+    from string import Formatter
+    refs: set[str] = set()
+    try:
+        parsed = Formatter().parse(template or '')
+        for _literal, field_name, _spec, _conv in parsed:
+            if not field_name:
+                continue
+            base = field_name.split('.')[0].split('[')[0].strip()
+            if base:
+                refs.add(base)
+    except ValueError:
+        return set()
+    return refs
+
+
+def _active_template_source(chat_template: str | None) -> str:
+    if chat_template is not None:
+        return chat_template
+    from src.prompt_templates import active_template_content
+    return active_template_content()
+
+
 def character_def_blocks(
     card: CharacterCard,
     user_name: str = 'User',
@@ -713,18 +929,20 @@ def system_prompt_blocks(
     chat_template: str | None = None,
     extra_books: Optional[list[CharacterBook]] = None,
     token_fn=None,
+    attributes: list[dict] | None = None,
 ) -> list[tuple[str, str]]:
     """The system-side blocks of a chat request, in SillyTavern order.
 
-    Main prompt (the card's ``system_prompt`` when set, else the chat
-    template) -> world info *before* the character -> description /
-    personality / scenario -> world info *after* the character -> user
-    persona -> chat memory.  Mirrors SillyTavern's prompt ordering: a card
-    system prompt replaces only the main prompt, its character definition is
-    still injected.
+    Main prompt (the system prompt template with the card's own
+    ``system_prompt`` appended, see :func:`resolve_system_prompt`) ->
+    world info *before* the character -> description / personality /
+    scenario -> world info *after* the character -> user persona ->
+    persistent attributes -> chat memory.  Mirrors SillyTavern's prompt
+    ordering: the card's system prompt adds to the main prompt, its
+    character definition is still injected.
 
-    A character-def block whose raw text already appears in the main prompt
-    (custom templates may inline ``{description}``) is not duplicated.
+    A character-def block whose field the template structurally references
+    (``{description}`` etc. in a custom template) is not duplicated.
     ``at_depth`` / Author's-Note-positioned world-info entries are
     message-level injections (see :func:`injections_for_chat`), not system
     blocks.  Pure function (token counting injectable).
@@ -749,11 +967,19 @@ def system_prompt_blocks(
             _substituted_entries(before, user_name, card.name or '', custom_macros),
         )))
 
+    # Structural inlining check: a custom template that references
+    # ``{description}`` / ``{personality}`` / ``{scenario}`` already emits the
+    # field, so the labelled block would duplicate it. (The old check was a
+    # substring test of the raw field against the whole main prompt, which
+    # silently dropped any short field - a character named "Aria" whose
+    # description is "Aria" lost its entire [Description] block.)
+    inlined = _template_field_refs(_active_template_source(chat_template))
+
     for title, attr in _SYSTEM_BLOCK_TITLES:
         raw = (getattr(card, attr, '') or '')
         if not raw.strip():
             continue
-        if raw.strip() in main:
+        if attr in inlined:
             # The main prompt already inlines this field (custom template).
             continue
         body = substitute_macros(raw, user_name, card.name or '', custom_macros)
@@ -766,6 +992,13 @@ def system_prompt_blocks(
 
     if persona and persona.strip():
         blocks.append(('User Persona', _persona_block(persona, user_name)))
+    attr_block = _attributes_section(attributes)
+    if attr_block:
+        # Attribute names may carry {{char}} / {{user}} macros (e.g.
+        # "{{char}} mood"); resolve them like every other system block.
+        blocks.append(('Persistent Attributes', substitute_macros(
+            attr_block, user_name, card.name or '', custom_macros,
+        )))
     mem_block = _memory_section(memories or [])
     if mem_block:
         blocks.append(('Chat Memory', mem_block))
@@ -800,13 +1033,14 @@ def assemble_system(
     chat_template: str | None = None,
     extra_books: Optional[list[CharacterBook]] = None,
     token_fn=None,
+    attributes: list[dict] | None = None,
 ) -> str:
     """The system message text for a chat request (see :func:`system_prompt_blocks`)."""
     blocks = system_prompt_blocks(
         card, messages,
         user_name=user_name, persona=persona, memories=memories,
         custom_macros=custom_macros, chat_template=chat_template,
-        extra_books=extra_books, token_fn=token_fn,
+        extra_books=extra_books, token_fn=token_fn, attributes=attributes,
     )
     return '\n\n'.join(text for _title, text in blocks)
 
@@ -975,14 +1209,16 @@ def build_context_plan(
     example_placement: str = 'history',
     author_note: dict | None = None,
     jailbreak: str = '',
+    template_post_history: str = '',
+    attributes: list[dict] | None = None,
 ) -> ContextPlan:
     """Build the exact context a chat turn will send, section by section.
 
     Mirrors the Test tab's send path: system blocks (main prompt -> world
-    info -> character definition -> persona -> memory, see
-    :func:`system_prompt_blocks`), the few-shot example dialogue (placed per
-    *example_placement*: ``'system'``, ``'post_history'`` or the legacy
-    ``'history'`` turns), the message history with depth injections
+    info -> character definition -> persona -> persistent attributes ->
+    memory, see :func:`system_prompt_blocks`), the few-shot example dialogue
+    (placed per *example_placement*: ``'system'``, ``'post_history'`` or the
+    legacy ``'history'`` turns), the message history with depth injections
     (Author's Note / ``at_depth`` world info) spliced in, the trailing
     post-history instructions, and the user *jailbreak* block after them.
     Pure function (token counting injectable).
@@ -996,7 +1232,7 @@ def build_context_plan(
         card, messages,
         user_name=user_name, persona=persona, memories=memories,
         custom_macros=custom_macros, chat_template=chat_template,
-        extra_books=extra_books, token_fn=token_fn,
+        extra_books=extra_books, token_fn=token_fn, attributes=attributes,
     ):
         sections.append(ContextSection(title, text, token_fn(text)))
 
@@ -1032,16 +1268,36 @@ def build_context_plan(
         msg_no += 1
         attachments = row.get('attachments') or [] if isinstance(row, dict) else []
         title = f'Message {msg_no} ({role})'
+        counted = content
         if attachments:
             title += f' — {len(attachments)} attachment(s)'
-        sections.append(ContextSection(title, content, token_fn(content)))
+            # Count (and show) what the wire actually sends: history_for_api
+            # prepends text attachments to the content, so counting content
+            # alone under-reported the token label and the "over the
+            # configured context size" warning.
+            text_blocks = [
+                _attachment_text_block(a) for a in attachments
+                if isinstance(a, dict) and a.get('kind') == 'text'
+            ]
+            if text_blocks:
+                counted = '\n\n'.join(text_blocks + ([content] if content else []))
+        sections.append(ContextSection(title, counted, token_fn(counted)))
 
     if example_placement == 'post_history' and examples_text:
         sections.append(ContextSection(
             'Example Dialogue (post-history)', examples_text, token_fn(examples_text),
         ))
 
+    phi_parts = []
     phi = post_history_text(card, user_name, custom_macros)
+    if phi:
+        phi_parts.append(phi)
+    tpl_phi = (template_post_history or '').strip()
+    if tpl_phi:
+        phi_parts.append(substitute_macros(
+            tpl_phi, user_name, card.name or '', custom_macros,
+        ))
+    phi = '\n\n'.join(p for p in phi_parts if p)
     if phi:
         sections.append(ContextSection('Post-History Instructions', phi, token_fn(phi)))
 

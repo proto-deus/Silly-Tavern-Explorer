@@ -9,6 +9,7 @@ from copy import deepcopy
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
@@ -28,6 +29,7 @@ from src.database import LibraryDatabase, sanitize_filename
 from src.token_counter import count_card_tokens, count_tokens
 from src.ui.dialog_helper import exec_dialog
 from src.ui.form_undo import FormSnapshot, UndoStack
+from src.ui.spell_check import SpellCheckTextEdit
 from src.ui.widgets.collapsible_section import CollapsibleSection
 from src.ui.widgets.tag_widget import TagWidget
 
@@ -239,6 +241,10 @@ class EditTab(QWidget):
         header_vlayout.setSpacing(0)
 
         header_row = QHBoxLayout()
+        # A nested layout inherits its parent's spacing: without this the
+        # buttons pack flush together (header_vlayout is spaced 0), unlike
+        # every other button row in the app.
+        header_row.setSpacing(6)
         header_row.setContentsMargins(8, 8, 20, 0)
         self._change_img_btn = QPushButton('Change Image')
         self._change_img_btn.setEnabled(False)
@@ -304,56 +310,56 @@ class EditTab(QWidget):
         self._name_edit.textChanged.connect(self._update_token_count)
         form_layout.addWidget(self._name_edit)
 
-        self._desc_edit = QTextEdit()
+        self._desc_edit = SpellCheckTextEdit()
         self._desc_edit.setMaximumHeight(300)
         self._desc_edit.textChanged.connect(self._update_token_count)
         self._desc_section = CollapsibleSection('Description:', self._desc_edit)
         form_layout.addWidget(self._desc_section)
         self._sections.append(self._desc_section)
 
-        self._pers_edit = QTextEdit()
+        self._pers_edit = SpellCheckTextEdit()
         self._pers_edit.setMaximumHeight(300)
         self._pers_edit.textChanged.connect(self._update_token_count)
         self._pers_section = CollapsibleSection('Personality:', self._pers_edit)
         form_layout.addWidget(self._pers_section)
         self._sections.append(self._pers_section)
 
-        self._scen_edit = QTextEdit()
+        self._scen_edit = SpellCheckTextEdit()
         self._scen_edit.setMaximumHeight(300)
         self._scen_edit.textChanged.connect(self._update_token_count)
         self._scen_section = CollapsibleSection('Scenario:', self._scen_edit)
         form_layout.addWidget(self._scen_section)
         self._sections.append(self._scen_section)
 
-        self._sys_edit = QTextEdit()
+        self._sys_edit = SpellCheckTextEdit()
         self._sys_edit.setMaximumHeight(240)
         self._sys_edit.textChanged.connect(self._update_token_count)
         self._sys_section = CollapsibleSection('System Prompt:', self._sys_edit)
         form_layout.addWidget(self._sys_section)
         self._sections.append(self._sys_section)
 
-        self._phi_edit = QTextEdit()
+        self._phi_edit = SpellCheckTextEdit()
         self._phi_edit.setMaximumHeight(200)
         self._phi_edit.textChanged.connect(self._update_token_count)
         self._phi_section = CollapsibleSection('Post-History Instructions:', self._phi_edit)
         form_layout.addWidget(self._phi_section)
         self._sections.append(self._phi_section)
 
-        self._first_edit = QTextEdit()
+        self._first_edit = SpellCheckTextEdit()
         self._first_edit.setMaximumHeight(240)
         self._first_edit.textChanged.connect(self._update_token_count)
         self._first_section = CollapsibleSection('First Message:', self._first_edit)
         form_layout.addWidget(self._first_section)
         self._sections.append(self._first_section)
 
-        self._example_edit = QTextEdit()
+        self._example_edit = SpellCheckTextEdit()
         self._example_edit.setMaximumHeight(240)
         self._example_edit.textChanged.connect(self._update_token_count)
         self._example_section = CollapsibleSection('Example Messages:', self._example_edit)
         form_layout.addWidget(self._example_section)
         self._sections.append(self._example_section)
 
-        self._notes_edit = QTextEdit()
+        self._notes_edit = SpellCheckTextEdit()
         self._notes_edit.setMaximumHeight(160)
         self._notes_edit.textChanged.connect(self._update_token_count)
         self._notes_section = CollapsibleSection('Creator Notes:', self._notes_edit)
@@ -364,7 +370,7 @@ class EditTab(QWidget):
         user_notes_container = QWidget()
         user_notes_v = QVBoxLayout(user_notes_container)
         user_notes_v.setContentsMargins(0, 0, 0, 0)
-        self._user_notes_edit = QTextEdit()
+        self._user_notes_edit = SpellCheckTextEdit()
         self._user_notes_edit.setMaximumHeight(120)
         self._user_notes_edit.setPlaceholderText(
             'Private notes — stored locally, never written to the card file'
@@ -579,10 +585,13 @@ class EditTab(QWidget):
 
     def undo(self) -> None:
         """Revert the form to its previous committed state."""
+        # Flush the debounced edits FIRST: stopping the timer discarded
+        # keystrokes typed in the last ~900 ms (and cancelled the pending
+        # fold entirely when nothing had been committed yet).
+        self._commit_undo_snapshot()
         if not self._undo_stack.can_undo:
             self.status_message.emit('Nothing to undo', 2000)
             return
-        self._undo_timer.stop()
         snapshot = self._undo_stack.undo()
         if snapshot is None:
             return
@@ -592,10 +601,10 @@ class EditTab(QWidget):
 
     def redo(self) -> None:
         """Re-apply the state that undo reverted."""
+        self._commit_undo_snapshot()
         if not self._undo_stack.can_redo:
             self.status_message.emit('Nothing to redo', 2000)
             return
-        self._undo_timer.stop()
         snapshot = self._undo_stack.redo()
         if snapshot is None:
             return
@@ -736,14 +745,21 @@ class EditTab(QWidget):
         """Set the selected character id without loading the card (for cross-tab sync)."""
         self._current_id = char_id
 
+    def current_id(self) -> int | None:
+        """The currently selected card id (mirrors CharacterSidebar.current_id)."""
+        return self._current_id
+
     def _load_card(self, token_count: int | None = None,
-                   refresh_labels: bool = True) -> None:
+                   refresh_labels: bool = True,
+                   keep_history: bool = False) -> None:
         """Load the current card into the form.
 
         *token_count* passes in a value the caller already computed (save()
         counts the card it just wrote, so the reload does not re-tokenize it);
         *refresh_labels* can be skipped when the per-field labels are already
-        current for the content being loaded.
+        current for the content being loaded; *keep_history* preserves the
+        undo/redo stacks and only moves the pristine baseline (save() reloads
+        through this path, and Ctrl+S must not destroy the history).
         """
         if self._current_id is None:
             return
@@ -821,7 +837,10 @@ class EditTab(QWidget):
         finally:
             self._dirty_state.end_load()
         # Seed the undo history with the freshly loaded state.
-        self._undo_stack.reset(self._take_snapshot(f'Loaded {card.name}'))
+        if keep_history:
+            self._undo_stack.mark_saved(self._take_snapshot(f'Saved {card.name}'))
+        else:
+            self._undo_stack.reset(self._take_snapshot(f'Loaded {card.name}'))
         self._update_undo_actions()
 
     def _gather_card(self) -> CharacterCard:
@@ -925,7 +944,7 @@ class EditTab(QWidget):
         row_layout.addWidget(del_btn)
         insert_pos = self._alt_greeting_layout.count() - 1
         self._alt_greeting_layout.insertWidget(insert_pos, row)
-        edit = QTextEdit()
+        edit = SpellCheckTextEdit()
         edit.setMaximumHeight(120)
         edit.setPlainText(text)
         edit.textChanged.connect(self._mark_dirty)
@@ -1092,18 +1111,26 @@ class EditTab(QWidget):
 
     def _edit_character_book(self) -> None:
         from src.ui.widgets.character_book_editor import CharacterBookEditor
+        from src.ui.dialog_helper import exec_dialog_with
         dlg = CharacterBookEditor(self._character_book_dict, self)
-        if exec_dialog(dlg):
-            self._character_book_dict = dlg.get_book_dict()
+        # get_book_dict must be read BEFORE the dialog is disposed of
+        # (exec_dialog's contract) - the C++ object is gone on its return.
+        result = exec_dialog_with(dlg, lambda d: d.get_book_dict() if d.result()
+                                  == QDialog.DialogCode.Accepted else None)
+        if result is not None:
+            self._character_book_dict = result
             self._mark_dirty()
 
     def _edit_extensions(self) -> None:
         if self._current_card is None:
             return
         from src.ui.widgets.extensions_editor import ExtensionsEditor
+        from src.ui.dialog_helper import exec_dialog_with
         dlg = ExtensionsEditor(self._current_card.extensions, self)
-        if exec_dialog(dlg):
-            self._current_card.extensions = dlg.get_extensions()
+        result = exec_dialog_with(dlg, lambda d: d.get_extensions() if d.result()
+                                  == QDialog.DialogCode.Accepted else None)
+        if result is not None:
+            self._current_card.extensions = result
             self._mark_dirty()
 
     def _change_image(self) -> None:
@@ -1169,6 +1196,13 @@ class EditTab(QWidget):
         card.token_count = count_card_tokens(card)
         try:
             self.db.update_card(self._current_id, card, rename_file_on_name_change=True)
+            # The notes field marks the form dirty and the reload below
+            # restores it from the DB, so it must be persisted here too -
+            # otherwise typing notes and pressing Ctrl+S silently discarded
+            # them (the separate "Save Notes" button was the only writer).
+            self.db.set_user_notes(
+                self._current_id, self._user_notes_edit.toPlainText(),
+            )
             self._dirty_state.clear()
             self.status_message.emit(f"'{card.name}' saved", 4000)
             # The labels already describe the saved text (the gathered card
@@ -1178,7 +1212,10 @@ class EditTab(QWidget):
             # Reload from disk so the editor (header, file path, in-memory
             # card) reflects the saved state, including a renamed file when
             # the character name changed.
-            self._load_card(token_count=card.token_count, refresh_labels=False)
+            self._load_card(
+                token_count=card.token_count, refresh_labels=False,
+                keep_history=True,
+            )
             self.card_updated.emit(self._current_id)
             return True
         except Exception as e:

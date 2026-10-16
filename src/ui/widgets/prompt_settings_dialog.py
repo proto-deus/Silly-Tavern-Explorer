@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 
 from src import ai_prompts
 from src.card_models import CharacterCard
+from src.ui.spell_check import SpellCheckPlainTextEdit
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ class _PromptTab(QWidget):
         for key in keys:
             label_text = 'System prompt:' if key.endswith('_system') else 'User prompt:'
             layout.addWidget(self._make_label(label_text))
-            edit = QPlainTextEdit()
+            edit = SpellCheckPlainTextEdit()
             edit.setPlainText(ai_prompts.load_prompt(key))
             edit.setMinimumHeight(120)
             layout.addWidget(edit)
@@ -150,6 +151,12 @@ class PromptSettingsDialog(QDialog):
         self._tab_fill = _PromptTab('Fill Fields', ['fill_system', 'fill_user'])
         self._tab_wizard = _PromptTab('Wizard', ['wizard_system', 'wizard_user'])
         self._tab_chat = _PromptTab('Chat', ['chat_system'])
+        self._tab_chat.setToolTip(
+            "This is the 'Custom' system prompt template used for Test chats "
+            "when no other template is selected.\n"
+            "Named templates (Natural Chat, Simple Roleplay, ...) are managed "
+            "in Settings > Prompts > Manage Templates..."
+        )
         self._tab_lorebook = _PromptTab('Lorebook', ['lorebook_system', 'lorebook_user'])
         self._tab_lore_entry = _PromptTab(
             'Lorebook Entry', ['lorebook_entry_system', 'lorebook_entry_user'],

@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
 
 from src.card_models import CharacterCard
 from src.card_parser import read_card_data
-from src.database import LibraryDatabase, sanitize_filename
+from src.database import SORT_LABELS, LibraryDatabase, sanitize_filename
 from src.settings_manager import load_font_size
 from src.ui.dialog_helper import exec_dialog, exec_dialog_with
 from src.ui.widgets.async_image import (
@@ -162,16 +162,9 @@ class LibraryTab(QWidget):
     selection_changed = pyqtSignal(list)
     settings_requested = pyqtSignal()
 
-    # Map dropdown display text -> DB sort key (mirrors the whitelist in
-    # LibraryDatabase._SORT_WHITELIST so invalid values can never reach SQL).
-    _SORT_LABELS: dict[str, str] = {
-        'Name': 'name',
-        'Date Added': 'date_added',
-        'Token Count': 'token_count',
-        'Favorites': 'is_favorite',
-        'Rating': 'rating',
-        'Random': 'random',
-    }
+    # Map dropdown display text -> DB sort key (shared with the sidebar's
+    # sort combo; see SORT_LABELS / LibraryDatabase._SORT_WHITELIST).
+    _SORT_LABELS: dict[str, str] = SORT_LABELS
 
     def __init__(self, db: LibraryDatabase, parent: QWidget | None = None):
         super().__init__(parent)
@@ -1348,7 +1341,10 @@ class LibraryTab(QWidget):
         from src.ui.widgets.duplicate_scanner import DuplicateScannerDialog
         dlg = DuplicateScannerDialog(self.db, self)
         exec_dialog(dlg)
-        # Card data may have changed; refresh the grid.
+        # Card data may have changed; refresh the grid. Deletions from the
+        # scanner must also invalidate the parsed-card cache (the menu path
+        # in MainWindow does the same).
+        self.invalidate_card_cache()
         self.load_cards()
 
     def show_statistics(self) -> None:

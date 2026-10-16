@@ -14,6 +14,7 @@ from typing import Optional
 from src.card_models import CharacterCard
 from src.card_parser import read_chara_card, read_card_from_json, save_thumbnail
 from src import vault
+from src.fs_utils import unique_temp_path
 from src.tag_ops import (
     count_tags,
     merge_tag,
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Bumped when a migration adds work that only needs to run once. Stored in the
 # database's PRAGMA user_version so startup can skip migrations that have
 # already been applied instead of scanning the whole table every launch.
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 def _escape_like(text: str) -> str:
@@ -106,6 +107,12 @@ def _get_library_dir() -> Path:
 
 def _get_thumbnail_dir() -> Path:
     d = _get_data_dir() / 'thumbnails'
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _get_gallery_dir() -> Path:
+    d = _get_data_dir() / 'gallery'
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -206,6 +213,20 @@ def hash_hamming_distance(a: str, b: str) -> int:
         return 64
 
 
+# Map dropdown display text -> sort key in LibraryDatabase._SORT_WHITELIST.
+# Shared by the Library tab's sort combo and the character sidebar's sort
+# combo so the two dropdowns can never drift apart or pass a key that isn't
+# whitelisted (which would otherwise fall back to the default ordering).
+SORT_LABELS: dict[str, str] = {
+    'Name': 'name',
+    'Date Added': 'date_added',
+    'Token Count': 'token_count',
+    'Favorites': 'is_favorite',
+    'Rating': 'rating',
+    'Random': 'random',
+}
+
+
 class LibraryDatabase:
     _SORT_WHITELIST = frozenset({'name', 'date_added', 'token_count', 'is_favorite', 'rating', 'random'})
 
@@ -303,11 +324,12 @@ class LibraryDatabase:
 
         self._do_backup(db_file, bak_path, bak2_path)
 
-    def _do_backup(self, db_file: Path, bak_path: Path, bak2_path: Path) -> None:
+    def _do_backup(self, db_file: Path, bak_path: Path, bak2_path: Path) -> bool:
         """Checkpoint WAL, rotate the previous backup, and copy the DB.
 
         The new backup is written to a temp file first so a crash between
         rotation and copy never leaves the user without any backup.
+        Returns True when a new backup now exists at *bak_path*.
         """
         conn = self._connect()
         try:
@@ -321,11 +343,14 @@ class LibraryDatabase:
                 )
         except sqlite3.Error as exc:
             logger.warning("WAL checkpoint failed during backup: %s", exc)
-            return
+            return False
         finally:
             conn.close()
 
-        tmp_path = bak_path.with_suffix('.bak.tmp')
+        # Unique temp name: two concurrent backups (or two instances before
+        # the single-instance lock engages) must not interleave writes to the
+        # same .bak.tmp.
+        tmp_path = unique_temp_path(bak_path.parent, f'.{bak_path.name}.', '.tmp')
         try:
             # Vault-aware copy: the backup is sealed like every other data
             # file when encryption is on, so no plaintext DB copy lingers.
@@ -336,21 +361,32 @@ class LibraryDatabase:
                 bak_path.rename(bak2_path)
             tmp_path.replace(bak_path)
             logger.info("Database backed up to %s", bak_path)
+            return True
         except (OSError, vault.VaultError):
             logger.exception("Database backup failed")
             try:
                 tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
+            return False
 
     def backup(self) -> Path:
-        """Force a backup of the database. Returns the backup file path."""
+        """Force a backup of the database. Returns the backup file path.
+
+        Raises :class:`RuntimeError` when the backup did not happen: the
+        caller (the UI's "force backup") must not be shown a stale or
+        missing file as the new backup.
+        """
         db_file = Path(self.db_path)
         if not db_file.exists():
             raise FileNotFoundError(f"Database file not found: {self.db_path}")
         bak_path = db_file.parent / (db_file.name + '.bak')
         bak2_path = db_file.parent / (db_file.name + '.bak2')
-        self._do_backup(db_file, bak_path, bak2_path)
+        if not self._do_backup(db_file, bak_path, bak2_path):
+            raise RuntimeError(
+                f"Database backup to {bak_path} did not complete; "
+                "see the log for details"
+            )
         return bak_path
 
     def _migrate_db(self) -> None:
@@ -429,6 +465,28 @@ class LibraryDatabase:
                     deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            # Per-character gallery images: metadata for the extra images
+            # stored under gallery/<character_id>/. Order and captions live
+            # here rather than in sidecar JSON so reordering is one UPDATE
+            # per row and the Doctor can spot orphan rows directly.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS gallery_images (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    character_id INTEGER NOT NULL,
+                    file_name TEXT NOT NULL,
+                    caption TEXT NOT NULL DEFAULT '',
+                    sort_order INTEGER DEFAULT 0,
+                    content_hash TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (character_id, file_name)
+                )
+            ''')
+            # The gallery pane lists per character in sort_order on every
+            # load; without this every open full-scanned the table.
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_gallery_images_character '
+                'ON gallery_images (character_id, sort_order)'
+            )
             if schema_version != _SCHEMA_VERSION:
                 # Only write when it actually changes: an unconditional write
                 # bumps the DB mtime on every launch, which made the startup
@@ -832,7 +890,16 @@ class LibraryDatabase:
         if regen_thumbnail:
             thumb_path = new_thumb
             if thumb_path and new_source and Path(new_source).exists():
-                save_thumbnail(new_source, thumb_path)
+                try:
+                    save_thumbnail(new_source, thumb_path)
+                except (OSError, vault.VaultError) as e:
+                    # A thumbnail is optional: an unwritable thumbnail
+                    # directory must not abort the UPDATE below, or a rename
+                    # that already happened would leave the row pointing at a
+                    # file name that no longer exists.
+                    logger.warning(
+                        "Thumbnail regeneration failed for ID %s: %s", char_id, e,
+                    )
 
         with self._conn() as conn:
             sets = '''
@@ -907,6 +974,7 @@ class LibraryDatabase:
             # with harmless orphan files (cleanable) instead of a ghost row
             # pointing at deleted files.
             conn.execute('DELETE FROM card_collections WHERE character_id = ?', (char_id,))
+            conn.execute('DELETE FROM gallery_images WHERE character_id = ?', (char_id,))
             conn.execute('DELETE FROM characters WHERE id = ?', (char_id,))
         logger.info("Removed card ID %s", char_id)
         # Chat sessions live on disk under sessions/<char_id>/. They are
@@ -919,6 +987,14 @@ class LibraryDatabase:
         if delete_sessions:
             self._delete_chat_sessions(char_id)
         if delete_files:
+            # Gallery images live on disk under gallery/<char_id>/ (metadata
+            # rows are gone already); like the sessions they are unreachable
+            # once the card is removed.
+            try:
+                from src import gallery_store
+                gallery_store.delete_gallery_dir(char_id)
+            except Exception:
+                logger.exception("Could not delete gallery folder for card %s", char_id)
             src_path = entry.get('source_path', '')
             if src_path:
                 src = Path(src_path)
@@ -1161,6 +1237,142 @@ class LibraryDatabase:
             )
             conn.commit()
 
+    # ---- Gallery images ----
+
+    def list_gallery_images(self, char_id: int) -> list[dict]:
+        """Return a card's gallery image rows in display order."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                'SELECT id, character_id, file_name, caption, sort_order, '
+                'content_hash, created_at FROM gallery_images '
+                'WHERE character_id = ? ORDER BY sort_order, id',
+                (char_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_gallery_image(self, image_id: int) -> Optional[dict]:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                'SELECT id, character_id, file_name, caption, sort_order, '
+                'content_hash, created_at FROM gallery_images WHERE id = ?',
+                (image_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def find_gallery_by_hash(self, char_id: int, content_hash: str) -> Optional[dict]:
+        """Return the gallery row already holding *content_hash*, if any.
+
+        Import dedupe: identical bytes are never stored twice for the same
+        character.
+        """
+        if not content_hash:
+            return None
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                'SELECT id, character_id, file_name, caption, sort_order, '
+                'content_hash, created_at FROM gallery_images '
+                'WHERE character_id = ? AND content_hash = ?',
+                (char_id, content_hash),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def add_gallery_image(
+        self, char_id: int, file_name: str, content_hash: str = '', caption: str = '',
+    ) -> int:
+        """Insert a gallery row; new images append at the end of the order."""
+        from src.fs_utils import safe_filename_component
+        safe_name = safe_filename_component(file_name)
+        if not safe_name:
+            raise ValueError(f'Invalid gallery file name: {file_name!r}')
+        with self._conn() as conn:
+            row = conn.execute(
+                'SELECT COALESCE(MAX(sort_order), -1) + 1 FROM gallery_images '
+                'WHERE character_id = ?',
+                (char_id,),
+            ).fetchone()
+            next_order = int(row[0]) if row else 0
+            cursor = conn.execute(
+                'INSERT INTO gallery_images '
+                '(character_id, file_name, caption, sort_order, content_hash) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (char_id, safe_name, caption or '', next_order, content_hash or ''),
+            )
+            new_id = cursor.lastrowid
+            conn.commit()
+        return new_id
+
+    def set_gallery_caption(self, image_id: int, caption: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                'UPDATE gallery_images SET caption = ? WHERE id = ?',
+                (caption or '', image_id),
+            )
+            conn.commit()
+
+    def set_gallery_order(self, char_id: int, ordered_ids: list[int]) -> None:
+        """Persist a drag-reordered gallery sequence.
+
+        The UPDATE list is rewritten from *ordered_ids* wholesale so a
+        dropped item can't leave two rows sharing one sort_order.
+        """
+        with self._conn() as conn:
+            for position, image_id in enumerate(ordered_ids):
+                conn.execute(
+                    'UPDATE gallery_images SET sort_order = ? '
+                    'WHERE id = ? AND character_id = ?',
+                    (position, image_id, char_id),
+                )
+            conn.commit()
+
+    def delete_gallery_image(self, image_id: int) -> Optional[dict]:
+        """Remove one gallery row and return it (for the caller's file delete)."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                'SELECT id, character_id, file_name FROM gallery_images WHERE id = ?',
+                (image_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute('DELETE FROM gallery_images WHERE id = ?', (image_id,))
+            conn.commit()
+            return dict(row)
+
+    def delete_gallery_rows(self, char_id: int) -> None:
+        with self._conn() as conn:
+            conn.execute('DELETE FROM gallery_images WHERE character_id = ?', (char_id,))
+            conn.commit()
+
+    def list_all_gallery_images(self) -> list[dict]:
+        """Every gallery row across all characters (Doctor scans)."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                'SELECT id, character_id, file_name, caption, sort_order, '
+                'content_hash, created_at FROM gallery_images '
+                'ORDER BY character_id, sort_order, id',
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def migrate_gallery_images(self, old_id: int, new_id: int) -> None:
+        """Re-point gallery rows from *old_id* to *new_id*.
+
+        Used when a card is superseded during sync and re-imported under a
+        new row id; the gallery belongs to the character and must follow it
+        (files move separately via gallery_store.migrate_gallery_files).
+        """
+        if old_id == new_id:
+            return
+        with self._conn() as conn:
+            conn.execute(
+                'UPDATE gallery_images SET character_id = ? WHERE character_id = ?',
+                (new_id, old_id),
+            )
+            conn.commit()
+
     # ---- SillyTavern linking ----
 
     def _record_deleted_st_card(
@@ -1216,11 +1428,12 @@ class LibraryDatabase:
                 new_dir.parent.mkdir(parents=True, exist_ok=True)
                 old_dir.rename(new_dir)
                 return
-            for item in old_dir.iterdir():
-                target = new_dir / item.name
-                if not target.exists():
-                    item.rename(target)
+            from src.fs_utils import move_contents_into
+            notes = move_contents_into(old_dir, new_dir)
             shutil.rmtree(old_dir, ignore_errors=True)
+            for note in notes:
+                logger.warning("Chat session %s during merge %s -> %s",
+                               note, old_dir, new_dir)
         except OSError as e:
             logger.warning(
                 "Could not migrate chat sessions from %s to %s: %s",

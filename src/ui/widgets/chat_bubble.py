@@ -116,6 +116,9 @@ class MessageBubble(QFrame):
         footer = QHBoxLayout()
         footer.setSpacing(6)
         self._buttons: list[QPushButton] = []
+        # Regenerate/variant controls only; they ride the newest assistant
+        # message and are retired in place when a newer reply arrives.
+        self._action_buttons: list[QPushButton] = []
         footer.addStretch()
 
         # Variant navigation back-arrow sits directly left of Edit.
@@ -125,6 +128,7 @@ class MessageBubble(QFrame):
             back.clicked.connect(lambda: self.variant_back_requested.emit(self._index))
             footer.addWidget(back)
             self._buttons.append(back)
+            self._action_buttons.append(back)
 
         for label, signal in (
             ('Edit', self.edit_requested),
@@ -142,6 +146,7 @@ class MessageBubble(QFrame):
             regen.clicked.connect(lambda: self.regenerate_requested.emit(self._index))
             footer.addWidget(regen)
             self._buttons.append(regen)
+            self._action_buttons.append(regen)
 
         # Right-most slot is always ▶: steps toward newer responses, or
         # labelled (New) when pressing it past the newest would generate
@@ -156,6 +161,7 @@ class MessageBubble(QFrame):
             fwd.clicked.connect(lambda: self.variant_forward_requested.emit(self._index))
             footer.addWidget(fwd)
             self._buttons.append(fwd)
+            self._action_buttons.append(fwd)
 
         layout.addLayout(footer)
 
@@ -293,6 +299,15 @@ class MessageBubble(QFrame):
         """Enable/disable the footer action buttons (edit/copy/delete/regen)."""
         for btn in self._buttons:
             btn.setEnabled(enabled)
+
+    def clear_actions(self) -> None:
+        """Hide the regenerate/variant controls in place.
+
+        They belong to the newest assistant message only; when a newer reply
+        lands, the previous holder drops them without a full rebuild.
+        """
+        for btn in self._action_buttons:
+            btn.hide()
 
     def set_content(self, text: str) -> None:
         """Replace the message text and re-render with colored formatting."""

@@ -46,18 +46,49 @@ _PERMANENT_CONFIG_ERRORS = (
 )
 
 
+def is_cleartext_remote(base_url: str) -> bool:
+    """True when *base_url* is plain ``http://`` to a non-loopback host.
+
+    A bearer API key sent to such a host travels unencrypted. Localhost is
+    exempt: the local-server presets (LM Studio, Ollama) are exactly that.
+    """
+    text = (base_url or '').strip()
+    if not text:
+        return False
+    if '://' not in text:
+        text = 'http://' + text
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() != 'http':
+        return False
+    host = (parsed.hostname or '').lower()
+    return host not in ('', 'localhost', '127.0.0.1', '::1', '0:0:0:0:0:0:0:1')
+
+
 def redact_secrets(message: object) -> str:
     """Return *message* with anything that looks like a credential removed.
 
     Applied to every transport error string that reaches a log or the UI:
-    exception messages can echo request headers, including ``Authorization``.
+    exception messages can echo request headers, including ``Authorization``,
+    and server error prose can echo the key back ("Incorrect API key
+    provided: sk-live-...").
     """
     text = str(message)
     text = re.sub(r'(?i)(bearer\s+)[^\s\'"]+', r'\1[redacted]', text)
     text = re.sub(r'(?i)((?:api[ _-]?key|authorization|token)\s*[:=]\s*)[^\s,;\'"]+',
                   r'\1[redacted]', text)
-    text = re.sub(r'(?i)(header value\s*[:=]?\s*)([\'"]?)[^\s\'"]+',
-                  r'\1\2[redacted]', text)
+    # Key-shaped tokens anywhere: servers echo keys in prose where the label
+    # rule above cannot see them ("api key provided: sk-live-SECRET").
+    text = re.sub(
+        r'(?i)\b(?:sk|key|token|apikey|api_key)[-_][A-Za-z0-9_\-]{6,}',
+        '[redacted]', text,
+    )
+    # Bare ``key=...`` / ``key: ...`` values (query strings, form bodies).
+    text = re.sub(r'(?i)(\bkey\s*[:=]\s*)[^\s,;\'"]+', r'\1[redacted]', text)
+    text = re.sub(r'(?i)(header value\s*[:=]?\s*)([\'"]?)[^\s\'"]+', r'\1\2[redacted]', text)
     return text
 
 
@@ -74,6 +105,27 @@ def _permanent_config_message(exc: BaseException) -> str:
             '(e.g. smart quotes). Re-enter it in Settings.'
         )
     return redact_secrets(exc)
+
+
+# Error-message fingerprints of a chat-template / role-shape rejection.  Both
+# llama.cpp-derived servers (LM Studio) and vLLM surface Jinja template
+# failures either as an HTTP 400 body or as an in-band SSE error chunk; the
+# wording always mentions the template or the alternation rule it enforces.
+_TEMPLATE_ERROR_MARKERS = (
+    'conversation roles must alternate',
+    'roles must alternate',
+    'raise_exception',
+    'unable to generate parser',
+    'jinja',
+    'chat template',
+    'chat_template',
+)
+
+
+def is_chat_template_error(message: object) -> bool:
+    """True when *message* looks like a chat-template / role-shape rejection."""
+    text = str(message).lower()
+    return any(marker in text for marker in _TEMPLATE_ERROR_MARKERS)
 
 
 class _RetryableError(Exception):
@@ -179,6 +231,11 @@ class APIPreset:
     retry_attempts: int = 2
     # Custom stop sequences (SillyTavern's "Custom Stopping Strings").
     stop: list[str] = field(default_factory=list)
+    # Rewrite chat messages into a single leading system message followed by
+    # strict user/assistant alternation before sending.  Required by Llama
+    # 3.x / Gemma chat templates; harmless elsewhere but it does change the
+    # wire format (trailing system blocks glue onto the last user turn).
+    strict_chat_template: bool = False
 
 
 PRESETS: dict[str, APIPreset] = {
@@ -276,7 +333,17 @@ def preset_from_saved(saved: dict) -> APIPreset:
         seed=saved.get('seed', base.seed),
         retry_attempts=saved.get('retry_attempts', base.retry_attempts),
         stop=_parse_stop_sequences(saved.get('stop')),
+        strict_chat_template=_as_bool(
+            saved.get('strict_chat_template', base.strict_chat_template)
+        ),
     )
+
+
+def _as_bool(value) -> bool:
+    """Coerce a saved settings value to bool (QSettings stores 'true'/'false')."""
+    if isinstance(value, str):
+        return value.strip().lower() in ('true', '1', 'yes', 'on')
+    return bool(value)
 
 
 def vary_seed(preset: APIPreset, bump: int) -> APIPreset:
@@ -343,6 +410,11 @@ class AIClient:
                     'The API key contains characters that cannot be sent '
                     '(e.g. smart quotes). Re-enter it in Settings.'
                 ) from None
+            if is_cleartext_remote(self.preset.base_url):
+                logger.warning(
+                    "Sending the API key to %s over unencrypted http://",
+                    (self.preset.base_url or '').split('//', 1)[-1].split('/', 1)[0],
+                )
             h['Authorization'] = f'Bearer {key}'
         return h
 
@@ -476,13 +548,13 @@ class AIClient:
             payload['stop'] = stops
         return payload
 
-    def _generate_sync(self, payload: dict) -> str:
+    def _generate_sync(self, payload: dict, rebuild=None) -> str:
         # Route through the streaming path so cancel() can interrupt an
         # in-flight request by closing the session, and so both modes share
         # the same retry/backoff behaviour.  Retryable failures only ever
         # occur before the first chunk, so partial output is never duplicated.
         parts: list[str] = []
-        for piece in self._generate_stream(dict(payload, stream=True)):
+        for piece in self._generate_stream(dict(payload, stream=True), rebuild=rebuild):
             parts.append(piece)
         content = ''.join(parts)
         if not content:
@@ -645,14 +717,25 @@ class AIClient:
         if isinstance(delta, dict) and delta.get('content'):
             yield delta['content']
 
-    def _generate_stream(self, payload: dict) -> Generator[str, None, None]:
+    def _generate_stream(self, payload: dict, rebuild=None) -> Generator[str, None, None]:
+        """Stream one chat completion, retrying transient failures.
+
+        *rebuild* (optional) returns a fresh streaming payload with the
+        messages normalised for strict chat templates; it is used at most once
+        when the server rejects the message layout (see
+        :func:`is_chat_template_error`).
+        """
         max_retries = self._max_retries()
         attempt = 0
+        template_retry_used = False
         while True:
             if self._cancel_requested:
                 raise RuntimeError('Generation cancelled')
+            produced = False
             try:
-                yield from self._stream_once(payload)
+                for piece in self._stream_once(payload):
+                    produced = True
+                    yield piece
                 return
             except _RetryableError as exc:
                 if attempt >= max_retries:
@@ -667,6 +750,31 @@ class AIClient:
                 )
                 self._cancellable_sleep(delay)
                 attempt += 1
+            except Exception as exc:
+                # The chat template rejected the message layout (Llama 3.x /
+                # Gemma require strict user/assistant alternation).  The
+                # rejection always arrives before any content, so resending
+                # with normalised roles cannot duplicate output.  This does
+                # not consume a regular retry attempt: it repairs the request
+                # rather than retrying the same one.
+                if (
+                    rebuild is not None
+                    and not template_retry_used
+                    and not produced
+                    and not self._cancel_requested
+                    and is_chat_template_error(exc)
+                ):
+                    template_retry_used = True
+                    logger.warning(
+                        "Chat template rejected the message layout (%s); "
+                        "resending with normalised user/assistant roles. "
+                        "Enable 'strict chat template' for this provider to "
+                        "always send the normalised form.",
+                        redact_secrets(exc),
+                    )
+                    payload = rebuild()
+                    continue
+                raise
 
     def generate_tags(self, card: CharacterCard, extra: str = '', length: str = '') -> list[str]:
         system, user = ai_prompts.build_tags_prompts(card, extra=extra, length=length)
@@ -746,11 +854,42 @@ class AIClient:
             reserve=reserve,
         )
         if injections:
-            full_messages = splice_injections(full_messages, injections)
+            # Depth is counted from the end of the CONVERSATION, not from the
+            # end of the payload: the trailing blocks (examples /
+            # post-history / jailbreak) are depth-0 blocks themselves, and
+            # counting from after them landed every injection that many
+            # messages closer to the end than the Context Inspector shows
+            # (and closer than SillyTavern places it).
+            trailing_count = len(trailing)
+            if trailing_count:
+                head, tail = (
+                    full_messages[:-trailing_count],
+                    full_messages[-trailing_count:],
+                )
+                full_messages = splice_injections(head, injections) + tail
+            else:
+                full_messages = splice_injections(full_messages, injections)
+        # Strict chat templates (Llama 3.x / Gemma) only accept one system
+        # message followed by user/assistant alternation.  With the
+        # per-provider flag on, repair the layout up front; otherwise send it
+        # as assembled and let the retry in ``_generate_stream`` normalise on
+        # the fly when the server rejects it (see ``is_chat_template_error``).
+        rebuild = None
+        if getattr(self.preset, 'strict_chat_template', False):
+            from src.chat_builder import normalize_chat_roles
+            full_messages = normalize_chat_roles(full_messages)
+        else:
+            def _rebuild() -> dict[str, Any]:
+                # Always rebuilds the streaming form: the retry lives inside
+                # ``_generate_stream``, which posts stream=True payloads.
+                from src.chat_builder import normalize_chat_roles
+                return self._build_payload(normalize_chat_roles(full_messages), True)
+
+            rebuild = _rebuild
         payload = self._build_payload(full_messages, stream)
         if stream:
-            return self._generate_stream(payload)
-        return self._generate_sync(payload)
+            return self._generate_stream(payload, rebuild=rebuild)
+        return self._generate_sync(payload, rebuild=rebuild)
 
 
 def _injection_parts(inj: Any) -> tuple[str, str, int]:

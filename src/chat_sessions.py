@@ -12,6 +12,13 @@ from src import vault
 
 logger = logging.getLogger(__name__)
 
+
+# Written with every session file.  Version 2 is the first one that persists
+# the auto-summarize / auto-update toggles faithfully: older files (no key at
+# all) never did — the auto-update flag was always written as False no matter
+# what the UI showed — so their stored flags are ignored (see session_flags).
+FLAGS_VERSION = 2
+
 # Session ids are uuid hexes; anything else (e.g. an 'id' field read from a
 # crafted/corrupt session file) must never reach a filesystem path.
 _SAFE_SESSION_ID = re.compile(r'^[A-Za-z0-9_-]+$')
@@ -32,6 +39,34 @@ def sessions_dir() -> Path:
     d = data_dir() / 'sessions'
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _stored_flag(existing: dict | None, key: str) -> bool:
+    """The flag value to keep when the caller passes ``None``.
+
+    Pre-|FLAGS_VERSION| files never persisted these toggles faithfully, so
+    their stored values are ignored and the ON default applies instead.
+    """
+    if not isinstance(existing, dict) or existing.get('flags_version') is None:
+        return True
+    return bool(existing.get(key, True))
+
+
+def session_flags(data: dict | None) -> tuple[bool, bool]:
+    """Return ``(auto_summarize, auto_update_attributes)`` for a session.
+
+    Files written before :data:`FLAGS_VERSION` existed come back with both
+    toggles ON regardless of what they store (that data was never a real
+    user choice); stamped files honour their values, defaulting to ON when
+    a key is missing.  Pure function.
+    """
+    data = data if isinstance(data, dict) else {}
+    if data.get('flags_version') is None:
+        return True, True
+    return (
+        bool(data.get('auto_summarize', True)),
+        bool(data.get('auto_update_attributes', True)),
+    )
 
 
 class ChatSessionStore:
@@ -69,7 +104,8 @@ class ChatSessionStore:
             # invalid UTF-8 raises UnicodeDecodeError, which is a ValueError
             # and NOT an OSError, so read_text's OSError guard would not catch
             # it.  The vault helper transparently decrypts sealed sessions.
-            data = json.loads(vault.read_bytes(path).decode('utf-8'))
+            from src.fs_utils import decode_text
+            data = json.loads(decode_text(vault.read_bytes(path)))
             if isinstance(data, dict):
                 return data
             logger.warning("Session file %s is not a JSON object", path)
@@ -116,6 +152,9 @@ class ChatSessionStore:
         author_note: dict | None = None,
         jailbreak: str | None = None,
         persona_id: str | None = None,
+        system_template: str | None = None,
+        attributes: list[dict] | None = None,
+        auto_update_attributes: bool | None = None,
     ) -> None:
         """Write a session, preserving its original ``created_at``.
 
@@ -123,12 +162,18 @@ class ChatSessionStore:
         legacy ``memory`` string migrated to the list form); ``auto_summarize``
         follows the same convention so the flag can be turned off explicitly
         without also wiping the memory list.  ``author_note`` / ``jailbreak`` /
-        ``persona_id`` are likewise kept unchanged when ``None``, so callers
-        that don't manage them (import paths, older code) can't wipe them.
+        ``persona_id`` / ``system_template`` / ``attributes`` /
+        ``auto_update_attributes`` are likewise kept unchanged when ``None``,
+        so callers that don't manage them (import paths, older code) can't
+        wipe them.
         """
         path = self._path(char_id, session_id)
         created_at = None
         existing = self._read(path)
+        if auto_summarize is None:
+            auto_summarize = _stored_flag(existing, 'auto_summarize')
+        if auto_update_attributes is None:
+            auto_update_attributes = _stored_flag(existing, 'auto_update_attributes')
         if existing:
             created_at = existing.get('created_at')
             if memories is None:
@@ -136,8 +181,6 @@ class ChatSessionStore:
                 # list and the legacy ``memory`` string field, so a
                 # legacy-only file keeps its text across saves.
                 memories = normalize_memories(existing)
-            if auto_summarize is None:
-                auto_summarize = bool(existing.get('auto_summarize', False))
             if author_note is None:
                 author_note = normalize_author_note(existing.get('author_note'))
             if jailbreak is None:
@@ -146,19 +189,31 @@ class ChatSessionStore:
             if persona_id is None:
                 stored_pid = existing.get('persona_id')
                 persona_id = stored_pid if isinstance(stored_pid, str) else ''
+            if system_template is None:
+                stored_tpl = existing.get('system_template')
+                system_template = stored_tpl if isinstance(stored_tpl, str) else ''
+            if attributes is None:
+                attributes = normalize_attributes(existing)
         now = datetime.now().isoformat(timespec='seconds')
         data = {
             'id': session_id,
             'char_id': char_id,
             'title': title,
+            'flags_version': FLAGS_VERSION,
             'messages': [
                 dict(m) for m in messages or [] if isinstance(m, dict)
             ],
             'memories': [c for c in (_clean_memory(m) for m in (memories or [])) if c is not None],
             'auto_summarize': bool(auto_summarize),
+            'attributes': [
+                c for c in (_clean_attribute(a) for a in (attributes or []))
+                if c is not None
+            ],
+            'auto_update_attributes': bool(auto_update_attributes),
             'author_note': normalize_author_note(author_note),
             'jailbreak': jailbreak or '',
             'persona_id': persona_id or '',
+            'system_template': system_template or '',
             'created_at': created_at or now,
             'updated_at': now,
         }
@@ -322,3 +377,184 @@ def _clean_memory(m) -> dict | None:
     if end is not None:
         cleaned['end_index'] = end
     return cleaned
+
+
+# ---- persistent attributes (tracked story state) ----
+
+DEFAULT_ATTRIBUTE_NAMES: tuple[str, ...] = (
+    'Setting',
+    '{{char}} mood',
+    '{{char}} clothing',
+    'Time & weather',
+    '{{char}} physical state',
+    '{{user}}-{{char}} relationship',
+    'Current activity',
+    'Who is present',
+)
+
+DEFAULT_ATTRIBUTE_DESCRIPTIONS: dict[str, str] = {
+    'Setting': (
+        'Where the scene currently takes place and the relevant surroundings.'
+    ),
+    '{{char}} mood': "{{char}}'s current emotional state.",
+    '{{char}} clothing': (
+        "What {{char}} is currently wearing, including its "
+        'condition (wet, torn, ...).'
+    ),
+    'Time & weather': (
+        'The current time of day and weather; update when either changes.'
+    ),
+    '{{char}} physical state': (
+        "{{char}}'s physical condition: injuries, exhaustion, "
+        'hunger, illness.'
+    ),
+    '{{user}}-{{char}} relationship': (
+        'How {{char}} and {{user}} stand with each other '
+        '(strangers, friends, tension, ...).'
+    ),
+    'Current activity': (
+        'What is happening right now and what {{char}} is doing.'
+    ),
+    'Who is present': 'Which characters are present in the scene.',
+}
+
+
+def default_attributes() -> list[dict]:
+    """The persistent attributes a new chat starts watching."""
+    return [
+        new_attribute_entry(
+            name, description=DEFAULT_ATTRIBUTE_DESCRIPTIONS.get(name, ''),
+        )
+        for name in DEFAULT_ATTRIBUTE_NAMES
+    ]
+
+
+def new_attribute_entry(
+    name: str,
+    value: str = '',
+    description: str = '',
+    enabled: bool = True,
+) -> dict:
+    """Build a dict for one watched persistent attribute.
+
+    ``value`` is the current state (e.g. the character's mood),
+    ``description`` tells the model what the attribute tracks and what
+    counts as a change, ``enabled`` is the per-attribute on/off switch
+    (a disabled attribute is neither tracked nor sent in the prompt),
+    and ``updated_at`` records when the value last changed.
+    """
+    return {
+        'id': uuid.uuid4().hex,
+        'name': str(name or '').strip(),
+        'value': str(value or ''),
+        'description': str(description or ''),
+        'enabled': bool(enabled),
+        'updated_at': '',
+    }
+
+
+def normalize_attributes(data: dict | None) -> list[dict]:
+    """Return the persistent-attribute list stored in session *data*.
+
+    Handles on-disk data that may have been hand-edited or written by an
+    older build: malformed entries are skipped and duplicate names collapse
+    to their first occurrence.  Pure function.
+    """
+    return _normalize_attributes_raw(data)
+
+
+def _normalize_attributes_raw(data: dict | None) -> list[dict]:
+    if not isinstance(data, dict):
+        return []
+    raw = data.get('attributes')
+    if not isinstance(raw, list):
+        return []
+    result: list[dict] = []
+    seen: set[str] = set()
+    for a in raw:
+        entry = _clean_attribute(a)
+        if entry is None:
+            continue
+        key = entry['name'].casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(entry)
+    return result
+
+
+def _clean_attribute(a) -> dict | None:
+    """Return a cleaned copy of an attribute entry, or None for garbage input."""
+    if not isinstance(a, dict):
+        return None
+    name = str(a.get('name', '') or '').strip()
+    if not name:
+        return None
+    return {
+        'id': str(a.get('id') or uuid.uuid4().hex),
+        'name': name,
+        'value': str(a.get('value', '') or ''),
+        'description': str(a.get('description', '') or ''),
+        'enabled': bool(a.get('enabled', True)),
+        'updated_at': str(a.get('updated_at', '') or ''),
+    }
+
+
+_NO_CHANGES_RE = re.compile(
+    r'^\s*(?:no\s+changes?|none|unchanged)\s*\.?\s*$', re.IGNORECASE,
+)
+
+
+def parse_attribute_updates(text: str, names: list[str]) -> dict[str, str]:
+    """Parse an attribute-update LLM reply into ``{name: new value}``.
+
+    Expected format is one ``Name: value`` line per changed attribute, or a
+    ``NO CHANGES`` reply.  Only names on the watched *names* list are
+    accepted (matched case-insensitively; the canonical name is returned);
+    unknown names and empty values are ignored.  Markdown fences around the
+    reply are tolerated.  Pure function.
+    """
+    if not text or not str(text).strip():
+        return {}
+    body = str(text).strip()
+    if body.startswith('```'):
+        body = re.sub(r'^```[A-Za-z0-9_-]*\s*', '', body)
+        body = re.sub(r'\s*```$', '', body)
+        body = body.strip()
+    if _NO_CHANGES_RE.match(body):
+        return {}
+    canonical = {n.strip().casefold(): n.strip() for n in (names or []) if n and n.strip()}
+    updates: dict[str, str] = {}
+    for line in body.splitlines():
+        line = line.strip().lstrip('-*').strip()
+        if not line or ':' not in line:
+            continue
+        key, _, value = line.partition(':')
+        name = canonical.get(key.strip().casefold())
+        value = value.strip()
+        if name and value:
+            updates[name] = value
+    return updates
+
+
+def apply_attribute_updates(attributes: list[dict], updates: dict[str, str]) -> list[dict]:
+    """Return a copy of *attributes* with *updates* applied by name.
+
+    Matching is case-insensitive on the attribute name; names in *updates*
+    that no watched attribute carries are ignored.  Updated entries get a
+    fresh ``updated_at`` timestamp.  Pure function.
+    """
+    by_key = {str(k).strip().casefold(): str(v) for k, v in (updates or {}).items()}
+    now = datetime.now().isoformat(timespec='seconds')
+    result: list[dict] = []
+    for a in attributes or []:
+        if not isinstance(a, dict):
+            result.append(a)
+            continue
+        entry = dict(a)
+        value = by_key.get(str(entry.get('name', '') or '').strip().casefold())
+        if value is not None:
+            entry['value'] = value
+            entry['updated_at'] = now
+        result.append(entry)
+    return result

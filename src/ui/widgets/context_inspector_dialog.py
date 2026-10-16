@@ -9,7 +9,6 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QHBoxLayout,
     QLabel,
-    QPlainTextEdit,
     QPushButton,
     QTabWidget,
     QTextBrowser,
@@ -18,6 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.chat_builder import ContextPlan
+from src.ui.spell_check import SpellCheckPlainTextEdit
 from src.ui.widgets.author_note_editor import AuthorNoteEditor
 
 _SECTION_COLOR = '#8ecbff'
@@ -124,7 +124,7 @@ class ContextInspectorDialog(QDialog):
             'Your own trailing instructions for this chat, sent after the '
             "card's post-history instructions (depth 0)."
         ))
-        self._jailbreak_edit = QPlainTextEdit(jailbreak or '')
+        self._jailbreak_edit = SpellCheckPlainTextEdit(jailbreak or '')
         self._jailbreak_edit.setPlaceholderText('e.g. Always reply in character.')
         jailbreak_layout.addWidget(self._jailbreak_edit, 1)
         self._tabs.addTab(jailbreak_page, 'Jailbreak')

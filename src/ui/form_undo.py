@@ -91,6 +91,17 @@ class UndoStack:
         self._present = snapshot
         self._baseline = snapshot
 
+    def mark_saved(self, snapshot: FormSnapshot) -> None:
+        """Adopt *snapshot* as the new pristine state without clearing history.
+
+        Used after a save: the undo/redo steps taken before the save are
+        still meaningful, and undoing past the baseline simply marks the form
+        dirty again (as every editor does). A plain :meth:`reset` here would
+        destroy the whole history on every Ctrl+S.
+        """
+        self._present = snapshot
+        self._baseline = snapshot
+
     @property
     def is_at_baseline(self) -> bool:
         """True when the current state equals the last-loaded (pristine) state.

@@ -122,6 +122,38 @@ def atomic_copy(src: str | Path, dst: str | Path) -> None:
             pass
 
 
+def decode_text(data: bytes) -> str:
+    """Decode *data* as text, tolerating BOMs and legacy ANSI encodings.
+
+    ``utf-8-sig`` first (it handles BOM'd *and* BOM-less UTF-8), then
+    ``cp1252`` for Windows "ANSI" saves. A strict ``utf-8`` read made such
+    files invisible ("No character data found") with no user-facing hint.
+    """
+    try:
+        return data.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        pass
+    try:
+        return data.decode('cp1252')
+    except UnicodeDecodeError:
+        # cp1252 leaves a handful of bytes undefined.
+        return data.decode('utf-8', errors='replace')
+
+
+def safe_filename_component(name: str | None) -> str:
+    """Return *name* reduced to a single safe path component ('' if unusable).
+
+    ``Path('..').name`` is ``'..'``, so the usual "take the basename" trick
+    does **not** stop a crafted or legacy DB value from escaping its
+    directory.  Empty/``.``/``..`` results are rejected outright; the caller
+    sees ``''`` and must decide (skip the row, refuse the write, ...).
+    """
+    base = Path(str(name or '')).name
+    if base in ('', '.', '..'):
+        return ''
+    return base
+
+
 def unique_temp_path(directory: str | Path, prefix: str, suffix: str = '') -> Path:
     """Return a unique temp path inside *directory* (same volume as targets).
 
@@ -137,3 +169,34 @@ def unique_temp_path(directory: str | Path, prefix: str, suffix: str = '') -> Pa
     path = Path(name)
     path.unlink(missing_ok=True)
     return path
+
+
+def _unique_collision_target(directory: Path, name: str) -> Path:
+    """A free ``<stem>__<n><suffix>`` path for *name* inside *directory*."""
+    p = Path(name)
+    stem, suffix = p.stem, p.suffix
+    for n in range(1, 10_000):
+        candidate = directory / f'{stem}__{n}{suffix}'
+        if not candidate.exists():
+            return candidate
+    return unique_temp_path(directory, f'{stem}__', suffix)
+
+
+def move_contents_into(old_dir: str | Path, new_dir: str | Path) -> list[str]:
+    """Move every entry of *old_dir* into *new_dir*, never losing data.
+
+    An entry whose target name already exists is renamed to a unique
+    ``<stem>__<n><suffix>`` form instead of being skipped - the previous
+    skip-and-``rmtree`` pattern silently destroyed every colliding entry.
+    Returns human-readable notes for renamed collisions.
+    """
+    old_dir = Path(old_dir)
+    new_dir = Path(new_dir)
+    notes: list[str] = []
+    for item in old_dir.iterdir():
+        target = new_dir / item.name
+        if target.exists():
+            target = _unique_collision_target(new_dir, item.name)
+            notes.append(f"'{item.name}' merged as '{target.name}'")
+        item.rename(target)
+    return notes

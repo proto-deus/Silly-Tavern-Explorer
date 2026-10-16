@@ -218,6 +218,32 @@ DEFAULT_MEMORY_SUMMARY_USER = (
     '{conversation}'
 )
 
+# Persistent-attribute tracking prompts: each turn the model decides which of
+# the watched attributes (setting, mood, clothing, ...) changed.
+DEFAULT_ATTRIBUTE_UPDATE_SYSTEM = (
+    'You track persistent state (attributes) in an ongoing roleplay '
+    'conversation. Each attribute has a name and its current value. Given the '
+    'latest exchange, decide which attributes changed and write their new '
+    'values.\n'
+    'Rules:\n'
+    '- Output one line per changed attribute in the form `Name: value`, using '
+    'the exact attribute names from the watched list.\n'
+    '- Only include attributes whose value actually changed; never invent new '
+    'attribute names.\n'
+    '- An attribute may carry a "(What to watch for: ...)" note defining what '
+    'it tracks and when its value should change.\n'
+    '- Keep values short and factual (a phrase, not a sentence).\n'
+    '- If nothing changed, output exactly `NO CHANGES`.\n'
+    'Output nothing else.'
+)
+
+DEFAULT_ATTRIBUTE_UPDATE_USER = (
+    'Watched attributes and their current values:\n'
+    '{attributes}\n\n'
+    'Latest exchange:\n{conversation}\n\n'
+    'Output the updated values for any attribute that changed (or NO CHANGES).'
+)
+
 # Lorebook (world info) generation prompts.
 DEFAULT_LOREBOOK_SYSTEM = (
     'You are an expert lorebook (world info) designer for roleplay AI. Given a '
@@ -287,6 +313,8 @@ PROMPT_KEYS: list[str] = [
     'wizard_user',
     'memory_summary_system',
     'memory_summary_user',
+    'attribute_update_system',
+    'attribute_update_user',
     'lorebook_system',
     'lorebook_user',
     'lorebook_entry_system',
@@ -313,6 +341,8 @@ _DEFAULTS: dict[str, str] = {
     'wizard_user': DEFAULT_WIZARD_USER,
     'memory_summary_system': DEFAULT_MEMORY_SUMMARY_SYSTEM,
     'memory_summary_user': DEFAULT_MEMORY_SUMMARY_USER,
+    'attribute_update_system': DEFAULT_ATTRIBUTE_UPDATE_SYSTEM,
+    'attribute_update_user': DEFAULT_ATTRIBUTE_UPDATE_USER,
     'lorebook_system': DEFAULT_LOREBOOK_SYSTEM,
     'lorebook_user': DEFAULT_LOREBOOK_USER,
     'lorebook_entry_system': DEFAULT_LOREBOOK_ENTRY_SYSTEM,
@@ -360,7 +390,11 @@ def _escape_literal_braces(template: str) -> str:
     """Double every brace that is not part of a ``{field}`` placeholder.
 
     Turns ``Return {"a": 1} for {concept}`` into a string ``str.format`` can
-    process while leaving ``{concept}`` substitutable.
+    process while leaving ``{concept}`` substitutable.  Already-escaped
+    pairs (``{{`` / ``}}``) are left as they are: converting them to single
+    braces would make ``format_map`` consume them as placeholders, deleting
+    literal ``{{x}}`` text and re-opening the value-injection hole that
+    ``escape_for_format`` closes (a card named ``{description}``).
     """
     out: list[str] = []
     i = 0
@@ -369,7 +403,7 @@ def _escape_literal_braces(template: str) -> str:
         ch = template[i]
         if ch == '{':
             if template.startswith('{{', i):
-                out.append('{')
+                out.append('{{')
                 i += 2
                 continue
             end = template.find('}', i + 1)
@@ -382,7 +416,7 @@ def _escape_literal_braces(template: str) -> str:
             continue
         if ch == '}':
             if template.startswith('}}', i):
-                out.append('}')
+                out.append('}}')
                 i += 2
                 continue
             out.append('}}')
@@ -560,6 +594,43 @@ def build_memory_summary_prompts(
     system = tmpl.get('memory_summary_system') or load_prompt('memory_summary_system')
     user = tmpl.get('memory_summary_user') or load_prompt('memory_summary_user')
     return substitute(system), substitute(user, conversation=conversation or '')
+
+
+def build_attribute_update_prompts(
+    attributes: list[dict],
+    conversation: str,
+    templates: dict[str, str] | None = None,
+) -> tuple[str, str]:
+    """Build the (system, user) prompts for updating persistent attributes.
+
+    *attributes* is the watched list (``[{'name', 'value', 'description'}, ...]``);
+    each contributes a ``Name: value`` line so the model sees the current state
+    and the exact names to use in its reply, plus an indented "what to watch
+    for" note when the attribute carries a description.  Attributes the user
+    disabled (``enabled: False``) are left out entirely.
+    """
+    tmpl = templates or {}
+    system = tmpl.get('attribute_update_system') or load_prompt('attribute_update_system')
+    user = tmpl.get('attribute_update_user') or load_prompt('attribute_update_user')
+    lines: list[str] = []
+    for a in attributes or []:
+        if (
+            not isinstance(a, dict)
+            or not a.get('enabled', True)
+            or not (a.get('name') or '').strip()
+        ):
+            continue
+        lines.append(
+            f"{a.get('name', '')}: {(a.get('value') or '').strip() or '(unset)'}"
+        )
+        description = (a.get('description') or '').strip()
+        if description:
+            lines.append(f'  (What to watch for: {description})')
+    return substitute(system), substitute(
+        user,
+        attributes='\n'.join(lines) or '(none)',
+        conversation=conversation or '',
+    )
 
 
 def _lorebook_card_block(card: CharacterCard | None) -> str:

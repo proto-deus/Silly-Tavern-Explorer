@@ -10,7 +10,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -18,6 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.card_models import BookEntry, parse_character_book
+from src.ui.spell_check import SpellCheckPlainTextEdit
 
 
 def parse_secondary_keys(text: str) -> list[str]:
@@ -68,14 +68,17 @@ def merge_edited_entry(
     case_sensitive: bool,
     match_whole_words: bool,
     extensions: dict | None = None,
+    role: int | None = None,
 ) -> BookEntry:
     """Build the saved :class:`BookEntry` from editor fields over *original*.
 
     By default the unmodeled ``extensions`` dict (ST-native fields such as
     ``uid``, ``probability``, ``selective``, ``sticky``, ...) is carried
     verbatim from *original*; passing *extensions* explicitly overrides it
-    (an empty dict clears it).  Pure function so preservation can be
-    unit-tested without Qt.
+    (an empty dict clears it).  ``role`` follows the same rule: it defaults
+    to the original's value (a 0 default would silently turn a user/assistant
+    ``at_depth`` injection into a system one the moment the entry is edited).
+    Pure function so preservation can be unit-tested without Qt.
     """
     if extensions is not None:
         final_extensions = dict(extensions)
@@ -92,6 +95,7 @@ def merge_edited_entry(
         match_whole_words=match_whole_words,
         depth=depth,
         position=position,
+        role=original.role if role is None else role,
     )
 
 
@@ -116,7 +120,7 @@ class _BookEntryEditDialog(QDialog):
         form.addRow('Keys:', self._keys_edit)
 
         form.addRow(QLabel('Content:'))
-        self._content_edit = QPlainTextEdit(entry.content)
+        self._content_edit = SpellCheckPlainTextEdit(entry.content)
         form.addRow(self._content_edit)
 
         self._position_edit = QLineEdit(entry.position)

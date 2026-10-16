@@ -6,12 +6,12 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QLabel,
     QSpinBox,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from src.chat_sessions import normalize_author_note
+from src.ui.spell_check import SpellCheckTextEdit
 
 
 class AuthorNoteEditor(QWidget):
@@ -39,7 +39,7 @@ class AuthorNoteEditor(QWidget):
             "(depth = how many messages stay below it)."
         ))
 
-        self._text = QTextEdit()
+        self._text = SpellCheckTextEdit()
         self._text.setAcceptRichText(False)
         self._text.setPlaceholderText(
             "e.g. Keep the pacing slow and the tone melancholic."

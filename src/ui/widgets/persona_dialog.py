@@ -3,8 +3,6 @@ from __future__ import annotations
 import uuid
 
 from PyQt6.QtWidgets import (
-    QDialog,
-    QDialogButtonBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -12,19 +10,21 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from src.ui.spell_check import SpellCheckTextEdit
 
-class PersonaDialog(QDialog):
-    """Manage named user personas and pick the one active for the chat.
+
+class PersonaManagerWidget(QWidget):
+    """Manage named user personas and pick the active one.
 
     SillyTavern keeps multiple personas (name + description per user) with a
-    per-chat selection; this dialog provides the same for the Test tab.
-    ``personas()`` returns the edited list and ``selected_id()`` the active
-    persona's id.
+    selection of which one is in effect; this widget provides the same for the
+    Settings ▸ Macros tab.  The highlighted persona is the active ``{{user}}``
+    persona for chats.  ``personas()`` returns the edited list and
+    ``selected_id()`` the active persona's id.
     """
 
     def __init__(
@@ -34,8 +34,6 @@ class PersonaDialog(QDialog):
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
-        self.setWindowTitle('User Personas')
-        self.setMinimumSize(560, 380)
 
         self._personas: list[dict] = [
             {
@@ -52,9 +50,10 @@ class PersonaDialog(QDialog):
         self._loading = False
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(QLabel(
-            'The selected persona is injected as the [User persona] block '
-            '({{user}}) for this chat.'
+            'The highlighted persona is the active [User persona] ({{user}}) '
+            'for chats.'
         ))
 
         row = QHBoxLayout()
@@ -79,20 +78,13 @@ class PersonaDialog(QDialog):
         self._name.textEdited.connect(self._sync_current)
         right.addWidget(self._name)
         right.addWidget(QLabel('Description (who {{user}} is):'))
-        self._text = QTextEdit()
+        self._text = SpellCheckTextEdit()
         self._text.setAcceptRichText(False)
         self._text.setPlaceholderText('Appearance, personality, role...')
         self._text.textChanged.connect(self._sync_current)
         right.addWidget(self._text, 1)
         row.addLayout(right, 2)
         layout.addLayout(row, 1)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
 
         select = 0
         for i, p in enumerate(self._personas):
@@ -158,7 +150,7 @@ class PersonaDialog(QDialog):
         return [dict(p) for p in self._personas]
 
     def selected_id(self) -> str:
-        """Id of the highlighted persona (the one to activate)."""
+        """Id of the highlighted persona (the active one)."""
         row = self._list.currentRow()
         if 0 <= row < len(self._personas):
             return self._personas[row]['id']

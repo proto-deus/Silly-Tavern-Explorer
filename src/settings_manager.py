@@ -24,7 +24,7 @@ def _get_settings() -> QSettings:
 _PROVIDER_KEYS = (
     'base_url', 'model', 'temperature', 'max_tokens', 'top_p', 'top_k',
     'min_p', 'context_size', 'frequency_penalty', 'presence_penalty', 'seed',
-    'retry_attempts', 'stop',
+    'retry_attempts', 'stop', 'strict_chat_template',
 )
 
 _LEGACY_KEYS = _PROVIDER_KEYS + ('preset_name',)
@@ -43,6 +43,7 @@ _PROVIDER_DEFAULTS: dict = {
     'seed': -1,
     'retry_attempts': 2,
     'stop': '',
+    'strict_chat_template': False,
 }
 
 
@@ -92,13 +93,56 @@ def undecryptable_api_key_providers() -> list[str]:
     return sorted(_UNDECRYPTABLE_KEYS)
 
 
+def is_provider_undecryptable(provider: str) -> bool:
+    """True when *provider*'s saved key could not be decrypted.
+
+    Accepts either the bare provider name (``'LM Studio'``) or the internal
+    storage key (``'api/providers/LM Studio'``) - the two forms have been
+    used interchangeably and callers must not have to know which is stored.
+    """
+    wanted = {
+        provider,
+        f'api/providers/{provider}',
+        _provider_prefix(provider).strip('/'),
+    }
+    return bool(wanted & _UNDECRYPTABLE_KEYS)
+
+
 def clear_undecryptable_api_key_providers() -> None:
     """Forget the undecryptable-key warnings (after the user re-enters keys)."""
     _UNDECRYPTABLE_KEYS.clear()
 
 
+def _is_preset_placeholder(prefix: str, api_key: str) -> bool:
+    """True when *api_key* is a PRESETS default, not a user-supplied secret.
+
+    Local-server presets (LM Studio, Ollama) carry a dummy key like
+    ``'lm-studio'`` purely so ``Authorization: Bearer`` is sent. Those
+    defaults must never be *stored*: the settings dialog round-trips them
+    (``preset_from_saved`` fills the empty field), and writing one over an
+    undecryptable ciphertext destroys the real key irrecoverably.
+    """
+    if not api_key:
+        return False
+    try:
+        from src.ai_client import PRESETS
+    except Exception:  # pragma: no cover - import always succeeds in-app
+        return False
+    name = prefix.strip('/').rsplit('/', 1)[-1]
+    base = PRESETS.get(name)
+    return base is not None and bool(base.api_key) and api_key == base.api_key
+
+
 def _write_api_key(s: QSettings, prefix: str, api_key: str) -> None:
     if api_key:
+        if _is_preset_placeholder(prefix, api_key):
+            # A transport default, not a secret: keep whatever is stored.
+            # Replacing a real (possibly undecryptable) key with the
+            # placeholder would destroy it.
+            logger.debug(
+                "Not storing the preset placeholder key for '%s'", prefix.strip('/'),
+            )
+            return
         encrypted = _encrypt_secret(api_key)
         if encrypted is not None:
             s.setValue(prefix + 'api_key_encrypted', encrypted)
@@ -115,6 +159,13 @@ def _write_api_key(s: QSettings, prefix: str, api_key: str) -> None:
             "the previous encrypted copy is kept", prefix.strip('/'),
         )
         s.setValue(prefix + 'api_key', api_key)
+        stale = s.value(prefix + 'api_key_encrypted', '')
+        if stale:
+            # Keep the old ciphertext, but not under the key _read_api_key
+            # consults first: it would decrypt to the PREVIOUS key and shadow
+            # the new plaintext value forever (requests then 401).
+            s.setValue(prefix + 'api_key_encrypted.bak', stale)
+            s.remove(prefix + 'api_key_encrypted')
     else:
         if prefix.strip('/') in _UNDECRYPTABLE_KEYS:
             # Refuse to wipe a key we merely failed to read.
@@ -141,6 +192,27 @@ def _safe_int(value, default: int) -> int:
     except (TypeError, ValueError):
         logger.warning("Corrupted settings value %r, falling back to %r", value, default)
         return default
+
+
+def _safe_bool(value, default: bool) -> bool:
+    """Coerce a QSettings value to bool.
+
+    The native Windows backend stores booleans as the strings "true"/"false",
+    and ``bool("false")`` is ``True`` - so a naive cast silently turns every
+    saved-off flag on.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ('true', '1', 'yes', 'on'):
+            return True
+        if text in ('false', '0', 'no', 'off', ''):
+            return False
+    logger.warning("Corrupted settings value %r, falling back to %r", value, default)
+    return default
 
 
 def _clamp(value, low, high, default):
@@ -170,6 +242,9 @@ def _read_config(s: QSettings, prefix: str, name: str = '') -> dict:
         # an effectively infinite retry loop.
         'retry_attempts': _clamp(_safe_int(s.value(prefix + 'retry_attempts', 2), 2), 0, 5, 2),
         'stop': _parse_stop_value(s.value(prefix + 'stop', '')),
+        'strict_chat_template': _safe_bool(
+            s.value(prefix + 'strict_chat_template', False), False,
+        ),
     }
     return result
 
@@ -533,6 +608,79 @@ def load_user_persona() -> str:
     return get_persona().get('text', '')
 
 
+# ---------------------------------------------------------------------------
+# System prompt templates (named main prompts for the Test chat)
+# ---------------------------------------------------------------------------
+
+_SYSTEM_TEMPLATES_KEY = 'prompts/system_templates'
+_ACTIVE_SYSTEM_TEMPLATE_KEY = 'prompts/active_system_template'
+_DEFAULT_SYSTEM_TEMPLATE_ID = 'custom'
+
+
+def save_system_templates(templates: list[dict]) -> None:
+    """Persist the user-defined system prompt templates.
+
+    Each item is ``{'id', 'name', 'content', 'post_history'}``; the list
+    replaces whatever was saved before.
+    """
+    clean: list[dict] = []
+    for item in templates or []:
+        if not isinstance(item, dict):
+            continue
+        tid = str(item.get('id') or '')
+        if not tid:
+            continue
+        clean.append({
+            'id': tid,
+            'name': str(item.get('name') or 'Template'),
+            'content': str(item.get('content') or ''),
+            'post_history': str(item.get('post_history') or ''),
+        })
+    _get_settings().setValue(_SYSTEM_TEMPLATES_KEY, json.dumps(clean, ensure_ascii=False))
+
+
+def load_system_templates() -> list[dict]:
+    """Return the user-defined system prompt templates (may be empty)."""
+    raw = _get_settings().value(_SYSTEM_TEMPLATES_KEY, '')
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("Corrupted system prompt template list; resetting")
+        return []
+    out: list[dict] = []
+    if isinstance(parsed, list):
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            tid = str(item.get('id') or '')
+            if not tid:
+                continue
+            out.append({
+                'id': tid,
+                'name': str(item.get('name') or 'Template'),
+                'content': str(item.get('content') or ''),
+                'post_history': str(item.get('post_history') or ''),
+            })
+    return out
+
+
+def save_active_system_template(template_id: str) -> None:
+    """Persist which system prompt template new chats use by default."""
+    _get_settings().setValue(
+        _ACTIVE_SYSTEM_TEMPLATE_KEY, str(template_id or _DEFAULT_SYSTEM_TEMPLATE_ID),
+    )
+
+
+def load_active_system_template() -> str:
+    """Return the active system prompt template id (default: 'custom')."""
+    tid = _get_settings().value(_ACTIVE_SYSTEM_TEMPLATE_KEY, '')
+    if isinstance(tid, str) and tid.strip():
+        return tid.strip()
+    return _DEFAULT_SYSTEM_TEMPLATE_ID
+
+
 def save_active_lorebooks(filenames: list[str]) -> None:
     """Persist which standalone lorebooks are injected into Test chats."""
     s = _get_settings()
@@ -588,6 +736,17 @@ def load_st_worlds_path() -> str:
     return s.value('st/worlds_path', '')
 
 
+def save_st_user_images_path(path: str) -> None:
+    """Persist the SillyTavern user-images (expression images) directory."""
+    s = _get_settings()
+    s.setValue('st/user_images_path', path)
+
+
+def load_st_user_images_path() -> str:
+    s = _get_settings()
+    return s.value('st/user_images_path', '')
+
+
 def save_st_auto_detect_done(done: bool) -> None:
     s = _get_settings()
     s.setValue('st/auto_detect_done', done)
@@ -610,6 +769,7 @@ def clear_st_settings() -> None:
     s = _get_settings()
     s.remove('st/characters_path')
     s.remove('st/worlds_path')
+    s.remove('st/user_images_path')
     s.remove('st/auto_detect_done')
 
 
@@ -653,6 +813,18 @@ def load_font_size() -> int:
     # Clamp to the same range the Font Size dialog allows so a corrupted
     # registry value can never produce a <= 0 font size downstream.
     return min(32, max(8, val))
+
+
+def save_spellcheck_enabled(enabled: bool) -> None:
+    """Persist whether text fields underline misspelled words."""
+    _get_settings().setValue('ui/spellcheck_enabled', bool(enabled))
+
+
+def load_spellcheck_enabled() -> bool:
+    """Return whether spell checking is on for editable text fields."""
+    # ``type=bool`` is required: the native Windows backend serializes
+    # booleans as "true"/"false" strings and ``bool("false") == True``.
+    return _get_settings().value('ui/spellcheck_enabled', True, type=bool)
 
 
 def save_library_selected_ids(ids: list[int]) -> None:

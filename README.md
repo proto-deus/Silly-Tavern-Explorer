@@ -10,11 +10,16 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 - **Keyboard shortcuts** — centralized registry (`src/ui/shortcuts.py`) drives all menu actions
 - **Full-screen image viewer** — zoomable, pannable dialog with Save As support (Ctrl+=/Ctrl+-/wheel)
 - **Database backup** — automatic `.bak`/`.bak2` rotation on startup when the DB has changed, plus a manual `backup()` method (File > Backup Now)
-- **Data encryption (opt-in)** — a password-protected vault (Settings > Encryption) encrypts the database, cards, thumbnails, chat sessions, lorebooks, and backups with AES-256-GCM; the app asks for the password at startup and seals the database again on exit. An optional recovery key can unlock the library if the password is forgotten. Exports and SillyTavern sync copies always stay plain text
+- **Data encryption (opt-in)** — a password-protected vault (Settings > Encryption) encrypts the database, cards, thumbnails, chat sessions, lorebooks, gallery images, and backups with AES-256-GCM; the app asks for the password at startup and seals the database again on exit. An optional recovery key can unlock the library if the password is forgotten. Exports and SillyTavern sync copies always stay plain text
 - **Duplicate scanner** — finds cards sharing the same name + creator (case-insensitive), or near-identical images via perceptual hashing; tree view with thumbnails, delete selected, or keep one and delete the rest of a group (View > Find Duplicates)
 - **Statistics dashboard** — aggregate metrics rendered as colored bars: total/avg/min/max tokens, top-10 tags, spec version distribution, creator leaderboard, and cards-added-per-week sparkline (View > Statistics)
-- **Full-library backup & restore** — File > Backup Library zips the database, all card files, chat sessions, and thumbnails into a single archive with a manifest; File > Restore Library validates and swaps a backup back in atomically, then offers to restart the app. A restore is **non-destructive**: it stages and validates everything first, honours cancellation before touching live data, moves each live directory aside instead of deleting it, and rolls back on failure. Directories the archive doesn't contain are left alone rather than wiped
-- **Library integrity check ("Doctor")** — File > Check Library audits the whole library and reports each problem with its suggested repair: cards whose file is missing, files that hold no character data any more, malformed tag values, stray files in the library folder, chat sessions belonging to deleted cards, SillyTavern links whose file has vanished, stale deletion records, API keys that can no longer be decrypted, and SQLite's own integrity check. Safe problems can be fixed in one click, and no automatic fix ever deletes a card file
+- **Full-library backup & restore** — File > Backup Library zips the database, all card files, chat sessions, thumbnails, and gallery images into a single archive with a manifest; File > Restore Library validates and swaps a backup back in atomically, then offers to restart the app. A restore is **non-destructive**: it stages and validates everything first, honours cancellation before touching live data, moves each live directory aside instead of deleting it, and rolls back on failure. Directories the archive doesn't contain are left alone rather than wiped
+- **Library integrity check ("Doctor")** — File > Check Library audits the whole library and reports each problem with its suggested repair: cards whose file is missing, files that hold no character data any more, malformed tag values, stray files in the library folder, chat sessions belonging to deleted cards, gallery entries whose image is gone or whose folder belongs to a deleted card, SillyTavern links whose file has vanished, stale deletion records, API keys that can no longer be decrypted, and SQLite's own integrity check. Safe problems can be fixed in one click, and no automatic fix ever deletes a card file
+- **Spell checking** — misspelled words in text fields are underlined in red as you type (English SymSpell dictionary); right-click an underlined word for up to five suggested corrections (undoable), **Ignore "word"**, or **Add "word" to dictionary**. SillyTavern `{{macros}}`, HTML tags, URLs, acronyms, `snake_case`, `@handles`, and filenames are never flagged. Applies to the Edit tab fields, alternate greetings, chat input, personas, author's notes, lorebook entries, prompt templates, and message-edit dialogs. Toggle via Settings > Editor ("Underline misspelled words in text fields", on by default — takes effect everywhere immediately); the personal word list lives at `~/.st-explorer/spellcheck.json`
+- **Font size** — View > Font Size... scales the whole UI (8–32 px, persisted across sessions, DPI-aware so text keeps its physical size on high-DPI displays); chat bubbles and the library grid re-flow live
+- **Status bar** — live library totals (cards, total tokens, favorites) alongside the SillyTavern status indicator and progress messages for background operations
+- **Session state restore** — window geometry, selected cards per tab, and library scroll position are restored on startup
+- **Character sidebar** — shared character picker on the Edit / Generate / Test tabs with its own sort dropdown and favorites filter
 - **Live token count** with debounced updates
 
 ### Library Tab
@@ -28,7 +33,7 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 - **Collections** — group cards into named collections (a card can belong to many); filter via the collection dropdown ("All Cards" / "No Collection" / each collection), manage via the Manage... dialog, and assign from the detail pane's Collections button
 - Toggle favorites with star indicator
 - Double-click thumbnails for full-size image view with zoom/pan
-- Export cards to PNG files
+- Export cards to PNG or JSON files (File > Export as PNG / Export as JSON)
 - **Find Duplicates** scanner — groups cards by name+creator or by image hash; delete selected or keep-one-delete-rest (View > Find Duplicates)
 - **Duplicate detection** on import
 - **Statistics** dashboard — library-wide stats with bar charts (View > Statistics)
@@ -45,9 +50,21 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 - **Undo / Redo** — whole-form snapshot history (Ctrl+Z / Ctrl+Shift+Z). Edits are coalesced into one undoable step per pause in typing, so undo crosses fields (edit the name, then the description, then undo both). The history is bounded, reseeded on every card load so undo never walks into the previous card, and the menu entries grey out when there's nothing to step to
 - **Rename file on name change** — saving with a changed character name renames the card file (and thumbnail) in the library and reloads the editor from the renamed file; the card's database id and SillyTavern link stay the same, so chat sessions and syncing are unaffected
 
+### Gallery Tab
+- **Per-character gallery** — extra images stored in the library (`gallery/<id>/`), managed per character: add images or import a whole folder, drag-and-drop image files onto the tab, drag thumbnails to reorder, per-image captions, and duplicate imports skipped by content hash
+- **SillyTavern expression images** — full management of the character's expression slots in ST's `user/images/<charName>/` folder (shared with SillyTavern): the 7 default expressions (`neutral`, `happy`, `sad`, `angry`, `surprised`, `disgusted`, `fearful`) shown as slots with visible gaps where an image is missing, plus any custom expressions found on disk; add/replace/delete per slot
+- **Lightbox viewer** — double-click any thumbnail for a full-screen view with zoom/pan and **←/→** arrow-key navigation across the images, plus Save As
+- **Set as card image** — promote any gallery or expression image to the character's portrait (card data is preserved, thumbnail regenerated)
+- **Card assets** — read-only pane listing the V3 `assets` declared by the card, with previews when the referenced file can be found next to the card or in ST's user-images folder
+- **Export** — export a single image, or the whole character's gallery plus expressions to a folder
+- Reveal any image's folder in the OS file manager; caption editing via the context menu
+
 ### Generate Tab
 - Connect to any OpenAI-compatible API (LM Studio, Ollama, OpenRouter, OpenAI, Custom)
 - **Multiple provider profiles** — each provider keeps its own base URL, API key, model, and sampling settings; switch the active provider in Settings and all generation/chat uses the selected profile
+- **Stop sequences** — per-provider custom stopping strings (Settings > LLM, comma-separated); generation halts as soon as one is produced, keeping the text before it
+- **Automatic retries** — failed requests (connection drops, timeouts, rate limits, server errors) are retried with exponential backoff honouring `Retry-After`; the attempt count is configurable per provider (0–5) and cancellation works mid-backoff
+- **Fetch Models** — pull the available model list from the endpoint into the model dropdown
 - **Generate tags** for existing characters
 - **Generate Missing Tags** — suggest only new tags not already on the card (existing tags are preserved; never replaces them)
 - Generate summaries (saved to creator notes)
@@ -67,13 +84,18 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 
 ### Test Tab
 - **Per-character chat testing**
+- **Per-chat LLM controls** — pick the model, context size, temperature, and Min-P right above the chat input; the model dropdown lists models cached from the endpoint (refresh via Settings > Fetch Models), and changes save back to the active provider profile
+- **System prompt templates** — pick the chat's main prompt per chat from the Template selector: built-in presets mirroring SillyTavern's sysprompt presets (Natural Chat, Simple Roleplay, Detailed Roleplay, Immersive Roleplay, Simple/Expert Assistant, Actor, Text Adventure, Creative/Realistic Writer, Chain of Thought, Blank) plus your own named templates with optional post-history instructions; the card's own system prompt is appended after the template ("Blank" keeps only the card's instructions), and templates are managed in Settings > Prompts > Manage Templates...
+- **Chat template compatibility** — optional per-provider "enforce alternating user/assistant roles" (Settings > LLM) for Llama 3.x / Gemma chat templates, which reject trailing system blocks and mid-history system injections; without it, a rejected request is automatically resent once with normalized roles
 - **Lorebook injection** — books from the Lorebooks tab can be toggled active via the Lorebooks button; their matching entries join the same `[World Info]` block, each book honoring its own scan depth/budget, and the selection persists across sessions
+- **Depth injections** — lorebook entries set to "at depth" (with their own depth and role) and entries at the Author's-Note positions are spliced directly into the chat history at that exact point, exactly like SillyTavern; the interleaved result is shown inline in the Context inspector
 - **Context inspector** — the Context button shows exactly what the next request will send, section by section (system prompt, world info, chat memory, each message) with per-section and total token counts against the configured context size; its Author's Note and Jailbreak tabs edit the chat's trailing prompt knobs
 - **Inline formatting** rendered in distinct colors: `"dialogue"`, `*action*`, and `_emphasis_`
 - **Per-message actions** — every bubble has Edit (reopen the message in a text dialog), Copy (to clipboard), and Delete (removes that message and everything after it); the last assistant bubble also gets a Regenerate button
 - **File attachments** — attach text files (`.txt`, `.md`, `.json`, `.csv`, code, etc.) or images (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`) to a message via the Attach button.
 - **Inline URL images** — image URLs in assistant responses are fetched asynchronously and shown as clickable thumbnails (click to open in browser)
 - **Chat memory** — a Memory dialog manages per-session memory entries (add/edit/delete), which are appended as a `[Chat memory]` bullet list to the system prompt (most recent 20 entries)
+- **Persistent attributes** — the Memory dialog also tracks watched story state that stays current through long roleplays (defaults: Setting, `{{char}}` mood, `{{char}}` clothing, Time & weather, `{{char}}` physical state, `{{user}}`-`{{char}}` relationship, Current activity, Who is present). "Auto-update each exchange" (on by default) asks the model after every reply which attributes changed and rewrites only those as short facts; "Update Attributes Now" runs the same pass over the whole conversation on demand. Rows are fully customizable — rename, add, remove, toggle per-row on/off, edit values by hand, and tune the "What To Watch For" hints. Current values are injected as a `[Persistent attributes]` block between the user persona and chat memory (SillyTavern prompt order; `{{char}}`/`{{user}}` macros in names are resolved; empty values are omitted), and everything is stored per chat session
 - **Auto-summarize** — toggle to automatically summarize each exchange into a memory entry after every assistant reply; "Summarize Now" summarizes the current conversation on demand
 - **Auto-saved chats** — each card's conversation is saved automatically (JSON files under `~/.st-explorer/sessions/`); a **Chats** button opens a popup to load, export, import, or delete saved chats (with title, message count, and timestamps), and **New Chat** starts fresh
 - **Chat export** — export any saved chat from the Chats window as `.txt`, `.json` (messages, memories, and metadata), or a SillyTavern `.jsonl` chat
@@ -94,6 +116,7 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 - **Linking** — cards can be linked to specific ST character files (by avatar URL); linked cards always sync to/from the same file (case-insensitive on Windows)
 - **Favorites sync** — favorites are stored inside the card PNG (`fav` / `data.extensions.fav`), so they travel automatically with push/pull — no special handling needed
 - **Auto-detect** — on first launch, common SillyTavern install locations are scanned; if exactly one is found, it's auto-configured
+- **Expression images** — the Gallery tab reads and writes each character's expression images directly in ST's `user/images/<charName>/` folder (plain files, so ST sees every change immediately); the folder is auto-derived from the characters path and overridable in Configure
 - **Directory watcher** — a `QFileSystemWatcher` monitors the ST characters directory and shows a status-bar message when changes are detected
 
 ## Installation
@@ -151,10 +174,11 @@ python main.py
 ### Test Chat
 1. Go to the **Test** tab
 2. Select a character from the list on the left
-3. Type a message and press Enter — responses stream back token-by-token
-4. Use **Regenerate** to redo the last reply or **Cancel** to interrupt an in-flight response
-5. Use **Attach** to add text/image files, and the **Memory** button to manage persistent memory (or toggle **Auto-Summarize**)
-6. Chats auto-save per character; use **Chats** to load, export, import, or delete past conversations
+3. Pick a system prompt template from the **Template** dropdown (Natural Chat, Simple Roleplay, ...) or keep Custom; create your own in **Settings > Prompts > Manage Templates...**
+4. Type a message and press Enter — responses stream back token-by-token
+5. Use **Regenerate** to redo the last reply or **Cancel** to interrupt an in-flight response
+6. Use **Attach** to add text/image files, and the **Memory** button to manage persistent memory (or toggle **Auto-Summarize**)
+7. Chats auto-save per character; use **Chats** to load, export, import, or delete past conversations
 
 ### SillyTavern Sync
 1. Go to **SillyTavern > Configure** and set the path to your SillyTavern `characters/` directory (e.g. `C:\SillyTavern\data\default-user\characters`), or use Auto-Detect
@@ -216,22 +240,26 @@ ST Explorer supports the SillyTavern character card specification:
 
 When saving, both V2 and V3 chunks are written for maximum compatibility.
 
+**Round-trip safety** — saving never drops data: unmodeled V2/V3 fields (`nickname`, `assets`, `group_only_greetings`, `creator_notes_multilingual`, `avatar`, `chat`, `create_date`, ...), extensions, and SillyTavern-specific lorebook entry fields are preserved untouched through edit → save → reload.
+
 ## Data Storage
 
 - Library database: `~/.st-explorer/library.db` (SQLite)
 - Card files: `~/.st-explorer/library/`
 - Thumbnails: `~/.st-explorer/thumbnails/`
+- Gallery images: `~/.st-explorer/gallery/<character_id>/`
 - AI-generated cards: `~/.st-explorer/generated/`
 - Standalone lorebooks: `~/.st-explorer/lorebooks/*.json`
 - Chat sessions: `~/.st-explorer/sessions/` (one JSON file per card per session)
 - Application log: `~/.st-explorer/app.log`
+- Spell-check word list: `~/.st-explorer/spellcheck.json` (words added to / ignored by the personal dictionary)
 - Lorebook sync baseline: `~/.st-explorer/lorebook_sync_state.json`
 - API-key encryption key (macOS/Linux only): `~/.st-explorer/secret.key` (created on first save, owner-only permissions)
 - Data-encryption envelope: `~/.st-explorer/vault.json` (when encryption is enabled)
 
 ### Data encryption at rest
 
-When **Settings > Encryption > Enable** is used, everything under `~/.st-explorer` (database, cards, thumbnails, sessions, lorebooks, generated cards, sync baseline, and the local `.bak` backups) is encrypted with AES-256-GCM under a random master key. The master key is wrapped by a key derived from your password (Scrypt) and stored in `vault.json`, so changing the password is instant and never re-encrypts files. An optional recovery key provides a second way to unwrap the master key.
+When **Settings > Encryption > Enable** is used, everything under `~/.st-explorer` (database, cards, thumbnails, sessions, lorebooks, gallery images, generated cards, sync baseline, and the local `.bak` backups) is encrypted with AES-256-GCM under a random master key. The master key is wrapped by a key derived from your password (Scrypt) and stored in `vault.json`, so changing the password is instant and never re-encrypts files. An optional recovery key provides a second way to unwrap the master key.
 
 - At startup the app asks for the password (or recovery key) before opening the database; the database file is decrypted in place for the session and re-sealed when the app exits.
 - Files are encrypted on disk at all times and decrypted in memory on use; filenames remain visible in the session/library folders.
@@ -248,7 +276,7 @@ Settings are stored by QSettings' native backend per platform:
 | macOS    | `~/Library/Preferences/com.stexplorer.stexplorer.plist` |
 | Linux    | `~/.config/STExplorer/STExplorer.ini` |
 
-This includes `st/characters_path` for the SillyTavern directory and `st/worlds_path` for the world-info (lorebooks) directory. Encrypted API keys live alongside them (`dpapi1:`-prefixed blobs on Windows, `fernet1:`-prefixed tokens elsewhere).
+This includes `st/characters_path` for the SillyTavern directory, `st/worlds_path` for the world-info (lorebooks) directory, and `st/user_images_path` for the expression-images directory. Encrypted API keys live alongside them (`dpapi1:`-prefixed blobs on Windows, `fernet1:`-prefixed tokens elsewhere).
 
 ## Platform Support
 
@@ -263,3 +291,40 @@ This includes `st/characters_path` for the SillyTavern directory and `st/worlds_
 | Atomic writes | Retry transient locks | Direct replace | Direct replace |
 
 Keyboard shortcuts use the platform modifier automatically (Qt maps Ctrl to Cmd on macOS).
+
+## Development
+
+### Setup & tests
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+```
+
+Run the test suite headless (as CI does):
+
+```bash
+# Linux/macOS
+QT_QPA_PLATFORM=offscreen python -m pytest -q
+
+# Windows PowerShell
+$env:QT_QPA_PLATFORM='offscreen'; python -m pytest -q
+```
+
+Lint with `ruff check .` (the rule set lives in `pyproject.toml`).
+
+### Building a standalone executable
+
+```bash
+powershell -File scripts/build.ps1
+# or: pyinstaller build.spec --noconfirm
+```
+
+Produces `dist/STExplorer.exe` with the tiktoken cache, the spell-check dictionary, and the icons bundled so the build works fully offline. The app icon is generated by `python scripts/make_icon.py` (no external assets needed).
+
+### Maintenance scripts
+
+- `python scripts/fix_card_filenames.py` — retro-fits libraries from older versions by renaming card files (and thumbnails) to match their character names. Dry-run preview by default; `--apply` performs the renames; a database backup is written first; safe to re-run.
+
+### Continuous integration
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request: the pytest suite on Python 3.11/3.12 across Ubuntu and Windows (Qt offscreen), `ruff check .`, and a frozen-build smoke test that builds the PyInstaller binary on both platforms.

@@ -24,7 +24,6 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -55,15 +54,21 @@ from src.chat_builder import (
 )
 from src.chat_sessions import (
     ChatSessionStore,
+    apply_attribute_updates,
     auto_title,
+    default_attributes,
     drop_memories_from,
     new_memory_entry,
+    normalize_attributes,
     normalize_author_note,
     normalize_memories,
+    parse_attribute_updates,
+    session_flags,
 )
 from src.database import LibraryDatabase
 from src import lorebook_store
 from src import st_chat_io
+from src.prompt_templates import active_template_id, all_templates, resolve_template
 from src.settings_manager import (
     get_persona,
     load_active_lorebooks,
@@ -71,20 +76,17 @@ from src.settings_manager import (
     load_active_persona_id,
     load_font_size,
     load_macro_settings,
-    load_personas,
     load_provider_models,
     load_test_settings,
     save_active_lorebooks,
-    save_active_persona_id,
     save_active_sampling,
-    save_personas,
 )
 from src.token_counter import count_tokens
+from src.ui.spell_check import SpellCheckTextEdit
 from src.ui.widgets.chat_bubble import MessageBubble
 from src.ui.widgets.context_inspector_dialog import ContextInspectorDialog
 from src.ui.widgets.edit_message_dialog import TextEditDialog
 from src.ui.widgets.memory_dialog import MemoryDialog
-from src.ui.widgets.persona_dialog import PersonaDialog
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +124,18 @@ def _resolve_export_format(path: str, selected_filter: str) -> tuple[str, str]:
     if not p.suffix or p.suffix.lower() in _EXPORT_EXTENSIONS:
         path = str(p.with_suffix(ext))
     return path, ext.lstrip('.')
+
+
+def _safe_variant_pos(value, default: int) -> int:
+    """Coerce a stored ``variant_pos`` to int, falling back to *default*.
+
+    Session JSON is user-editable; a non-numeric value here used to raise
+    inside a Qt slot, which aborts the whole process.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 class _ChatWorker(QThread):
@@ -368,7 +382,7 @@ class _LorebookSelectDialog(QDialog):
         ]
 
 
-class ChatInputEdit(QTextEdit):
+class ChatInputEdit(SpellCheckTextEdit):
     """Multi-line message input: plain Enter sends, Shift+Enter adds a line."""
 
     send_requested = pyqtSignal()
@@ -401,13 +415,16 @@ class TestTab(QWidget):
         self._summarize_worker: _SummarizeWorker | None = None
         self._generating = False
         self._at_bottom = True
+        # True while _render_history tears down/rebuilds the bubbles, so the
+        # scrollbar's intermediate range changes don't trigger follow/scroll.
+        self._rebuilding = False
 
         self._current_id: int | None = None
         self._card: CharacterCard | None = None
         self._session_id: str | None = None
         self._messages: list[dict[str, str]] = []
         self._memories: list[dict] = []
-        self._auto_summarize = False
+        self._auto_summarize = True
         self._summarize_source = 'summary'
         self._summarize_end_index: int | None = None
         self._summarize_char_id: int | None = None
@@ -415,16 +432,24 @@ class TestTab(QWidget):
         self._summarize_prefix = ''
         self._summarize_quiet = False
         self._memory_dialog: MemoryDialog | None = None
+        self._attributes: list[dict] = []
+        self._auto_update_attributes = True
+        self._attr_worker: _SummarizeWorker | None = None
+        self._attr_char_id: int | None = None
+        self._attr_session_id: str | None = None
+        self._attr_quiet = True
         self._bubbles: list[MessageBubble] = []
         self._stream_bubble: MessageBubble | None = None
         self._pending_attachments: list[dict] = []
         self._greeting_index = 0
         # SillyTavern-style per-chat prompt knobs (persisted per session):
-        # Author's Note injection, user jailbreak block, active persona.
+        # Author's Note injection, user jailbreak block, active persona,
+        # and the system prompt template.
         self._author_note: dict = normalize_author_note(None)
         self._jailbreak = ''
         self._persona_id = load_active_persona_id()
         self._persona = get_persona(self._persona_id).get('text', '')
+        self._system_template: str = active_template_id()
         # How the next response is applied (see _ChatWorker.mode).
         self._response_mode = 'assistant'
         # Number of leading messages already covered by a rolling summary.
@@ -464,6 +489,9 @@ class TestTab(QWidget):
         self._reload_extra_books()
 
         self._build_ui()
+        # The Auto-Summarize button starts unchecked like every QPushButton;
+        # mirror the (on-by-default) flag onto it before anything is shown.
+        self._sync_auto_toggle()
         self._set_inputs_enabled(False)
 
     # ---- configuration ----
@@ -475,6 +503,8 @@ class TestTab(QWidget):
         macro = load_macro_settings()
         self._user_name = macro.get('user_name') or 'User'
         self._custom_macros = macro.get('macros') or {}
+        # The active persona is global (Settings -> Macros); always follow it.
+        self._persona_id = load_active_persona_id()
         self._persona = get_persona(self._persona_id).get('text', '')
 
     def _reload_test_settings(self) -> None:
@@ -502,6 +532,8 @@ class TestTab(QWidget):
         self._set_sampling_widgets(
             self._preset.temperature, self._preset.min_p, self._preset.context_size,
         )
+        # Templates may have been created/edited in Settings > Prompts.
+        self._populate_template_combo()
         self._render_history()
 
     def _assemble_system(self) -> str:
@@ -509,9 +541,10 @@ class TestTab(QWidget):
 
         Layers (SillyTavern order, see ``chat_builder.system_prompt_blocks``):
         main prompt -> world info -> description/personality/scenario ->
-        user persona -> chat memory, plus the example dialogue block when the
-        placement setting keeps it in the system prompt.  The context
-        inspector shares these blocks so the two can never drift apart.
+        user persona -> persistent attributes -> chat memory, plus the
+        example dialogue block when the placement setting keeps it in the
+        system prompt.  The context inspector shares these blocks so the two
+        can never drift apart.
         """
         if self._card is None:
             return ''
@@ -521,7 +554,9 @@ class TestTab(QWidget):
             user_name=self._user_name,
             persona=self._persona,
             memories=self._memories,
+            attributes=self._attributes,
             custom_macros=self._custom_macros,
+            chat_template=resolve_template(self._system_template).content,
             extra_books=self._extra_books,
         )
         if self._example_placement == 'system':
@@ -545,10 +580,24 @@ class TestTab(QWidget):
         )
 
     def _post_history_text(self) -> str:
-        """Macro-substituted post-history instructions (may be empty)."""
-        if self._card is None:
-            return ''
-        return post_history_text(self._card, self._user_name, self._custom_macros)
+        """Trailing instructions for the request (may be empty).
+
+        The card's ``post_history_instructions`` first, then the selected
+        template's own post-history text (SillyTavern sysprompt presets carry
+        one), both macro-substituted.
+        """
+        parts = []
+        if self._card is not None:
+            card_phi = post_history_text(self._card, self._user_name, self._custom_macros)
+            if card_phi:
+                parts.append(card_phi)
+        tpl_phi = resolve_template(self._system_template).post_history.strip()
+        if tpl_phi:
+            parts.append(substitute_macros(
+                tpl_phi, self._user_name,
+                self._card.name if self._card else '', self._custom_macros,
+            ))
+        return '\n\n'.join(parts)
 
     def _jailbreak_text(self) -> str:
         """Macro-substituted user jailbreak block (may be empty)."""
@@ -654,12 +703,6 @@ class TestTab(QWidget):
         )
         self._lore_btn.clicked.connect(self._on_lorebooks)
         toolbar_row.addWidget(self._lore_btn)
-        self._persona_btn = QPushButton('Persona')
-        self._persona_btn.setToolTip(
-            'Manage named {{user}} personas and pick the one for this chat.'
-        )
-        self._persona_btn.clicked.connect(self._on_persona)
-        toolbar_row.addWidget(self._persona_btn)
         self._context_btn = QPushButton('Context')
         self._context_btn.setToolTip(
             'Inspect the exact context the next request will send.\n'
@@ -767,6 +810,21 @@ class TestTab(QWidget):
         settings_row = QHBoxLayout()
         settings_row.setContentsMargins(8, 2, 8, 8)
         small_style = 'color: #777;'
+        tpl_label = QLabel('Template')
+        tpl_label.setStyleSheet(small_style)
+        settings_row.addWidget(tpl_label)
+        self._template_combo = QComboBox()
+        self._template_combo.setMinimumWidth(150)
+        self._template_combo.setToolTip(
+            'System prompt template for this chat (the main prompt).\n'
+            'The card\'s own system prompt is appended after it; "Blank" '
+            'keeps only the card\'s instructions.\n'
+            'Templates are created and edited in Settings > Prompts > '
+            'Manage Templates...'
+        )
+        self._populate_template_combo()
+        self._template_combo.currentIndexChanged.connect(self._on_template_changed)
+        settings_row.addWidget(self._template_combo)
         model_label = QLabel('Model')
         model_label.setStyleSheet(small_style)
         settings_row.addWidget(model_label)
@@ -837,7 +895,7 @@ class TestTab(QWidget):
             self._new_session_btn, self._sessions_btn, self._memory_btn,
             self._context_btn, self._auto_summarize_btn,
             self._impersonate_btn, self._continue_btn,
-            self._persona_btn, self._lore_btn,
+            self._lore_btn,
         ]
 
     def _set_inputs_enabled(self, enabled: bool) -> None:
@@ -903,16 +961,26 @@ class TestTab(QWidget):
         self._memories = normalize_memories(data)
         self._summarized_through = 0
         self._regen_bump = 0
-        # Restore the persisted Auto-Summarize toggle for this session.
-        self._auto_summarize = bool(data.get('auto_summarize', False))
+        # Restore the persisted Auto-Summarize / Auto-update toggles; chats
+        # saved before the flags were persisted faithfully come back ON.
+        self._auto_summarize, self._auto_update_attributes = session_flags(data)
+        # Sessions saved before persistent attributes existed get the default
+        # watched list so the tracker works out of the box; an explicit (even
+        # empty) saved list is respected as-is.
+        if data.get('attributes') is None:
+            self._attributes = default_attributes()
+        else:
+            self._attributes = normalize_attributes(data)
         self._author_note = normalize_author_note(data.get('author_note'))
         self._jailbreak = data.get('jailbreak') or ''
-        self._persona_id = data.get('persona_id') or load_active_persona_id()
+        self._persona_id = load_active_persona_id()
         self._persona = get_persona(self._persona_id).get('text', '')
+        self._system_template = data.get('system_template') or active_template_id()
         self._sync_auto_toggle()
         self._update_memory_button()
         self._refresh_memory_dialog()
         self._update_prompt_buttons()
+        self._sync_template_combo()
         self._at_bottom = True
         self._render_history()
 
@@ -920,6 +988,8 @@ class TestTab(QWidget):
         self._session_id = ChatSessionStore.new_session_id()
         self._messages = []
         self._memories = []
+        self._attributes = default_attributes()
+        self._auto_update_attributes = True
         self._greeting_index = 0
         self._summarized_through = 0
         self._regen_bump = 0
@@ -927,9 +997,11 @@ class TestTab(QWidget):
         self._jailbreak = ''
         self._persona_id = load_active_persona_id()
         self._persona = get_persona(self._persona_id).get('text', '')
+        self._system_template = active_template_id()
         self._sync_auto_toggle()
         self._update_memory_button()
         self._update_prompt_buttons()
+        self._sync_template_combo()
         if self._include_first and self._card is not None and self._card.first_mes:
                 self._messages = build_initial_messages(
                     self._card, self._user_name, custom_macros=self._custom_macros,
@@ -938,14 +1010,39 @@ class TestTab(QWidget):
         self._render_history()
 
     def _update_prompt_buttons(self) -> None:
-        """Reflect note/jailbreak/persona state on their toolbar buttons."""
+        """Reflect note/jailbreak state on their toolbar button."""
         if getattr(self, '_context_btn', None) is not None:
             has_note = bool((self._author_note.get('text') or '').strip())
             has_jb = bool(self._jailbreak.strip())
             self._context_btn.setText('Context*' if (has_note or has_jb) else 'Context')
-        if getattr(self, '_persona_btn', None) is not None:
-            name = get_persona(self._persona_id).get('name', '') or 'Persona'
-            self._persona_btn.setText(f'Persona: {name}')
+
+    def _populate_template_combo(self) -> None:
+        """Fill the template combo and select this chat's template."""
+        combo = getattr(self, '_template_combo', None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        for tpl in all_templates():
+            combo.addItem(tpl.name, tpl.id)
+        idx = combo.findData(self._system_template)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _sync_template_combo(self) -> None:
+        """Re-select this chat's template (after a session switch)."""
+        self._populate_template_combo()
+
+    def _on_template_changed(self, index: int) -> None:
+        combo = getattr(self, '_template_combo', None)
+        if combo is None:
+            return
+        template_id = combo.itemData(index)
+        if not template_id or template_id == self._system_template:
+            return
+        self._system_template = str(template_id)
+        self._save_current_session()
+        self._update_token_label()
 
     def _on_new_session(self) -> None:
         if self._current_id is None:
@@ -997,10 +1094,13 @@ class TestTab(QWidget):
                 self._session_id = ChatSessionStore.new_session_id()
                 self._messages = []
                 self._memories = []
+                self._attributes = default_attributes()
+                self._auto_update_attributes = True
                 self._render_history()
                 self._update_token_label()
                 self._sync_auto_toggle()
                 self._update_memory_button()
+                self._refresh_memory_dialog()
 
     def _on_settings(self) -> None:
         self._flush_sampling_sync()
@@ -1046,24 +1146,6 @@ class TestTab(QWidget):
         save_active_lorebooks(selected)
         self._reload_extra_books()
         self._update_token_label()
-
-    # ---- SillyTavern prompt knobs (persona; note/jailbreak live in Context) ----
-
-    def _on_persona(self) -> None:
-        dlg = PersonaDialog(load_personas(), self._persona_id, self)
-        accepted = dlg.exec() == QDialog.DialogCode.Accepted
-        personas = dlg.personas()
-        selected = dlg.selected_id()
-        dlg.deleteLater()
-        if not accepted:
-            return
-        save_personas(personas)
-        self._persona_id = selected
-        save_active_persona_id(selected)
-        self._persona = get_persona(selected).get('text', '')
-        self._update_prompt_buttons()
-        self._update_token_label()
-        self._save_current_session()
 
     # ---- chat rendering ----
 
@@ -1175,31 +1257,98 @@ class TestTab(QWidget):
         self._bubbles.append(bubble)
         return bubble
 
-    def _render_history(self) -> None:
-        self._clear_bubbles()
-        last_assistant_idx = -1
-        for i, msg in enumerate(self._messages):
-            if msg.get('role') == 'assistant':
-                last_assistant_idx = i
-        for i, msg in enumerate(self._messages):
-            is_last_assistant = (
-                msg.get('role') == 'assistant' and i == last_assistant_idx
-            )
-            if i == 0 and self._should_show_greeting_selector():
-                self._add_greeting_selector()
-            variants = msg.get('variants') or []
-            pos = int(msg.get('variant_pos', len(variants) - 1) or 0)
-            self._add_bubble(
-                i, msg,
-                show_regenerate=is_last_assistant,
-                show_variant_back=is_last_assistant and pos > 0,
-                # ▶ always rides the latest assistant bubble: steps forward
-                # through tries, or (labelled New) generates past the newest.
-                show_variant_forward=is_last_assistant,
-                variant_forward_new=is_last_assistant and pos >= len(variants) - 1,
-            )
+    @staticmethod
+    def _variant_flags(msg: dict, is_last_assistant: bool) -> dict:
+        """Footer flags for *msg* (regenerate/variant controls).
+
+        They ride only the newest assistant message:  steps forward through
+        tries, or (labelled New) generates past the newest.
+        """
+        variants = msg.get('variants') or []
+        if not isinstance(variants, (list, tuple)):
+            variants = []
+        pos = _safe_variant_pos(msg.get('variant_pos'), len(variants) - 1)
+        return {
+            'show_regenerate': is_last_assistant,
+            'show_variant_back': is_last_assistant and pos > 0,
+            'show_variant_forward': is_last_assistant,
+            'variant_forward_new': is_last_assistant and pos >= len(variants) - 1,
+        }
+
+    def _drop_stream_bubble(self) -> None:
+        """Remove the streaming placeholder now that its message has landed."""
+        bubble = self._stream_bubble
+        self._stream_bubble = None
+        if bubble is None:
+            return
+        if bubble in self._bubbles:
+            self._bubbles.remove(bubble)
+        self._bubble_layout.removeWidget(bubble)
+        bubble.setParent(None)
+        bubble.deleteLater()
+
+    def _append_message_tail(self) -> None:
+        """Show the newest message without rebuilding the whole chat.
+
+        Sending and new replies only change the tail of the conversation, so
+        appending one bubble replaces the O(n) teardown/rebuild that made long
+        chats lag (and flash white) every time a message landed.
+        """
+        index = len(self._messages) - 1
+        if index < 0 or len(self._bubbles) != index:
+            # Out of sync (e.g. a leftover streaming placeholder): rebuild.
+            self._render_history()
+            return
+        msg = self._messages[index]
+        is_last_assistant = msg.get('role') == 'assistant'
+        if is_last_assistant:
+            # Retire the regenerate/variant buttons on the assistant message
+            # that held them until now (they ride the newest reply only).
+            for i in range(index - 1, -1, -1):
+                if self._messages[i].get('role') == 'assistant':
+                    self._bubbles[i].clear_actions()
+                    break
+        self._add_bubble(index, msg, **self._variant_flags(msg, is_last_assistant))
         self._update_token_label()
         self._maybe_scroll_to_bottom()
+
+    def _render_history(self) -> None:
+        bar = self._chat_scroll.verticalScrollBar()
+        scroll_pos = bar.value()
+        follow_bottom = self._at_bottom and self._auto_scroll
+        # Repaints stay off for the teardown/rebuild: otherwise the emptied
+        # viewport paints a blank frame first, so every re-render made the
+        # chat flash white and long chats stuttered while widgets churned.
+        self._rebuilding = True
+        self._chat_scroll.setUpdatesEnabled(False)
+        try:
+            self._clear_bubbles()
+            last_assistant_idx = -1
+            for i, msg in enumerate(self._messages):
+                if msg.get('role') == 'assistant':
+                    last_assistant_idx = i
+            for i, msg in enumerate(self._messages):
+                is_last_assistant = (
+                    msg.get('role') == 'assistant' and i == last_assistant_idx
+                )
+                if i == 0 and self._should_show_greeting_selector():
+                    self._add_greeting_selector()
+                self._add_bubble(i, msg, **self._variant_flags(msg, is_last_assistant))
+            self._bubble_layout.activate()
+        finally:
+            self._rebuilding = False
+            self._chat_scroll.setUpdatesEnabled(True)
+        self._update_token_label()
+        if follow_bottom:
+            self._scroll_to_bottom()
+        elif scroll_pos > 0:
+            # Keep the reader's place: clearing the bubbles clamps the
+            # scrollbar, so restore once the rebuilt layout has settled.
+            def _restore() -> None:
+                bar.setValue(min(scroll_pos, bar.maximum()))
+                self._update_at_bottom(bar.value())
+
+            QTimer.singleShot(0, _restore)
 
     def _append_error(self, text: str) -> None:
         short = text.splitlines()[0] if text else 'Unknown error'
@@ -1237,6 +1386,7 @@ class TestTab(QWidget):
             self._card,
             self._messages,
             memories=self._memories,
+            attributes=self._attributes,
             user_name=self._user_name,
             custom_macros=self._custom_macros,
             persona=self._persona,
@@ -1254,11 +1404,17 @@ class TestTab(QWidget):
             self._token_label.setText(f'{total:,} tokens')
 
     def _update_at_bottom(self, value: int) -> None:
+        if self._rebuilding:
+            # Intermediate values while bubbles are torn down would fake a
+            # "pinned to bottom" state and yank the scroll position.
+            return
         bar = self._chat_scroll.verticalScrollBar()
         self._at_bottom = value >= bar.maximum() - 8
 
     def _follow_if_at_bottom(self, _minimum: int, _maximum: int) -> None:
         """Keep following new content while pinned to the bottom."""
+        if self._rebuilding:
+            return
         if self._at_bottom:
             self._scroll_to_bottom()
 
@@ -1290,7 +1446,7 @@ class TestTab(QWidget):
         self._refresh_attachment_chips()
         self._input.clear()
         self._regen_bump = 0
-        self._render_history()
+        self._append_message_tail()
         self._save_current_session()
         self._start_generation()
 
@@ -1451,11 +1607,14 @@ class TestTab(QWidget):
             self._messages[-1]['variant_pos'] = len(tried) - 1
             self._regen_tried = None
             self._regen_replaced = None
-        self._render_history()
+        self._drop_stream_bubble()
+        self._append_message_tail()
         self._finish_generation()
         self._save_current_session()
         if role == 'assistant' and self._auto_summarize:
             self._start_summarize(self._last_exchange_text(), source='auto')
+        if role == 'assistant' and self._auto_update_attributes and self._attributes:
+            self._start_attribute_update(self._last_exchange_text())
 
     def _append_continuation(self, text: str) -> None:
         """Extend the last assistant message with a Continue result."""
@@ -1513,7 +1672,11 @@ class TestTab(QWidget):
                     signal.disconnect(slot)
                 except (TypeError, RuntimeError):
                     pass   # never connected, or the object is already gone
-        self._stream_bubble = None
+        # Remove the streaming placeholder widget too: only _on_response
+        # dropped it before, so cancelling a generation left a phantom
+        # bubble on screen (and one more bubble than messages) until some
+        # later action happened to rebuild the history.
+        self._drop_stream_bubble()
         restored = self._restore_interrupted_response()
         self._send_btn.setEnabled(True)
         self._input.setEnabled(True)
@@ -1592,8 +1755,8 @@ class TestTab(QWidget):
         """Update a message's content, keeping its alternate list in sync."""
         msg['content'] = text
         variants = msg.get('variants')
-        if variants is not None:
-            pos = int(msg.get('variant_pos', 0) or 0)
+        if isinstance(variants, list):
+            pos = _safe_variant_pos(msg.get('variant_pos'), 0)
             if 0 <= pos < len(variants):
                 variants[pos] = text
 
@@ -1635,7 +1798,9 @@ class TestTab(QWidget):
         msg = self._messages[index] if 0 <= index < len(self._messages) else None
         if msg is not None:
             variants = msg.get('variants') or []
-            pos = int(msg.get('variant_pos', len(variants) - 1) or 0)
+            if not isinstance(variants, (list, tuple)):
+                variants = []
+            pos = _safe_variant_pos(msg.get('variant_pos'), len(variants) - 1)
             if pos < len(variants) - 1:
                 # An older response is showing; step toward the newest.
                 self._navigate_variant(index, 1)
@@ -1650,9 +1815,9 @@ class TestTab(QWidget):
             return
         msg = self._messages[index]
         variants = msg.get('variants')
-        if not variants:
+        if not isinstance(variants, list) or not variants:
             return
-        pos = int(msg.get('variant_pos', len(variants) - 1) or 0)
+        pos = _safe_variant_pos(msg.get('variant_pos'), len(variants) - 1)
         new_pos = max(0, min(pos + step, len(variants) - 1))
         if new_pos == pos:
             return
@@ -1749,21 +1914,32 @@ class TestTab(QWidget):
         if self._memory_dialog is not None:
             self._memory_dialog.set_memories(self._memories)
             self._memory_dialog.set_auto_summarize(self._auto_summarize)
+            self._memory_dialog.set_attributes(self._attributes)
+            self._memory_dialog.set_auto_update_attributes(self._auto_update_attributes)
 
     def _on_auto_summarize_toggled(self, checked: bool) -> None:
         self._auto_summarize = bool(checked)
         self._save_current_session()
-        if self._memory_dialog is not None:
-            self._memory_dialog.set_auto_summarize(self._auto_summarize)
+        # Mirror into both controls so the toolbar button and the Memories
+        # checkbox always show the same state, whichever one was clicked.
+        self._sync_auto_toggle()
 
     def _on_memory(self) -> None:
         if self._current_id is None:
             return
         if self._memory_dialog is None:
-            self._memory_dialog = MemoryDialog(self._memories, self._auto_summarize, self)
+            self._memory_dialog = MemoryDialog(
+                self._memories, self._auto_summarize,
+                self._attributes, self._auto_update_attributes, self,
+            )
             self._memory_dialog.memories_changed.connect(self._on_memories_changed)
             self._memory_dialog.summarize_requested.connect(self._on_summarize_now)
             self._memory_dialog.auto_summarize_changed.connect(self._on_auto_summarize_toggled)
+            self._memory_dialog.attributes_changed.connect(self._on_attributes_changed)
+            self._memory_dialog.update_attributes_requested.connect(self._on_update_attributes_now)
+            self._memory_dialog.auto_update_attributes_changed.connect(
+                self._on_auto_update_attributes_toggled,
+            )
         else:
             self._refresh_memory_dialog()
         self._memory_dialog.show()
@@ -1780,10 +1956,12 @@ class TestTab(QWidget):
             return
 
         def plan_factory(author_note: dict, jailbreak: str):
-            return build_context_plan(
+            template = resolve_template(self._system_template)
+            plan = build_context_plan(
                 self._card,
                 self._messages,
                 memories=self._memories,
+                attributes=self._attributes,
                 user_name=self._user_name,
                 custom_macros=self._custom_macros,
                 persona=self._persona,
@@ -1791,7 +1969,15 @@ class TestTab(QWidget):
                 example_placement=self._example_placement,
                 author_note=author_note,
                 jailbreak=jailbreak,
+                chat_template=template.content,
+                template_post_history=template.post_history,
             )
+            if plan.sections and template.name:
+                # Show which template the main prompt came from.
+                first = plan.sections[0]
+                if first.title == 'System Prompt':
+                    first.title = f'System Prompt ({template.name})'
+            return plan
 
         dialog = ContextInspectorDialog(
             plan_factory(self._author_note, self._jailbreak),
@@ -1933,6 +2119,92 @@ class TestTab(QWidget):
         short = error.splitlines()[0] if error else 'Unknown error'
         QMessageBox.critical(self, 'Summarize Error', short)
 
+    # ---- persistent attributes ----
+
+    def _start_attribute_update(self, text: str, quiet: bool = True) -> bool:
+        """Re-derive persistent attributes from *text*.  Returns True when started.
+
+        *quiet* (per-turn auto-update) only logs failures; an explicit
+        "Update Attributes Now" run reports them in a popup.
+        """
+        if (
+            self._attr_worker is not None
+            or not text.strip()
+            or not any(a.get('enabled', True) for a in self._attributes)
+        ):
+            return False
+        from src.ai_prompts import build_attribute_update_prompts
+        system, user = build_attribute_update_prompts(self._attributes, text)
+        client = AIClient(self._effective_preset())
+        # Identity tag: results must not land in another card's session if
+        # the user switches cards while the request is in flight.
+        self._attr_char_id = self._current_id
+        self._attr_session_id = self._session_id
+        self._attr_quiet = quiet
+        self._set_updating_attributes(True)
+        self._attr_worker = _SummarizeWorker(client, system, user, self)
+        self._attr_worker.completed.connect(self._on_attribute_update)
+        self._attr_worker.error.connect(self._on_attribute_update_error)
+        # Cleanup on the built-in signal so cancelled runs are still deleted.
+        self._attr_worker.finished.connect(self._attr_worker.deleteLater)
+        self._attr_worker.start()
+        return True
+
+    def _set_updating_attributes(self, active: bool) -> None:
+        if self._memory_dialog is not None:
+            self._memory_dialog.set_updating_attributes(active)
+
+    @pyqtSlot(str)
+    def _on_attribute_update(self, result: str) -> None:
+        self._attr_worker = None
+        self._set_updating_attributes(False)
+        if (self._attr_char_id != self._current_id
+                or self._attr_session_id != self._session_id):
+            logger.info("Discarding stale attribute update for card %s", self._attr_char_id)
+            return
+        updates = parse_attribute_updates(
+            result,
+            [a.get('name', '') for a in self._attributes if a.get('enabled', True)],
+        )
+        if not updates:
+            if not getattr(self, '_attr_quiet', True):
+                self.status_message.emit('No attribute changes.', 3000)
+            return
+        self._attributes = apply_attribute_updates(self._attributes, updates)
+        self._save_current_session()
+        self._update_token_label()
+        self._refresh_memory_dialog()
+        self.status_message.emit('Attributes updated.', 3000)
+
+    @pyqtSlot(str)
+    def _on_attribute_update_error(self, error: str) -> None:
+        self._attr_worker = None
+        self._set_updating_attributes(False)
+        if getattr(self, '_attr_quiet', True):
+            logger.warning(
+                "Background attribute update failed: %s",
+                error.splitlines()[0] if error else error,
+            )
+            return
+        short = error.splitlines()[0] if error else 'Unknown error'
+        QMessageBox.critical(self, 'Attribute Update Error', short)
+
+    def _on_update_attributes_now(self) -> None:
+        conversation = self._conversation_text().strip()
+        if not conversation:
+            self.status_message.emit('Nothing to update attributes from.', 3000)
+            return
+        self._start_attribute_update(conversation, quiet=False)
+
+    def _on_attributes_changed(self, attributes: list) -> None:
+        self._attributes = [dict(a) for a in attributes]
+        self._save_current_session()
+        self._update_token_label()
+
+    def _on_auto_update_attributes_toggled(self, checked: bool) -> None:
+        self._auto_update_attributes = bool(checked)
+        self._save_current_session()
+
     # ---- export ----
 
     def _on_export_session(self, session_id: str, parent: QWidget | None = None) -> None:
@@ -1965,6 +2237,8 @@ class TestTab(QWidget):
                     'title': title,
                     'memories': memories,
                     'auto_summarize': bool(data.get('auto_summarize', False)),
+                    'attributes': normalize_attributes(data),
+                    'auto_update_attributes': bool(data.get('auto_update_attributes', False)),
                     'author_note': author_note,
                     'jailbreak': jailbreak,
                     'messages': messages,
@@ -2019,6 +2293,8 @@ class TestTab(QWidget):
         self._session_id = ChatSessionStore.new_session_id()
         self._messages = messages
         self._memories = []
+        self._attributes = default_attributes()
+        self._auto_update_attributes = True
         self._greeting_index = 0
         self._summarized_through = 0
         self._regen_bump = 0
@@ -2026,9 +2302,11 @@ class TestTab(QWidget):
         self._jailbreak = ''
         self._persona_id = load_active_persona_id()
         self._persona = get_persona(self._persona_id).get('text', '')
+        self._system_template = active_template_id()
         self._sync_auto_toggle()
         self._update_memory_button()
         self._update_prompt_buttons()
+        self._sync_template_combo()
         self._at_bottom = True
         self._render_history()
         self._save_current_session()
@@ -2043,10 +2321,13 @@ class TestTab(QWidget):
         self._store.save_session(
             self._current_id, self._session_id, title, self._messages,
             memories=self._memories,
+            attributes=self._attributes,
             auto_summarize=self._auto_summarize,
+            auto_update_attributes=self._auto_update_attributes,
             author_note=self._author_note,
             jailbreak=self._jailbreak,
             persona_id=self._persona_id,
+            system_template=self._system_template,
         )
 
     def refresh_font_size(self) -> None:
@@ -2087,6 +2368,13 @@ class TestTab(QWidget):
             try:
                 self._summarize_worker.cancel()
                 if not self._summarize_worker.wait(timeout_ms):
+                    return False
+            except RuntimeError:
+                pass
+        if self._worker_is_alive(self._attr_worker):
+            try:
+                self._attr_worker.cancel()
+                if not self._attr_worker.wait(timeout_ms):
                     return False
             except RuntimeError:
                 pass

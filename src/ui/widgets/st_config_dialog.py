@@ -19,12 +19,15 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from src.gallery_store import resolve_user_images_dir
 from src.lorebook_sync import resolve_worlds_dir
 from src.settings_manager import (
     load_st_characters_path,
+    load_st_user_images_path,
     load_st_worlds_path,
     clear_st_settings,
-save_st_characters_path,
+    save_st_characters_path,
+    save_st_user_images_path,
     save_st_worlds_path,
 )
 from src.sillytavern_sync import detect_st_installs
@@ -32,21 +35,24 @@ from src.sillytavern_sync import detect_st_installs
 logger = logging.getLogger(__name__)
 
 
-def _example_paths() -> tuple[str, str]:
-    """Return OS-appropriate example (characters, worlds) paths for hints."""
+def _example_paths() -> tuple[str, str, str]:
+    """Return OS-appropriate example (characters, worlds, user-images) hints."""
     if sys.platform == 'win32':
         return (
             r'C:\SillyTavern\data\default-user\characters',
             r'C:\SillyTavern\data\default-user\worlds (auto-derived from the characters path)',
+            r'C:\SillyTavern\data\default-user\user\images (auto-derived from the characters path)',
         )
     if sys.platform == 'darwin':
         return (
             '/Applications/SillyTavern/data/default-user/characters',
             '/Applications/SillyTavern/data/default-user/worlds (auto-derived from the characters path)',
+            '/Applications/SillyTavern/data/default-user/user/images (auto-derived from the characters path)',
         )
     return (
         '~/SillyTavern/data/default-user/characters',
         '~/SillyTavern/data/default-user/worlds (auto-derived from the characters path)',
+        '~/SillyTavern/data/default-user/user/images (auto-derived from the characters path)',
     )
 
 
@@ -66,7 +72,7 @@ class STConfigDialog(QDialog):
         path_layout = QVBoxLayout(path_group)
 
         row = QHBoxLayout()
-        example_chars, example_worlds = _example_paths()
+        example_chars, example_worlds, example_images = _example_paths()
         self._path_edit = QLineEdit(load_st_characters_path())
         self._path_edit.setPlaceholderText(f'e.g. {example_chars}')
         row.addWidget(self._path_edit)
@@ -117,8 +123,35 @@ class STConfigDialog(QDialog):
 
         layout.addWidget(worlds_group)
 
-        # Changing the characters path refreshes the auto-derived worlds path
-        # until the user edits it manually.
+        images_group = QGroupBox('SillyTavern User Images (Expression Images)')
+        images_layout = QVBoxLayout(images_group)
+
+        images_row = QHBoxLayout()
+        saved_images = load_st_user_images_path()
+        self._images_auto = not saved_images
+        derived_images = resolve_user_images_dir(initial_chars) if initial_chars else ''
+        self._images_edit = QLineEdit(saved_images or str(derived_images))
+        self._images_edit.setPlaceholderText(f'e.g. {example_images}')
+        self._images_edit.textEdited.connect(self._on_images_edited)
+        images_row.addWidget(self._images_edit)
+        images_browse_btn = QPushButton('Browse...')
+        images_browse_btn.clicked.connect(self._on_browse_images)
+        images_row.addWidget(images_browse_btn)
+        images_layout.addLayout(images_row)
+
+        images_hint = QLabel(
+            'Expression images live in per-character subfolders here '
+            '(e.g. <name>/happy.png) and are shared with SillyTavern. '
+            'Leave this as-is to follow the characters directory.'
+        )
+        images_hint.setWordWrap(True)
+        images_hint.setStyleSheet('color: #888;')
+        images_layout.addWidget(images_hint)
+
+        layout.addWidget(images_group)
+
+        # Changing the characters path refreshes the auto-derived worlds and
+        # user-images paths until the user edits them manually.
         self._path_edit.textChanged.connect(self._on_characters_changed)
 
         btn_row = QHBoxLayout()
@@ -159,20 +192,29 @@ class STConfigDialog(QDialog):
         clear_st_settings()
         self._path_edit.clear()
         self._worlds_edit.clear()
+        self._images_edit.clear()
         self._worlds_auto = True
+        self._images_auto = True
         self._update_status()
 
     def _on_characters_changed(self, text: str) -> None:
-        """Keep the auto-derived worlds path following the characters path."""
-        if not self._worlds_auto:
-            return
-        chars = text.strip()
-        self._worlds_edit.setText(
-            str(resolve_worlds_dir(chars)) if chars else ''
-        )
+        """Keep the auto-derived worlds/user-images paths following the characters path."""
+        if self._worlds_auto:
+            chars = text.strip()
+            self._worlds_edit.setText(
+                str(resolve_worlds_dir(chars)) if chars else ''
+            )
+        if self._images_auto:
+            chars = text.strip()
+            self._images_edit.setText(
+                str(resolve_user_images_dir(chars)) if chars else ''
+            )
 
     def _on_worlds_edited(self, _text: str) -> None:
         self._worlds_auto = False
+
+    def _on_images_edited(self, _text: str) -> None:
+        self._images_auto = False
 
     def _on_browse_worlds(self) -> None:
         path = QFileDialog.getExistingDirectory(
@@ -181,6 +223,14 @@ class STConfigDialog(QDialog):
         if path:
             self._worlds_edit.setText(path)
             self._worlds_auto = False
+
+    def _on_browse_images(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, 'Select SillyTavern User Images Directory',
+        )
+        if path:
+            self._images_edit.setText(path)
+            self._images_auto = False
 
     def _on_detect(self) -> None:
         candidates = detect_st_installs()
@@ -220,8 +270,13 @@ class STConfigDialog(QDialog):
     def _save(self) -> None:
         path = self._path_edit.text().strip()
         worlds = self._worlds_edit.text().strip()
+        images = self._images_edit.text().strip()
         save_st_characters_path(path)
         save_st_worlds_path(worlds)
+        save_st_user_images_path(images)
         self.settings_changed.emit(path)
-        logger.info("ST characters path saved: %s (worlds: %s)", path, worlds)
+        logger.info(
+            "ST characters path saved: %s (worlds: %s, user images: %s)",
+            path, worlds, images,
+        )
         self.accept()

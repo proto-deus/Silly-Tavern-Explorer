@@ -60,18 +60,32 @@ _RECOVERY_BYTES = 20
 
 # Bounds for KDF parameters read back from vault.json (untrusted on-disk
 # input): a corrupt/hostile ``n`` must not be allowed to allocate gigabytes
-# or hang the UI thread during unlock.
+# or hang the UI thread during unlock.  Memory is 128 * n * r bytes, so the
+# individual caps must be paired with a product cap: n = 2**20, r = 32 on
+# their own would still allocate ~4 GiB.
 _SCRYPT_N_MIN = 2
 _SCRYPT_N_MAX = 2 ** 20
 _SCRYPT_R_MAX = 32
 _SCRYPT_P_MAX = 16
+# 128 * n * r <= 32 MiB - comfortably above the parameters this vault writes
+# (n = 2**15, r = 8) while keeping a hostile metadata file bounded.
+_SCRYPT_MEM_MAX = 2 ** 25
 
-_MIGRATION_DIRS = ('library', 'thumbnails', 'sessions', 'lorebooks', 'generated')
+_MIGRATION_DIRS = ('library', 'thumbnails', 'sessions', 'lorebooks', 'generated', 'gallery')
 _MIGRATION_FILES = ('lorebook_sync_state.json',)
 
 
 class VaultError(Exception):
     """Base error for vault operations."""
+
+
+class VaultMetaMissing(VaultError):
+    """The vault envelope file is absent (vault never enabled, or removed).
+
+    Distinct from corruption: "there is nothing to unlock" is a normal
+    outcome (``unlock`` returns False), while a corrupt envelope is an
+    error the user must be told about.
+    """
 
 
 class VaultLocked(VaultError):
@@ -184,7 +198,14 @@ class Vault:
 
     @property
     def has_recovery(self) -> bool:
-        meta = self._load_meta(required=False)
+        # A property must never raise: corrupt metadata would escape the
+        # unlock dialog's constructor into the generic "failed to start"
+        # handler with no useful message.
+        try:
+            meta = self._load_meta(required=False)
+        except VaultError:
+            logger.error("Vault metadata is unreadable; treating as no recovery key")
+            return False
         return bool(meta and meta.get('recovery'))
 
     def lock(self) -> None:
@@ -199,7 +220,9 @@ class Vault:
             raw = path.read_bytes()
         except OSError:
             if required:
-                raise VaultError(f'Vault metadata {path} is missing or unreadable.') from None
+                raise VaultMetaMissing(
+                    f'Vault metadata {path} is missing or unreadable.'
+                ) from None
             return None
         try:
             meta = json.loads(raw.decode('utf-8'))
@@ -238,7 +261,8 @@ class Vault:
             salt = _b64d(kdf['salt'])
             n, r, p = int(kdf['n']), int(kdf['r']), int(kdf['p'])
             if not (_SCRYPT_N_MIN <= n <= _SCRYPT_N_MAX) or not (1 <= r <= _SCRYPT_R_MAX) \
-                    or not (1 <= p <= _SCRYPT_P_MAX):
+                    or not (1 <= p <= _SCRYPT_P_MAX) \
+                    or 128 * n * r > _SCRYPT_MEM_MAX:
                 # Treated as corruption, not auth failure: the user's password
                 # is fine, the metadata is not.
                 raise ValueError('kdf parameters out of range')
@@ -313,19 +337,32 @@ class Vault:
         try:
             self._key = attempt()
         except VaultAuthError:
+            # A wrong secret is a normal outcome: False means "try again".
+            self._key = None
+            return False
+        except VaultMetaMissing:
+            # Nothing to unlock (vault not enabled / envelope removed).
             self._key = None
             return False
         except VaultError as exc:
+            # Corruption is NOT a wrong password: the user can never guess
+            # their way past it. Surface it so the UI says "the vault
+            # metadata is corrupt" instead of "incorrect password".
             self._key = None
             logger.error('Vault unlock failed: %s', exc)
-            return False
+            raise
         return True
 
     def verify_password(self, password: str) -> bool:
-        """True when *password* unwraps the MEK (does not change state)."""
+        """True when *password* unwraps the MEK (does not change state).
+
+        Raises :class:`VaultError` when the vault metadata itself is corrupt -
+        that is indistinguishable from "wrong password" only by accident of
+        both failing to unwrap, and the user deserves the real message.
+        """
         try:
             self._unwrap_slot(self._password_slot(self._load_meta()), password)
-        except VaultError:
+        except VaultAuthError:
             return False
         return True
 

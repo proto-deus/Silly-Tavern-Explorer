@@ -8,6 +8,7 @@ import requests
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QColorDialog,
     QComboBox,
     QDialog,
@@ -33,15 +34,20 @@ from PyQt6.QtWidgets import (
 from src import ai_prompts
 from src.ai_client import PRESETS, preset_from_saved
 from src.settings_manager import (
+    load_active_persona_id,
     load_active_provider,
     load_macro_settings,
+    load_personas,
     load_provider_models,
     load_provider_settings,
+    load_spellcheck_enabled,
     load_test_settings,
-    load_user_persona,
+    save_active_persona_id,
     save_all_provider_settings,
     save_macro_settings,
+    save_personas,
     save_provider_models,
+    save_spellcheck_enabled,
     save_test_settings,
     save_user_persona,
     set_active_provider,
@@ -92,6 +98,12 @@ class _FetchModelsWorker(QThread):
                 # would reject with an InvalidHeader (whose message embeds
                 # the whole header value, i.e. the key).
                 key = self.api_key.strip()
+                if '\r' in key or '\n' in key:
+                    self.error.emit(
+                        'The API key contains invalid characters. '
+                        'Check the key in Settings.'
+                    )
+                    return
                 try:
                     key.encode('latin-1')
                 except UnicodeEncodeError:
@@ -131,7 +143,15 @@ class _FetchModelsWorker(QThread):
         except _FetchCancelled:
             return
         except Exception as e:
-            self.error.emit(f"{e}\n{traceback.format_exc()}")
+            # The raw exception (and its traceback) can carry the request URL
+            # with userinfo and the Authorization header value; send only a
+            # redacted one-line message to the UI and log the details under
+            # the same redaction.
+            from src.ai_client import redact_secrets
+            logger.error(
+                "Model fetch failed: %s", redact_secrets(f"{e}\n{traceback.format_exc()}"),
+            )
+            self.error.emit(redact_secrets(str(e)))
 
 
 class _APIPanel(QWidget):
@@ -173,6 +193,14 @@ class _APIPanel(QWidget):
         self._key_warning.setVisible(False)
         form.addRow('', self._key_warning)
 
+        # Shown when the base URL would send the API key over cleartext http
+        # to a remote host (loopback is exempt: that is the local-server case).
+        self._url_warning = QLabel('')
+        self._url_warning.setWordWrap(True)
+        self._url_warning.setStyleSheet('color: #e0a030; ')
+        self._url_warning.setVisible(False)
+        form.addRow('', self._url_warning)
+
         model_row = QHBoxLayout()
         self._model_combo = QComboBox()
         self._model_combo.setEditable(True)
@@ -191,6 +219,10 @@ class _APIPanel(QWidget):
         layout.addWidget(conn_group)
         layout.addStretch()
 
+        self._url_edit.textChanged.connect(self._refresh_url_warning)
+        self._key_edit.textChanged.connect(self._refresh_url_warning)
+        self._refresh_url_warning()
+
     def load_connection(self, connection: dict) -> None:
         self._url_edit.setText(connection.get('base_url', ''))
         self._key_edit.setText(connection.get('api_key', ''))
@@ -198,6 +230,7 @@ class _APIPanel(QWidget):
         cached = load_provider_models(provider, connection.get('base_url', ''))
         self._populate_model_combo(cached, connection.get('model', ''))
         self._refresh_key_warning()
+        self._refresh_url_warning()
 
     def _populate_model_combo(self, models: list[str], current: str) -> None:
         """Fill the model combo from the cached list, keeping *current* visible."""
@@ -219,9 +252,9 @@ class _APIPanel(QWidget):
         assume nothing was saved, and hit Save - which is exactly the path that
         used to destroy the key.
         """
-        from src.settings_manager import undecryptable_api_key_providers
+        from src.settings_manager import is_provider_undecryptable
         preset = self._preset_combo.currentText()
-        if preset in undecryptable_api_key_providers():
+        if is_provider_undecryptable(preset):
             self._key_warning.setText(
                 "This provider's saved key could not be decrypted. It has been "
                 "left untouched - re-enter the key and Save to replace it."
@@ -229,6 +262,20 @@ class _APIPanel(QWidget):
             self._key_warning.setVisible(True)
         else:
             self._key_warning.setVisible(False)
+
+    def _refresh_url_warning(self) -> None:
+        """Warn when the API key would travel over cleartext http."""
+        from src.ai_client import is_cleartext_remote
+        base_url = self._url_edit.text().strip()
+        if base_url and self._key_edit.text().strip() and is_cleartext_remote(base_url):
+            self._url_warning.setText(
+                'This base URL is plain http:// to a remote host: the API key '
+                'would be sent unencrypted. Prefer https:// for non-local '
+                'servers.'
+            )
+            self._url_warning.setVisible(True)
+        else:
+            self._url_warning.setVisible(False)
 
     @staticmethod
     def _fetch_worker_is_alive(worker) -> bool:
@@ -403,6 +450,21 @@ class _LLMPanel(QWidget):
         )
         form.addRow('Stop sequences:', self._stop)
 
+        self._strict_template = QCheckBox(
+            'Enforce alternating user/assistant roles (Llama 3.x templates)'
+        )
+        self._strict_template.setChecked(bool(config.get('strict_chat_template', False)))
+        self._strict_template.setToolTip(
+            'Rewrites chat requests into one system message followed by '
+            'strictly alternating user/assistant turns.\n'
+            'Required by Llama 3.x / Gemma chat templates, which reject '
+            'trailing system blocks (post-history instructions, jailbreak) '
+            'and system messages injected mid-history.\n'
+            'Without it, such requests are still repaired automatically after '
+            'the server rejects them; enable this to skip the failed attempt.'
+        )
+        form.addRow('Chat template:', self._strict_template)
+
         layout.addWidget(group)
         layout.addStretch()
 
@@ -428,6 +490,7 @@ class _LLMPanel(QWidget):
             'seed': self._seed.value(),
             'retry_attempts': self._retries.value(),
             'stop': self._stop_text_list(),
+            'strict_chat_template': self._strict_template.isChecked(),
         }
 
     def _stop_text_list(self) -> list[str]:
@@ -444,6 +507,7 @@ class _LLMPanel(QWidget):
         self._pres_pen.setValue(config.get('presence_penalty', 0.0))
         self._seed.setValue(config.get('seed', -1))
         self._retries.setValue(config.get('retry_attempts', 2))
+        self._strict_template.setChecked(bool(config.get('strict_chat_template', False)))
         stop_value = config.get('stop', [])
         if isinstance(stop_value, (list, tuple)):
             stop_value = ', '.join(str(s) for s in stop_value)
@@ -451,32 +515,32 @@ class _LLMPanel(QWidget):
 
 
 class _MacrosPanel(QWidget):
-    """{{user}} value + persona + custom macro overrides."""
+    """{{user}} value + personas + custom macro overrides."""
 
     def __init__(
         self,
         user_name: str,
         custom_macros: dict[str, str],
-        persona: str = '',
+        personas: list[dict] | None = None,
+        active_id: str = '',
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
+        from src.ui.widgets.persona_dialog import PersonaManagerWidget
+
         layout = QVBoxLayout(self)
 
         user_group = QGroupBox('User Macro')
         user_form = QFormLayout(user_group)
         self._user_edit = QLineEdit(user_name)
         user_form.addRow('{{user}}:', self._user_edit)
-
-        from PyQt6.QtWidgets import QPlainTextEdit
-        self._persona_edit = QPlainTextEdit(persona)
-        self._persona_edit.setPlaceholderText(
-            "Describe who {{user}} is (background, appearance, role) so the "
-            "character responds to a real person, not a nameless stranger..."
-        )
-        self._persona_edit.setFixedHeight(80)
-        user_form.addRow('User persona:', self._persona_edit)
         layout.addWidget(user_group)
+
+        persona_group = QGroupBox('User Personas')
+        persona_layout = QVBoxLayout(persona_group)
+        self._persona_manager = PersonaManagerWidget(personas, active_id, self)
+        persona_layout.addWidget(self._persona_manager)
+        layout.addWidget(persona_group, 1)
 
         custom_group = QGroupBox('Custom Macros')
         custom_layout = QVBoxLayout(custom_group)
@@ -498,7 +562,6 @@ class _MacrosPanel(QWidget):
 
         for name, value in (custom_macros or {}).items():
             self._add_row(name, value)
-        layout.addStretch()
 
     def _add_row(self, name: str = '', value: str = '') -> None:
         row = self._table.rowCount()
@@ -523,7 +586,8 @@ class _MacrosPanel(QWidget):
         return {
             'user_name': self._user_edit.text().strip(),
             'macros': custom,
-            'persona': self._persona_edit.toPlainText().strip(),
+            'personas': self._persona_manager.personas(),
+            'active_persona_id': self._persona_manager.selected_id(),
         }
 
 
@@ -535,6 +599,29 @@ class _PromptsPanel(QWidget):
         from src.ui.widgets.prompt_settings_dialog import _PromptTab
 
         layout = QVBoxLayout(self)
+
+        template_row = QHBoxLayout()
+        template_row.addWidget(QLabel('System prompt template:'))
+        self._template_combo = QComboBox()
+        self._template_combo.setMinimumWidth(180)
+        self._template_combo.setToolTip(
+            "Main prompt used for Test chats: the selected template is the "
+            "first system block, and the character's own system prompt is "
+            "appended after it.\n"
+            'The "Custom" entry is the editable Chat prompt below.'
+        )
+        self._refresh_template_combo()
+        template_row.addWidget(self._template_combo)
+        manage_btn = QPushButton('Manage Templates...')
+        manage_btn.setToolTip(
+            'Create, edit, or delete named system prompt templates\n'
+            '(Natural Chat, Simple Roleplay, ...) and their post-history '
+            'instructions.'
+        )
+        manage_btn.clicked.connect(self._on_manage_templates)
+        template_row.addWidget(manage_btn)
+        template_row.addStretch()
+        layout.addLayout(template_row)
 
         selector_row = QHBoxLayout()
         selector_row.addWidget(QLabel('Edit prompt:'))
@@ -554,6 +641,7 @@ class _PromptsPanel(QWidget):
             ('Wizard', ['wizard_system', 'wizard_user']),
             ('Chat', ['chat_system']),
             ('Memory', ['memory_summary_system', 'memory_summary_user']),
+            ('Attributes', ['attribute_update_system', 'attribute_update_user']),
             ('Lorebook', ['lorebook_system', 'lorebook_user']),
             ('Lorebook Entry', ['lorebook_entry_system', 'lorebook_entry_user']),
         ]
@@ -563,11 +651,55 @@ class _PromptsPanel(QWidget):
         self._prompt_combo.currentIndexChanged.connect(self._stack.setCurrentIndex)
         layout.addWidget(self._stack)
 
+    def _refresh_template_combo(self) -> None:
+        from src.prompt_templates import active_template_id, all_templates
+
+        self._template_combo.blockSignals(True)
+        self._template_combo.clear()
+        active = active_template_id()
+        for tpl in all_templates():
+            self._template_combo.addItem(tpl.name, tpl.id)
+        idx = self._template_combo.findData(active)
+        self._template_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._template_combo.blockSignals(False)
+
+    def _on_manage_templates(self) -> None:
+        from src.ui.widgets.system_template_dialog import SystemTemplateDialog
+
+        dlg = SystemTemplateDialog(self)
+        dlg.exec()
+        dlg.deleteLater()
+        self._refresh_template_combo()
+
     def save(self) -> None:
         for index in range(self._stack.count()):
             tab = self._stack.widget(index)
             for key, value in tab.get_templates().items():
                 ai_prompts.save_prompt(key, value)
+        from src.prompt_templates import save_active_template_id
+        save_active_template_id(self._template_combo.currentData() or 'custom')
+
+
+class _EditorPanel(QWidget):
+    """Text-editing behaviour shared by every editable field."""
+
+    def __init__(self, spellcheck_enabled: bool = True, parent: QWidget | None = None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        group = QGroupBox('Spell Checking')
+        group_layout = QVBoxLayout(group)
+        self._spellcheck = QCheckBox('Underline misspelled words in text fields')
+        self._spellcheck.setChecked(bool(spellcheck_enabled))
+        self._spellcheck.setToolTip(
+            'Right-click an underlined word for suggested corrections, to\n'
+            'ignore it, or to add it to your personal dictionary.'
+        )
+        group_layout.addWidget(self._spellcheck)
+        layout.addWidget(group)
+        layout.addStretch()
+
+    def spellcheck_enabled(self) -> bool:
+        return self._spellcheck.isChecked()
 
 
 class _TestPanel(QWidget):
@@ -842,7 +974,7 @@ class _EncryptionPanel(QWidget):
 
 
 class SettingsDialog(QDialog):
-    """Master settings dialog with API / LLM / Macros / Prompts / Test tabs."""
+    """Master settings dialog with API / LLM / Macros / Prompts / Editor / Test tabs."""
 
     settings_changed = pyqtSignal()
 
@@ -850,7 +982,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle('Settings')
         self.setMinimumWidth(600)
-        self.setMinimumHeight(560)
+        self.setMinimumHeight(640)
 
         from dataclasses import asdict
 
@@ -869,22 +1001,24 @@ class SettingsDialog(QDialog):
 
         macro = load_macro_settings()
         test = load_test_settings()
-        persona = load_user_persona()
 
         layout = QVBoxLayout(self)
         self._tabs = QTabWidget()
         self._api_panel = _APIPanel(names, active, self._configs[active])
         self._llm_panel = _LLMPanel(self._configs[active])
         self._macros_panel = _MacrosPanel(
-            macro.get('user_name', 'User'), macro.get('macros', {}), persona,
+            macro.get('user_name', 'User'), macro.get('macros', {}),
+            load_personas(), load_active_persona_id(),
         )
         self._prompts_panel = _PromptsPanel()
+        self._editor_panel = _EditorPanel(load_spellcheck_enabled())
         self._test_panel = _TestPanel(test)
         self._encryption_panel = _EncryptionPanel()
         self._tabs.addTab(self._api_panel, 'API')
         self._tabs.addTab(self._llm_panel, 'LLM')
         self._tabs.addTab(self._macros_panel, 'Macros')
         self._tabs.addTab(self._prompts_panel, 'Prompts')
+        self._tabs.addTab(self._editor_panel, 'Editor')
         self._tabs.addTab(self._test_panel, 'Test')
         self._tabs.addTab(self._encryption_panel, 'Encryption')
         layout.addWidget(self._tabs)
@@ -923,9 +1057,20 @@ class SettingsDialog(QDialog):
         macro = self._macros_panel.values()
         test = self._test_panel.values()
         save_macro_settings(macro['user_name'], macro['macros'])
-        save_user_persona(macro.get('persona', ''))
+        personas = macro.get('personas') or []
+        active_id = macro.get('active_persona_id') or ''
+        save_personas(personas)
+        save_active_persona_id(active_id)
+        # Keep the legacy single-persona key mirroring the active persona so
+        # older builds (and its migration path) still see the current text.
+        active_text = next(
+            (p.get('text', '') for p in personas if p.get('id') == active_id),
+            personas[0].get('text', '') if personas else '',
+        )
+        save_user_persona(active_text)
         self._prompts_panel.save()
         save_test_settings(test)
+        save_spellcheck_enabled(self._editor_panel.spellcheck_enabled())
         logger.info("Settings saved")
         self.settings_changed.emit()
         # accept() does not go through closeEvent, so the fetch worker must

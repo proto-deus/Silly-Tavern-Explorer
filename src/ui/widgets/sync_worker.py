@@ -203,6 +203,11 @@ class PushPullWorker(QThread):
         self.characters_dir = characters_dir
         self.char_id = char_id
         self.action = action
+        self._cancel = False
+
+    def cancel(self) -> None:
+        """Request cooperative cancellation before the plan executes."""
+        self._cancel = True
 
     def run(self) -> None:
         from src.sillytavern_sync import (
@@ -219,6 +224,9 @@ class PushPullWorker(QThread):
         # `completed` never firing would additionally leave the caller's
         # permanent status-bar message stuck on screen forever.
         try:
+            if self._cancel:
+                self.completed.emit(SyncSummary(skipped=1))
+                return
             entry = self.db.get_by_id(self.char_id)
             if not entry:
                 self.completed.emit(SyncSummary(errors=[f"Card {self.char_id} not found"]))
@@ -287,7 +295,10 @@ class PushPullWorker(QThread):
                 pair = SyncPair(category=category, st=st_entry)
 
             plan = [SyncPlanItem(pair, self.action)]
-            summary = bulk_sync(plan, self.db, self.characters_dir)
+            summary = bulk_sync(
+                plan, self.db, self.characters_dir,
+                is_cancelled=lambda: self._cancel,
+            )
             self.completed.emit(summary)
         except Exception as exc:
             logger.exception("Push/pull of card %s failed", self.char_id)

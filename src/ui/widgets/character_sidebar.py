@@ -5,6 +5,8 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QScrollArea,
@@ -12,7 +14,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from src.database import LibraryDatabase
+from src.database import SORT_LABELS, LibraryDatabase
 from src.ui.widgets.async_image import cancel_pending_image_loads
 from src.ui.widgets.card_thumbnail import CardThumbnail
 
@@ -37,6 +39,7 @@ class CharacterSidebar(QWidget):
         self._thumb_widgets: list[CardThumbnail] = []
         self._current_id: int | None = None
         self._favorites_only: bool = False
+        self._sort_by: str = 'name'
         self._full_image_dlg: QWidget | None = None
 
         layout = QVBoxLayout(self)
@@ -51,6 +54,18 @@ class CharacterSidebar(QWidget):
         self._search_box.setClearButtonEnabled(True)
         self._search_box.textChanged.connect(self._filter_thumbnails)
         layout.addWidget(self._search_box)
+
+        # Same sort-by dropdown the Library tab uses (shared label->key map).
+        sort_row = QHBoxLayout()
+        sort_label = QLabel('Sort:')
+        sort_label.setStyleSheet('color: #ccc;')
+        sort_row.addWidget(sort_label)
+        self._sort_combo = QComboBox()
+        for label in SORT_LABELS:
+            self._sort_combo.addItem(label)
+        self._sort_combo.currentTextChanged.connect(self._on_sort_changed)
+        sort_row.addWidget(self._sort_combo, 1)
+        layout.addLayout(sort_row)
 
         self._thumb_scroll = QScrollArea()
         self._thumb_scroll.setWidgetResizable(True)
@@ -73,7 +88,7 @@ class CharacterSidebar(QWidget):
     # ---- loading / filtering ----
 
     def load_cards(self) -> None:
-        """Rebuild the thumbnail list from the DB, honouring the favorites filter."""
+        """Rebuild the thumbnail list from the DB, honouring sort and filters."""
         # Drop this list's queued image loads so a rebuild doesn't leave stale
         # decodes competing for the pool (the Library grid tags its own loads
         # separately and is unaffected).
@@ -84,7 +99,9 @@ class CharacterSidebar(QWidget):
             w.deleteLater()
         self._thumb_widgets.clear()
 
-        entries = self.db.get_all(favorites_only=self._favorites_only)
+        entries = self.db.get_all(
+            sort_by=self._sort_by, favorites_only=self._favorites_only,
+        )
 
         # Drop a selection that no longer exists (or is filtered out of view).
         # Keeping it left the sidebar highlighting a deleted card, which the
@@ -111,6 +128,10 @@ class CharacterSidebar(QWidget):
 
     def _on_favorites_toggled(self, checked: bool) -> None:
         self._favorites_only = checked
+        self.load_cards()
+
+    def _on_sort_changed(self, label: str) -> None:
+        self._sort_by = SORT_LABELS.get(label, 'name')
         self.load_cards()
 
     def _filter_thumbnails(self, text: str) -> None:

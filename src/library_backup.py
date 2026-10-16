@@ -50,6 +50,7 @@ _CARD_SUBDIR = 'cards'
 _THUMB_SUBDIR = 'thumbnails'
 _SESSION_SUBDIR = 'sessions'
 _LORE_SUBDIR = 'lorebooks'
+_GALLERY_SUBDIR = 'gallery'
 
 _SQLITE_HEADER = b'SQLite format 3\x00'
 
@@ -126,12 +127,14 @@ def create_backup(
     thumbs_dir = data / 'thumbnails'
     sessions_dir = data / 'sessions'
     lore_dir = data / 'lorebooks'
+    gallery_dir = data / 'gallery'
 
     file_groups: list[tuple[Path, str]] = [
         (cards_dir, _CARD_SUBDIR),
         (thumbs_dir, _THUMB_SUBDIR),
         (sessions_dir, _SESSION_SUBDIR),
         (lore_dir, _LORE_SUBDIR),
+        (gallery_dir, _GALLERY_SUBDIR),
     ]
     grouped: list[tuple[Path, str]] = []
     for src_dir, prefix in file_groups:
@@ -153,20 +156,22 @@ def create_backup(
             'thumbnails': sum(1 for _, p in grouped if p == _THUMB_SUBDIR),
             'sessions': sum(1 for _, p in grouped if p == _SESSION_SUBDIR),
             'lorebooks': sum(1 for _, p in grouped if p == _LORE_SUBDIR),
+            'gallery': sum(1 for _, p in grouped if p == _GALLERY_SUBDIR),
         },
     }
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    # NOTE: with_suffix() *replaces* the extension, so build the temp name by
-    # concatenation instead - otherwise 'backup.2024.01' becomes
-    # 'backup.2024.tmp' and two runs can collide on the same temp file.
-    tmp_zip = dest.with_name(f'{dest.name}.tmp')
+    # Unique temp names: two concurrent backups must not interleave writes to
+    # the same temp file (the old fixed '<dest>.tmp' / '<dest>.db-snapshot.tmp'
+    # collided).
+    from src.fs_utils import unique_temp_path
+    tmp_zip = unique_temp_path(dest.parent, f'{dest.name}.', '.tmp')
     # Snapshot the DB through SQLite's backup API instead of copying the file:
     # the app's own connections keep committing while the archive is written
     # (those commits land in ``-wal``, which is not archived), and a plain file
     # copy can tear mid-write.  ``Connection.backup`` copies under a read lock
     # into a temp file, so the snapshot is both consistent and complete.
-    db_snapshot = dest.with_name(f'{dest.name}.db-snapshot.tmp')
+    db_snapshot = unique_temp_path(dest.parent, f'{dest.name}.', '.db-snapshot.tmp')
     try:
         src_conn = sqlite3.connect(str(db_path), timeout=5.0)
         try:
@@ -194,6 +199,7 @@ def create_backup(
                 _THUMB_SUBDIR: thumbs_dir,
                 _SESSION_SUBDIR: sessions_dir,
                 _LORE_SUBDIR: lore_dir,
+                _GALLERY_SUBDIR: gallery_dir,
             }
             for src_file, prefix in grouped:
                 rel = src_file.relative_to(src_dirs[prefix])
@@ -361,6 +367,7 @@ def restore_backup(
             _THUMB_SUBDIR: 'thumbnails',
             _SESSION_SUBDIR: 'sessions',
             _LORE_SUBDIR: 'lorebooks',
+            _GALLERY_SUBDIR: 'gallery',
         }
         # Only directories the archive actually provides are replaced. Wiping
         # a live directory that the backup omits would destroy data the

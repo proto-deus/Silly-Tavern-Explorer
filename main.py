@@ -29,7 +29,9 @@ def _check_dependencies() -> list[str]:
     import importlib.util
     # cryptography encrypts the API keys on macOS/Linux - without it they fall
     # back to plain text silently - so it is required, not optional.
-    required = ['PyQt6', 'PIL', 'tiktoken', 'requests', 'markdown', 'cryptography']
+    # symspellpy backs the text-field spell checker (its frequency dictionary
+    # ships with the package).
+    required = ['PyQt6', 'PIL', 'tiktoken', 'requests', 'markdown', 'cryptography', 'symspellpy']
     missing = []
     for name in required:
         if importlib.util.find_spec(name) is None:

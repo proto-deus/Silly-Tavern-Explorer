@@ -131,7 +131,7 @@ def check_malformed_tags(db) -> list[Finding]:
     from src.database import _decode_tag_blob
 
     out: list[Finding] = []
-    for blob, in _iter_tag_blobs(db):
+    for card_id, blob in _iter_tag_blobs(db):
         tags = _decode_tag_blob(blob)
         bad = [t for t in tags if not isinstance(t, str)]
         if bad:
@@ -139,6 +139,7 @@ def check_malformed_tags(db) -> list[Finding]:
                 'malformed-tags', 'warning',
                 f'{len(bad)} non-text tag value(s) found',
                 detail=', '.join(repr(t)[:24] for t in bad[:3]), fixable=True,
+                card_id=card_id,
             ))
     return out
 
@@ -146,7 +147,8 @@ def check_malformed_tags(db) -> list[Finding]:
 def _iter_tag_blobs(db):
     try:
         with db._conn() as conn:
-            yield from conn.execute('SELECT tags FROM characters').fetchall()
+            for row in conn.execute('SELECT id, tags FROM characters').fetchall():
+                yield row[0], row[1]
     except Exception:
         logger.exception("Doctor could not read tag blobs")
 
@@ -210,6 +212,74 @@ def check_orphan_sessions(db, sessions_dir: str | Path | None = None) -> list[Fi
     )]
 
 
+def check_gallery_images(db, gallery_dir: str | Path | None = None) -> list[Finding]:
+    """Gallery metadata and files that have drifted apart.
+
+    Three failure modes, each with a different safe repair:
+
+    * gallery rows whose file is missing - drop the row (the file is gone);
+    * files no row references - report only, never delete user images;
+    * ``gallery/<id>/`` folders of deleted cards - remove the folder, like
+      the orphaned chat sessions.
+    """
+    if gallery_dir is None:
+        from src.app_paths import data_dir
+        gallery_dir = data_dir() / 'gallery'
+    root = Path(gallery_dir)
+    live = {str(r.get('id')) for r in _iter_characters(db)}
+    out: list[Finding] = []
+
+    known_files: dict[str, set[str]] = {}
+    try:
+        rows = db.list_all_gallery_images()
+    except Exception:
+        logger.exception("Doctor could not list gallery rows")
+        rows = []
+    for row in rows:
+        char_id = str(row.get('character_id'))
+        file_name = str(row.get('file_name') or '')
+        known_files.setdefault(char_id, set()).add(file_name)
+        path = root / char_id / file_name
+        if file_name and not path.is_file():
+            out.append(Finding(
+                'gallery-missing-file', 'warning',
+                f"Gallery image '{file_name}' is missing from disk",
+                detail=f'gallery/{char_id}/{file_name}', fixable=True,
+                card_id=row.get('character_id'),
+                items=[str(row.get('id'))],
+            ))
+
+    if not root.is_dir():
+        return out
+
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or not child.name.isdigit():
+            continue
+        if child.name not in live:
+            out.append(Finding(
+                'orphan-gallery', 'warning',
+                f'Gallery folder of deleted card {child.name}',
+                detail=f'gallery/{child.name}', fixable=True,
+                items=[child.name],
+            ))
+            continue
+        expected = known_files.get(child.name, set())
+        strays = [
+            p.name for p in sorted(child.iterdir())
+            if p.is_file() and p.name not in expected
+            and not p.name.startswith('.ste-') and not p.name.endswith('.tmp')
+        ]
+        if strays:
+            out.append(Finding(
+                'gallery-orphan-file', 'info',
+                f'{len(strays)} file(s) in the gallery folder are not in the library',
+                detail=', '.join(strays[:10]), fixable=True,
+                card_id=int(child.name),
+                items=strays,
+            ))
+    return out
+
+
 def check_stale_links(db, characters_dir: str | Path | None = None) -> list[Finding]:
     """Cards linked to a SillyTavern file that is no longer there."""
     if characters_dir is None:
@@ -269,12 +339,43 @@ def check_undecryptable_keys() -> list[Finding]:
         return []
     if not providers:
         return []
+    # Report every affected provider (not just the first) and show the bare
+    # provider name rather than the internal storage key.
+    names = [p.rsplit('/', 1)[-1] for p in providers]
     return [Finding(
         'undecryptable-api-key', 'error',
-        f"API key for '{providers[0]}' could not be decrypted",
-        detail=('The stored key has been left untouched. Open Settings and '
-                're-enter it to replace it.'),
+        f"API key(s) for {', '.join(names)} could not be decrypted",
+        detail=('The stored key(s) have been left untouched. Open Settings and '
+                're-enter them to replace them.'),
+        items=names,
     )]
+
+
+def check_cleartext_api_url() -> list[Finding]:
+    """Provider base URLs that would send an API key over cleartext http."""
+    try:
+        from src.ai_client import PRESETS, is_cleartext_remote
+        from src.settings_manager import load_provider_settings
+    except Exception:
+        return []
+    out: list[Finding] = []
+    for name in list(PRESETS.keys()):
+        try:
+            cfg = load_provider_settings(name)
+        except Exception:
+            logger.exception("Could not read provider settings for %s", name)
+            continue
+        if not cfg.get('api_key'):
+            continue
+        if is_cleartext_remote(cfg.get('base_url') or ''):
+            out.append(Finding(
+                'cleartext-api-url', 'warning',
+                f"Provider '{name}' sends its API key over unencrypted http://",
+                detail=(f"{cfg.get('base_url')} - prefer https:// for "
+                        "non-local servers."),
+                items=[name],
+            ))
+    return out
 
 
 def check_database(db_path: str | Path) -> list[Finding]:
@@ -307,35 +408,41 @@ def check_database(db_path: str | Path) -> list[Finding]:
 def run_all(db, db_path: str | Path | None = None,
             library_dir: str | Path | None = None,
             sessions_dir: str | Path | None = None,
+            gallery_dir: str | Path | None = None,
             st_characters_dir: str | Path | None = None) -> DoctorReport:
     """Run every check and return a combined report."""
     report = DoctorReport()
-    checks = [
-        lambda: check_missing_card_files(db),
-        lambda: check_unreadable_cards(db),
-        lambda: check_malformed_tags(db),
-        lambda: check_orphan_files(db, library_dir),
-        lambda: check_orphan_sessions(db, sessions_dir),
-        lambda: check_stale_links(db, st_characters_dir),
-        lambda: check_stale_tombstones(db),
-        check_undecryptable_keys,
+    # (name, callable) pairs: a bare lambda reports as '<lambda>' and, since
+    # Finding.key includes detail, every failed check deduped into ONE
+    # useless 'check-failed' finding.
+    checks: list[tuple[str, callable]] = [
+        ('missing-card-files', lambda: check_missing_card_files(db)),
+        ('unreadable-cards', lambda: check_unreadable_cards(db)),
+        ('malformed-tags', lambda: check_malformed_tags(db)),
+        ('orphan-files', lambda: check_orphan_files(db, library_dir)),
+        ('orphan-sessions', lambda: check_orphan_sessions(db, sessions_dir)),
+        ('gallery-images', lambda: check_gallery_images(db, gallery_dir)),
+        ('stale-links', lambda: check_stale_links(db, st_characters_dir)),
+        ('stale-tombstones', lambda: check_stale_tombstones(db)),
+        ('undecryptable-keys', check_undecryptable_keys),
+        ('cleartext-api-url', check_cleartext_api_url),
     ]
     if db_path is None:
         db_path = getattr(db, 'db_path', None)
     if db_path:
-        checks.insert(0, lambda: check_database(db_path))
+        checks.insert(0, ('database-integrity', lambda: check_database(db_path)))
 
-    for check in checks:
+    for name, check in checks:
         try:
             for finding in check():
                 report.add(finding)
         except Exception:
             # A broken check must not abort the whole report.
-            logger.exception("Doctor check failed: %s", getattr(check, '__name__', check))
+            logger.exception("Doctor check failed: %s", name)
             report.add(Finding(
                 'check-failed', 'warning',
-                'An integrity check could not complete',
-                detail=getattr(check, '__name__', 'unknown'),
+                f"The '{name}' integrity check could not complete",
+                detail=name,
             ))
     return report
 
@@ -358,17 +465,24 @@ def repair(db, report: DoctorReport) -> list[str]:
                 applied.append(f"Removed the library entry for {finding.detail}")
             elif finding.category == 'orphan-sessions':
                 applied.extend(_remove_dirs(finding))
+            elif finding.category == 'orphan-gallery':
+                applied.extend(_remove_gallery_dirs(finding))
+            elif finding.category == 'gallery-missing-file':
+                applied.extend(_drop_gallery_rows(db, finding))
             elif finding.category == 'stale-tombstone':
                 applied.extend(_clear_tombstones(db, finding))
             elif finding.category == 'malformed-tags':
-                applied.append(
-                    'Non-text tag values are now ignored rather than breaking '
-                    'the tag views.'
-                )
+                applied.extend(_clean_tag_blob(db, finding))
             elif finding.category == 'orphan-file':
                 applied.append(
                     'Files in the library folder that are not in the library '
                     'were left in place; import them if you still want them.'
+                )
+            elif finding.category == 'gallery-orphan-file':
+                applied.append(
+                    'Files in the gallery folder that are not in the library '
+                    'were left in place; add them to the gallery if you still '
+                    'want them.'
                 )
         except Exception as exc:
             logger.exception("Doctor repair failed for %s", finding.category)
@@ -397,6 +511,47 @@ def _remove_dirs(finding: Finding) -> list[str]:
     return removed
 
 
+def _remove_gallery_dirs(finding: Finding) -> list[str]:
+    import shutil
+
+    from src.app_paths import data_dir
+    root = data_dir() / 'gallery'
+    removed = []
+    for name in finding.items:
+        name = str(name).strip()
+        if not name:
+            continue
+        target = root / name
+        if not target.is_dir():
+            continue
+        try:
+            shutil.rmtree(target)
+            removed.append(f"Deleted the gallery folder of the deleted card {name}")
+        except OSError as exc:
+            logger.warning("Could not remove %s: %s", target, exc)
+    return removed
+
+
+def _drop_gallery_rows(db, finding: Finding) -> list[str]:
+    """Delete gallery rows whose file is already gone (never a file itself)."""
+    dropped = 0
+    for item in finding.items:
+        try:
+            image_id = int(str(item).strip())
+        except (TypeError, ValueError):
+            continue
+        try:
+            row = db.delete_gallery_image(image_id)
+            if row is not None:
+                dropped += 1
+        except Exception:
+            logger.warning("Could not drop gallery row %s", image_id)
+    if not dropped:
+        return []
+    return [f'Removed {dropped} gallery entr{"y" if dropped == 1 else "ies"} '
+            f'whose image file is missing']
+
+
 def _clear_tombstones(db, finding: Finding) -> list[str]:
     cleared = 0
     for url in finding.items:
@@ -409,6 +564,36 @@ def _clear_tombstones(db, finding: Finding) -> list[str]:
         except Exception:
             logger.warning("Could not clear tombstone %s", url)
     return [f'Cleared {cleared} stale deletion record(s).'] if cleared else []
+
+
+def _clean_tag_blob(db, finding: Finding) -> list[str]:
+    """Rewrite one card's tag blob, keeping only text values.
+
+    The old "repair" only appended a note claiming the values were ignored;
+    the blob itself was never cleaned, so the finding came back on every run.
+    """
+    import json as _json
+    if finding.card_id is None:
+        return []
+    try:
+        with db._conn() as conn:
+            row = conn.execute(
+                'SELECT tags FROM characters WHERE id = ?', (finding.card_id,),
+            ).fetchone()
+            if row is None:
+                return []
+            from src.database import _decode_tag_blob
+            tags = _decode_tag_blob(row[0])
+            kept = [t for t in tags if isinstance(t, str)]
+            conn.execute(
+                'UPDATE characters SET tags = ? WHERE id = ?',
+                (_json.dumps(kept, ensure_ascii=False), finding.card_id),
+            )
+            conn.commit()
+    except Exception as exc:
+        logger.warning("Could not clean tag blob for card %s: %s", finding.card_id, exc)
+        return [f'Could not clean the tags of card {finding.card_id}: {exc}']
+    return [f'Cleaned the tags of card {finding.card_id}.']
 
 
 def summarize(report: DoctorReport) -> str:

@@ -260,7 +260,8 @@ def read_card_from_json(json_path: str | Path) -> Optional[dict]:
     or if the content doesn't look like a character card.
     """
     try:
-        data = json.loads(vault.read_text(json_path))
+        from src.fs_utils import decode_text
+        data = json.loads(decode_text(vault.read_bytes(json_path)))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError, vault.VaultError) as e:
         logger.warning("Failed to read JSON card from %s: %s", json_path, e)
         return None

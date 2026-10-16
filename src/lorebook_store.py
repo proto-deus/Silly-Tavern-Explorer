@@ -198,6 +198,23 @@ def _entry_items(entries) -> list[dict]:
     return []
 
 
+def _key_list(raw: Any) -> list[str]:
+    """Normalize a world-info keyword field into a list of non-empty strings.
+
+    A hand-edited (or third-party) file may carry ``"key": "dragon"`` instead
+    of ``["dragon"]``; iterating the string would split it into single
+    characters, making the entry match almost any text while its real keyword
+    never fires.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(k) for k in raw if str(k).strip()]
+
+
 def _safe_int(val: Any, default: int = 0) -> int:
     """Coerce *val* to int without raising.
 
@@ -255,8 +272,8 @@ def _st_entry_to_book_entry(raw: dict) -> BookEntry:
     }
     extensions = {k: v for k, v in raw.items() if k not in known}
 
-    keys = [str(k) for k in (raw.get('key') or []) if str(k).strip()]
-    secondary = [str(k) for k in (raw.get('keysecondary') or []) if str(k).strip()]
+    keys = _key_list(raw.get('key'))
+    secondary = _key_list(raw.get('keysecondary'))
     if secondary:
         extensions['keysecondary'] = secondary
 
@@ -448,7 +465,7 @@ def _nai_entry_to_book_entry(raw: dict, index: int) -> BookEntry:
              and not isinstance(order_raw, bool) else index * 100)
     return BookEntry(
         name=str(raw.get('displayName') or ''),
-        keys=[str(k) for k in (raw.get('keys') or []) if str(k).strip()],
+        keys=_key_list(raw.get('keys')),
         content=str(raw.get('text') or ''),
         extensions=extensions,
         enabled=bool(raw.get('enabled', True)),
