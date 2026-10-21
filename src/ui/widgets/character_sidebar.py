@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -22,10 +22,21 @@ from src.ui.widgets.card_thumbnail import CardThumbnail
 # the Library grid's loads leaves the sidebar's alone (and vice versa).
 SIDEBAR_LOADER_OWNER = 'sidebar'
 
-#: How many cards the sidebar shows at most.  It is a quick picker, not the
-#: full library: building a thumbnail widget (and queueing a PNG decode) for
-#: every card of a large library froze the window on every refresh.
-MAX_SIDEBAR_CARDS = 300
+#: How many cards are built per event-loop turn.  A thumbnail widget costs a
+#: font-metrics measurement and a few layout operations, so building the whole
+#: library in one go froze the window for seconds.  The list is built in small
+#: batches instead, which keeps the UI responsive while it fills up.
+BUILD_CHUNK_SIZE = 25
+
+#: How far above/below the viewport a row may sit and still get its image
+#: decoded.  Rows outside it keep their placeholder until they are scrolled
+#: near, so a library of thousands of cards does not decode thousands of
+#: images up front (and hold thousands of pixmaps in memory).
+IMAGE_LOAD_MARGIN = 400
+
+#: The gap around the rows of the list and between them.
+ROW_MARGIN = 4
+ROW_SPACING = 6
 
 
 class CharacterSidebar(QWidget):
@@ -33,6 +44,12 @@ class CharacterSidebar(QWidget):
 
     A single instance is placed to the left of the tab widget so the three
     content tabs share the same selection, search and favorites filter.
+
+    The list holds *every* card in the library - not just the first page of
+    it - so a card picked in the Library grid (which is paged) is always
+    present here and can always be followed.  To keep that affordable the
+    list is built in small batches and the images are only decoded for the
+    rows near the viewport.
     """
 
     card_selected = pyqtSignal(int)
@@ -50,11 +67,28 @@ class CharacterSidebar(QWidget):
         super().__init__(parent)
         self.db = db
         self._thumb_widgets: list[CardThumbnail] = []
+        self._thumbs_by_id: dict[int, CardThumbnail] = {}
         self._search_blobs: dict[int, str] = {}
         self._current_id: int | None = None
         self._favorites_only: bool = False
         self._sort_by: str = 'name'
         self._full_image_dlg: QWidget | None = None
+        # Every card in the library (light rows), plus the state of the
+        # batch-wise build that turns them into thumbnails.
+        self._entries: list[dict] = []
+        self._build_token: int = 0
+        self._build_pos: int = 0
+        self._build_done: bool = True
+        self._removed_ids: set[int] = set()
+        # (widget, y) of every row that is currently shown, in list order.
+        # The layout only catches up when Qt repaints, so the positions are
+        # tracked here: they decide which images are worth decoding.
+        self._rows: list[tuple[CardThumbnail, int]] = []
+        # A selection made before its row existed: scrolled to as soon as
+        # the row is built.
+        self._pending_scroll_id: int | None = None
+        # The scroll position of the list, kept across a rebuild.
+        self._saved_scroll: int = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 4, 8)
@@ -85,12 +119,15 @@ class CharacterSidebar(QWidget):
         self._thumb_scroll.setWidgetResizable(True)
         self._thumb_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._thumb_scroll.setFixedWidth(180)
+        self._thumb_scroll.verticalScrollBar().valueChanged.connect(
+            self._on_scrolled,
+        )
 
         self._thumb_container = QWidget()
-        self._thumb_layout = QVBoxLayout(self._thumb_container)
-        self._thumb_layout.setContentsMargins(4, 4, 4, 4)
-        self._thumb_layout.setSpacing(6)
-        self._thumb_layout.addStretch()
+        # The rows are placed by hand (see ``_layout_rows``) instead of by a
+        # layout: a layout re-lays-out every row each time one of them is
+        # shown or hidden, which makes a list of thousands of cards quadratic.
+        self._thumb_container.setMinimumHeight(0)
         self._thumb_scroll.setWidget(self._thumb_container)
         layout.addWidget(self._thumb_scroll, 1)
 
@@ -99,73 +136,186 @@ class CharacterSidebar(QWidget):
         self._favorites_check.toggled.connect(self._on_favorites_toggled)
         layout.addWidget(self._favorites_check)
 
-        # The sidebar is a quick picker, not the full library: it shows at
-        # most this many cards and says how many are hidden.  Without the
-        # cap a library of a few thousand cards built a thumbnail widget
-        # (and queued a PNG decode) for every one of them, on every import,
-        # favourite toggle, sync and save.
-        self._more_label = QLabel('')
-        self._more_label.setWordWrap(True)
-        self._more_label.setStyleSheet('color: #ccc; font-size: 11px;')
-        self._more_label.setVisible(False)
-        layout.addWidget(self._more_label)
+        # The list shows every card, so the label counts them instead of
+        # reporting how many were left out.
+        self._status_label = QLabel('')
+        self._status_label.setWordWrap(True)
+        self._status_label.setStyleSheet('color: #ccc; font-size: 11px;')
+        layout.addWidget(self._status_label)
 
     # ---- loading / filtering ----
 
     def load_cards(self) -> None:
-        """Rebuild the thumbnail list from the DB, honouring sort and filters."""
+        """Rebuild the thumbnail list from the DB, honouring sort and filters.
+
+        The whole library is listed, but it is built in batches: the first
+        batch is ready when this returns, the rest follows on the event loop.
+        """
+        # Invalidate a build that is still running: its remaining batches
+        # would add cards the new query does not contain.
+        self._build_token += 1
         # Drop this list's queued image loads so a rebuild doesn't leave stale
         # decodes competing for the pool (the Library grid tags its own loads
         # separately and is unaffected).
         cancel_pending_image_loads(SIDEBAR_LOADER_OWNER)
-        for w in self._thumb_widgets:
-            w.hide()
-            w.setParent(None)
-            w.deleteLater()
-        self._thumb_widgets.clear()
-        self._search_blobs.clear()
+        # The list is rebuilt from scratch, so the scroll position has to be
+        # put back once the new list is there.
+        self._saved_scroll = self._thumb_scroll.verticalScrollBar().value()
+        self._destroy_thumbs()
+        self._removed_ids.clear()
 
-        entries = self.db.get_all(light=True,
-            sort_by=self._sort_by, favorites_only=self._favorites_only,
+        self._entries = self.db.get_all(
+            light=True,
+            sort_by=self._sort_by,
+            favorites_only=self._favorites_only,
         )
 
         # Drop a selection that no longer exists (or is filtered out of view).
         # Keeping it left the sidebar highlighting a deleted card, which the
         # Edit tab then loaded (with Save enabled) and Push/Pull targeted.
-        ids = {entry['id'] for entry in entries}
+        ids = {entry['id'] for entry in self._entries}
         if self._current_id is not None and self._current_id not in ids:
             self._current_id = None
 
-        for entry in entries[:MAX_SIDEBAR_CARDS]:
+        self._build_pos = 0
+        self._build_done = False
+        self._build_batch(self._build_token)
+
+    def _destroy_thumbs(self) -> None:
+        for w in self._thumb_widgets:
+            w.hide()
+            w.setParent(None)
+            w.deleteLater()
+        self._thumb_widgets.clear()
+        self._thumbs_by_id.clear()
+        self._search_blobs.clear()
+        self._rows.clear()
+        self._thumb_container.setMinimumHeight(0)
+
+    def _build_batch(self, token: int) -> None:
+        """Build the next batch of thumbnails.
+
+        The list is built one batch per event-loop turn, so a library with
+        thousands of cards does not freeze the window.  *token* identifies
+        the build: a rebuild bumps it and the stale batch stops.
+        """
+        if token != self._build_token:
+            return
+        query = self._search_box.text().strip().lower()
+        entries = self._entries[self._build_pos:self._build_pos + BUILD_CHUNK_SIZE]
+        appended: list[CardThumbnail] = []
+        for entry in entries:
+            char_id = entry['id']
+            if char_id in self._removed_ids:
+                continue
             thumb = CardThumbnail(
-                char_id=entry['id'],
+                char_id=char_id,
                 name=entry['name'],
                 thumb_path=entry.get('thumbnail_path', ''),
                 is_favorite=bool(entry.get('is_favorite')),
                 token_count=entry.get('token_count', 0),
+                parent=self._thumb_container,
                 loader_owner=SIDEBAR_LOADER_OWNER,
+                # The image is decoded when the row scrolls near the
+                # viewport, not up front.
+                auto_load=False,
             )
             thumb.clicked.connect(self._on_thumb_clicked)
             thumb.double_clicked.connect(self._on_thumb_double_clicked)
-            self._thumb_layout.insertWidget(self._thumb_layout.count() - 1, thumb)
             self._thumb_widgets.append(thumb)
-            self._search_blobs[entry['id']] = ' '.join(
+            self._thumbs_by_id[char_id] = thumb
+            self._search_blobs[char_id] = ' '.join(
                 str(entry.get(key) or '')
                 for key in (
                     'name', 'description_preview', 'tags',
                     'creator', 'creator_notes',
                 )
             ).lower()
-        hidden = len(entries) - len(self._thumb_widgets)
-        if hidden > 0:
-            self._more_label.setText(
-                f'{hidden} more card(s) not shown - narrow the search to see them.'
-            )
-            self._more_label.setVisible(True)
+            thumb.setVisible(self._row_matches(thumb, query))
+            thumb.set_selected(char_id == self._current_id)
+            appended.append(thumb)
+        self._build_pos += len(entries)
+        self._layout_rows(appended)
+        self._load_visible_images()
+        self._flush_pending_scroll()
+        self._update_status_label()
+        if self._build_pos < len(self._entries):
+            QTimer.singleShot(0, lambda t=token: self._build_batch(t))
         else:
-            self._more_label.setVisible(False)
-        self._apply_search_filter(self._search_box.text())
-        self._apply_selection_highlight()
+            self._build_done = True
+            self._flush_pending_scroll()
+            self._update_status_label()
+            # Put the list back where the user left it.
+            if self._saved_scroll:
+                QTimer.singleShot(0, self._restore_scroll)
+
+    def _restore_scroll(self) -> None:
+        """Restore the scroll position of a rebuilt list."""
+        self._thumb_scroll.verticalScrollBar().setValue(self._saved_scroll)
+
+    def _layout_rows(self, appended: list[CardThumbnail] | None = None) -> None:
+        """Place the shown rows and size the scrollable area.
+
+        The rows are positioned by hand rather than by a layout: a layout
+        re-lays-out every row each time one of them is shown or hidden, and
+        with thousands of cards in the list that turns every filter change
+        into quadratic work.  The positions are also used to decide which
+        images are worth decoding.
+
+        *appended* are the rows that were just added at the end of the list.
+        While nothing is filtered out they simply go below the last row,
+        which keeps a batch of new rows cheap.
+        """
+        if appended and not self._search_box.text().strip():
+            y = (
+                self._rows[-1][1] + self._rows[-1][0].height() + ROW_SPACING
+                if self._rows
+                else ROW_MARGIN
+            )
+            for thumb in appended:
+                thumb.move(ROW_MARGIN, y)
+                self._rows.append((thumb, y))
+                y += thumb.height() + ROW_SPACING
+            self._thumb_container.setMinimumHeight(
+                max(0, y - ROW_SPACING + ROW_MARGIN),
+            )
+            return
+        y = ROW_MARGIN
+        rows: list[tuple[CardThumbnail, int]] = []
+        for thumb in self._thumb_widgets:
+            if thumb.isHidden():
+                continue
+            thumb.move(ROW_MARGIN, y)
+            rows.append((thumb, y))
+            y += thumb.height() + ROW_SPACING
+        self._rows = rows
+        # The minimum height is what the scroll area scrolls through.
+        self._thumb_container.setMinimumHeight(
+            max(0, y - ROW_SPACING + ROW_MARGIN),
+        )
+
+    def _load_visible_images(self) -> None:
+        """Decode the images of the rows that are near the viewport.
+
+        Only those rows are decoded: the list holds the whole library, and
+        decoding every image in it would cost both time and a lot of memory
+        (a pixmap per card).
+        """
+        bar = self._thumb_scroll.verticalScrollBar()
+        top = bar.value() - IMAGE_LOAD_MARGIN
+        bottom = bar.value() + self._thumb_scroll.viewport().height() + IMAGE_LOAD_MARGIN
+        for thumb, y in self._rows:
+            if top <= y <= bottom:
+                thumb.load_image()
+
+    def _on_scrolled(self, _value: int) -> None:
+        """Load the images of the rows that just scrolled into view."""
+        self._load_visible_images()
+
+    def showEvent(self, event) -> None:
+        """Load the images of the rows that are on screen when the list shows."""
+        super().showEvent(event)
+        self._load_visible_images()
 
     def _on_favorites_toggled(self, checked: bool) -> None:
         self._favorites_only = checked
@@ -202,6 +352,20 @@ class CharacterSidebar(QWidget):
             self._sort_combo.blockSignals(False)
         self.load_cards()
 
+    def _row_matches(self, thumb: CardThumbnail, query: str) -> bool:
+        """Whether *thumb* should be shown for the search *query*.
+
+        The selected card is always shown, even when the query does not match
+        it: the Library grid can match a card on fields the sidebar does not
+        search (the full card body), and the two lists have to agree on
+        which card is selected.
+        """
+        if not query:
+            return True
+        if thumb.char_id == self._current_id:
+            return True
+        return query in self._search_blobs.get(thumb.char_id, '')
+
     def _apply_search_filter(self, text: str) -> None:
         """Show only the cards matching *text* (same fields as the Library tab).
 
@@ -210,8 +374,10 @@ class CharacterSidebar(QWidget):
         """
         query = text.strip().lower()
         for thumb in self._thumb_widgets:
-            blob = self._search_blobs.get(thumb.char_id, '')
-            thumb.setVisible(not query or query in blob)
+            thumb.setVisible(self._row_matches(thumb, query))
+        self._layout_rows()
+        self._load_visible_images()
+        self._update_status_label()
 
     def _on_search_text(self, text: str) -> None:
         self._apply_search_filter(text)
@@ -226,54 +392,111 @@ class CharacterSidebar(QWidget):
         self._search_box.blockSignals(False)
         self._apply_search_filter(text)
 
+    def _update_status_label(self) -> None:
+        """Show how many cards the list holds (and how many match the search)."""
+        total = len(self._entries) - len(self._removed_ids)
+        if not self._build_done:
+            self._status_label.setText(
+                f'Loading {len(self._thumb_widgets):,} of {total:,}...'
+            )
+            return
+        shown = sum(1 for thumb in self._thumb_widgets if not thumb.isHidden())
+        if shown >= total:
+            self._status_label.setText(
+                f'{total:,} card' + ('' if total == 1 else 's')
+            )
+        else:
+            self._status_label.setText(f'{shown:,} of {total:,} cards')
+
     # ---- selection ----
 
     def _apply_selection_highlight(self) -> None:
         for thumb in self._thumb_widgets:
             thumb.set_selected(thumb.char_id == self._current_id)
 
-    def set_selected_id(self, char_id: int | None) -> None:
-        """Set the highlighted card without loading anything."""
+    def _set_current(self, char_id: int | None) -> None:
+        """Change the selected card and bring the list in line with it."""
+        previous = self._current_id
         self._current_id = char_id
         self._apply_selection_highlight()
+        # The newly selected card has to be shown even when the search text
+        # does not match it, and the one before it goes back to the search.
+        query = self._search_box.text().strip().lower()
+        relayout = False
+        for cid in (previous, char_id):
+            thumb = self._thumbs_by_id.get(cid) if cid is not None else None
+            if thumb is None:
+                continue
+            visible = self._row_matches(thumb, query)
+            if thumb.isHidden() == visible:
+                thumb.setVisible(visible)
+                relayout = True
+        if relayout:
+            self._layout_rows()
+
+    def set_selected_id(self, char_id: int | None) -> None:
+        """Set the highlighted card without loading anything."""
+        self._set_current(char_id)
 
     def current_id(self) -> int | None:
         return self._current_id
 
     def select_card(self, char_id: int) -> None:
         """Set selection and scroll the card into view."""
-        self._current_id = char_id
-        self._apply_selection_highlight()
+        self._set_current(char_id)
         self._scroll_to_selected()
 
     def _scroll_to_selected(self) -> None:
         target_id = self._current_id
 
         def _do_scroll() -> None:
-            for t in self._thumb_widgets:
-                if t.char_id == target_id and not t.isHidden():
-                    self._thumb_scroll.ensureWidgetVisible(t)
-                    break
+            if self._scroll_to_row(target_id):
+                self._pending_scroll_id = None
+                return
+            # The row is not built yet (the list is still being built): keep
+            # the target and scroll to it as soon as it shows up.
+            self._pending_scroll_id = target_id
 
         QTimer.singleShot(0, _do_scroll)
+
+    def _scroll_to_row(self, char_id: int | None) -> bool:
+        """Scroll the row of *char_id* to the top of the viewport.
+
+        Returns False when the row is not in the list (yet).
+        """
+        if char_id is None:
+            return False
+        for thumb, y in self._rows:
+            if thumb.char_id != char_id:
+                continue
+            bar = self._thumb_scroll.verticalScrollBar()
+            bar.setValue(max(0, min(y, bar.maximum())))
+            return True
+        return False
+
+    def _flush_pending_scroll(self) -> None:
+        """Scroll to a selection whose row was not built yet."""
+        if self._pending_scroll_id is None:
+            return
+        if self._scroll_to_row(self._pending_scroll_id):
+            self._pending_scroll_id = None
 
     def scroll_selected_to_top(self) -> None:
         """Scroll so the selected card is at the top of the sidebar viewport."""
         target_id = self._current_id
 
         def _do_scroll() -> None:
-            for t in self._thumb_widgets:
-                if t.char_id == target_id and not t.isHidden():
-                    self._thumb_scroll.verticalScrollBar().setValue(t.y())
-                    break
+            if self._scroll_to_row(target_id):
+                self._pending_scroll_id = None
+                return
+            self._pending_scroll_id = target_id
 
         QTimer.singleShot(0, _do_scroll)
 
     def _on_thumb_clicked(self, char_id: int) -> None:
         if char_id == self._current_id:
             return
-        self._current_id = char_id
-        self._apply_selection_highlight()
+        self._set_current(char_id)
         self.card_selected.emit(char_id)
 
     def _on_thumb_double_clicked(self, char_id: int) -> None:
@@ -286,26 +509,39 @@ class CharacterSidebar(QWidget):
         entry = self.db.get_by_id(char_id)
         if not entry:
             return
-        for thumb in self._thumb_widgets:
-            if thumb.char_id == char_id:
-                thumb.update_from_entry(
-                    name=entry['name'],
-                    thumb_path=entry.get('thumbnail_path', ''),
-                    is_favorite=bool(entry.get('is_favorite')),
-                    token_count=entry.get('token_count', 0),
-                )
-                break
+        thumb = self._thumbs_by_id.get(char_id)
+        if thumb is None:
+            return
+        thumb.update_from_entry(
+            name=entry['name'],
+            thumb_path=entry.get('thumbnail_path', ''),
+            is_favorite=bool(entry.get('is_favorite')),
+            token_count=entry.get('token_count', 0),
+        )
+        # A new name can wrap onto another line, which changes the height of
+        # the row and the position of the rows below it.
+        self._layout_rows()
 
     def remove_card(self, char_id: int) -> None:
         """Remove a single thumbnail from the list."""
-        for i, thumb in enumerate(self._thumb_widgets):
-            if thumb.char_id == char_id:
-                thumb.setParent(None)
-                thumb.deleteLater()
-                self._thumb_widgets.pop(i)
-                break
+        # Remember the removal: a build that is still running would otherwise
+        # add the card back.
+        self._removed_ids.add(char_id)
+        thumb = self._thumbs_by_id.pop(char_id, None)
+        if thumb is not None:
+            # Hide before reparenting: a widget without a parent becomes a
+            # top-level window and would flash on screen.
+            thumb.hide()
+            thumb.setParent(None)
+            thumb.deleteLater()
+            try:
+                self._thumb_widgets.remove(thumb)
+            except ValueError:
+                pass
         if self._current_id == char_id:
             self._current_id = None
+        self._layout_rows()
+        self._update_status_label()
 
     # ---- session restore ----
 
@@ -314,9 +550,10 @@ class CharacterSidebar(QWidget):
 
     def set_selected_ids(self, ids: list[int]) -> None:
         """Restore a saved selection (first matching id wins)."""
-        valid = {t.char_id for t in self._thumb_widgets}
+        known = {entry['id'] for entry in self._entries}
+        known.update(self._thumbs_by_id)
         for char_id in ids:
-            if char_id in valid:
+            if char_id in known:
                 self.set_selected_id(char_id)
                 return
 

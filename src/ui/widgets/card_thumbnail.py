@@ -29,6 +29,7 @@ class CardThumbnail(QWidget):
         token_count: int = 0,
         parent: QWidget | None = None,
         loader_owner: str = THUMBNAIL_LOADER_OWNER,
+        auto_load: bool = True,
     ):
         super().__init__(parent)
         self.char_id = char_id
@@ -39,6 +40,10 @@ class CardThumbnail(QWidget):
         self._name_lines_max = 4
         self._loader_owner = loader_owner
         self._star_label: QLabel | None = None
+        # Whether the image has been requested at all.  A list that holds
+        # every card in the library defers the request until the card is
+        # near the viewport (see ``auto_load``).
+        self._image_requested = False
         self.setFixedWidth(self._img_size + 8)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -78,6 +83,23 @@ class CardThumbnail(QWidget):
         layout.addLayout(name_row)
 
         self._apply_name_fit()
+        if auto_load:
+            self.load_image()
+
+    @property
+    def image_requested(self) -> bool:
+        """Whether the image has been requested (and so will arrive)."""
+        return self._image_requested
+
+    def load_image(self) -> None:
+        """Request the thumbnail image.
+
+        Safe to call repeatedly: the image is only requested once.  Widgets
+        built with ``auto_load=False`` start out with a placeholder and get
+        their image when the list scrolls them into view.
+        """
+        if self._image_requested:
+            return
         self._request_load()
 
     def _apply_name_fit(self) -> None:
@@ -119,6 +141,7 @@ class CardThumbnail(QWidget):
 
     def _request_load(self) -> None:
         """Load the thumbnail, using the cache or an async worker."""
+        self._image_requested = True
         path = self._thumb_path
         if not path or not Path(path).exists():
             self._show_no_image()
