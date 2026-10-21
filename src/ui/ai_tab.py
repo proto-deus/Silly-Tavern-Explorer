@@ -5,6 +5,7 @@ import traceback
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
     QCheckBox,
     QGridLayout,
@@ -21,6 +22,7 @@ from PyQt6.QtWidgets import (
 
 from src.ai_client import AIClient, APIPreset, _extract_json, _parse_tags, preset_from_saved
 from src import ai_prompts
+from src.ai_output import INSTRUCTION_FIELDS, validate_fill_result
 from src.card_models import CharacterCard
 from src.card_parser import read_card_data
 from src.database import LibraryDatabase
@@ -63,6 +65,7 @@ class _GenerateWorker(QThread):
                 full = self._stream_generate(system, user)
                 if not self._cancel and full is not None:
                     tags = _parse_tags(full)
+                    self._record_usage(system, user, full, card)
                     self.completed.emit(tags)
             elif self.mode == 'missing_tags':
                 card = self.params['card']
@@ -74,6 +77,7 @@ class _GenerateWorker(QThread):
                 full = self._stream_generate(system, user)
                 if not self._cancel and full is not None:
                     tags = _parse_tags(full)
+                    self._record_usage(system, user, full, card)
                     self.completed.emit(tags)
             elif self.mode == 'summary':
                 card = self.params['card']
@@ -84,6 +88,7 @@ class _GenerateWorker(QThread):
                 )
                 full = self._stream_generate(system, user)
                 if not self._cancel and full is not None:
+                    self._record_usage(system, user, full, card)
                     self.completed.emit(full)
             elif self.mode == 'alt_greetings':
                 card = self.params['card']
@@ -94,6 +99,7 @@ class _GenerateWorker(QThread):
                 )
                 full = self._stream_generate(system, user)
                 if not self._cancel and full is not None:
+                    self._record_usage(system, user, full, card)
                     self.completed.emit(full)
             elif self.mode == 'fill':
                 card = self.params['card']
@@ -108,21 +114,54 @@ class _GenerateWorker(QThread):
                     raw = _extract_json(full, expected_keys=set(fields))
                     if raw is None:
                         raise ValueError("AI did not return valid JSON for fill result")
+                    self._record_usage(system, user, full, card)
                     self.completed.emit({'fields': fields, 'result': raw, 'card': card})
         except Exception as e:
             if not self._cancel:
                 self.error.emit(f"{e}\n{traceback.format_exc()}")
 
+    def _record_usage(
+        self,
+        system: str,
+        user: str,
+        reply: str,
+        card: CharacterCard | None,
+    ) -> None:
+        """Book the generation in the usage ledger.
+
+        Without this the Generate tab was invisible to the cost
+        dashboard: only the Test chat recorded its usage, so the totals
+        were far below the real spend.
+        """
+        try:
+            from src.usage_ledger import record_generation
+
+            preset = self.client.preset if self.client is not None else None
+            record_generation(
+                provider=getattr(preset, 'name', '') or '',
+                model=getattr(preset, 'model', '') or '',
+                card_id=self.params.get('card_id'),
+                card_name=getattr(card, 'name', '') or '',
+                session_id=f'generate:{self.mode}',
+                prompt_text=f'{system}\n\n{user}',
+                reply_text=reply or '',
+            )
+        except Exception:
+            logger.warning('Could not record the usage of the generation', exc_info=True)
+
     def _stream_generate(self, system: str, user: str) -> str | None:
         """Stream a generation, accumulating the full text.
 
-        Returns the accumulated full text, or ``None`` if cancelled mid-stream.
+        The chunks are emitted as they arrive so the tab can show the
+        reply while it is still being written.  Returns the accumulated
+        full text, or ``None`` if cancelled mid-stream.
         """
         parts: list[str] = []
         for piece in self.client.generate(system, user, stream=True):
             if self._cancel:
                 return None
             parts.append(piece)
+            self.chunk.emit(piece)
         return ''.join(parts)
 
 
@@ -595,6 +634,9 @@ class AITab(QWidget):
         if self._worker_is_alive(self._worker):
             return
         client = AIClient(self._api_preset)
+        # The card id is not part of the card object, but the usage ledger
+        # groups the spend per card.
+        params = {**params, 'card_id': self._selected_id}
 
         # Clear the previous result for this section so a stale Save/Clear
         # can't operate on outdated data while the new one streams in.
@@ -627,6 +669,7 @@ class AITab(QWidget):
         self._gen_source_id = self._selected_id
         self._worker = _GenerateWorker(client, mode, params, self)
         self._worker.completed.connect(self._on_finished)
+        self._worker.chunk.connect(self._on_chunk)
         self._worker.error.connect(self._on_error)
         # Cleanup on the built-in signal so cancelled runs are still deleted.
         self._worker.finished.connect(self._clear_worker)
@@ -672,6 +715,22 @@ class AITab(QWidget):
             )
             return False
         return True
+
+    @pyqtSlot(str)
+    def _on_chunk(self, piece: str) -> None:
+        """Show the reply while it is still being generated."""
+        if self._active_mode not in ('summary', 'alt_greetings'):
+            # The other modes parse the reply as JSON, so a half-written
+            # JSON blob would only confuse the user.
+            return
+        box = self._active_result_box()
+        if box.toPlainText() == 'Generating...':
+            box.setPlainText(piece)
+            return
+        cursor = box.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        box.setTextCursor(cursor)
+        box.insertPlainText(piece)
 
     @pyqtSlot(object)
     def _on_finished(self, result) -> None:
@@ -816,24 +875,31 @@ class AITab(QWidget):
             return
         try:
             data = self._last_fill_result
-            # Only apply the fields the user actually requested — the model
+            # Only apply the fields the user actually requested - the model
             # may return extra keys (e.g. 'name') that must never be applied
-            # silently.
+            # silently - and only values of the right shape.  A reply with
+            # ``"tags": "a, b"`` used to store the whole string as one tag.
             requested = self._last_fill_fields or list(data)
-            applied = []
-            for field_name in requested:
-                if field_name not in data:
-                    continue
-                value = data[field_name]
-                if field_name == 'tags' and isinstance(value, list):
-                    card.tags = [str(t).strip().lower() for t in value if t]
-                    applied.append('tags')
-                elif isinstance(value, str) and hasattr(card, field_name):
-                    setattr(card, field_name, value)
-                    applied.append(field_name)
+            clean, applied = validate_fill_result(data, requested)
             if not applied:
                 QMessageBox.warning(self, 'Nothing Saved', 'No valid fields were found in the results.')
                 return
+            instruction_fields = [f for f in applied if f in INSTRUCTION_FIELDS]
+            if instruction_fields:
+                answer = QMessageBox.question(
+                    self, 'Save model instructions?',
+                    'The generated text for\n'
+                    + '\n'.join(f'  - {f}' for f in instruction_fields)
+                    + '\n\nis saved as a *model instruction* of the card. It is sent '
+                      'to the AI on every future chat with this character.\n\n'
+                      'Only continue if you trust the generated text.',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+            for field_name in applied:
+                setattr(card, field_name, clean[field_name])
             card.token_count = count_card_tokens(card)
             self.db.update_card(self._selected_id, card)
             QMessageBox.information(self, 'Saved', f"Saved {len(applied)} field(s) to '{card.name}'.")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -66,9 +67,10 @@ from src.chat_sessions import (
     session_flags,
 )
 from src.database import LibraryDatabase
+from src import context_templates
 from src import lorebook_store
 from src import st_chat_io
-from src.prompt_templates import active_template_id, all_templates, resolve_template
+from src.prompt_templates import active_template_id, resolve_template
 from src.settings_manager import (
     get_persona,
     load_active_lorebooks,
@@ -83,7 +85,9 @@ from src.settings_manager import (
 )
 from src.token_counter import count_tokens
 from src.ui.spell_check import SpellCheckTextEdit
+from src.ui.styles import ui_font_px
 from src.ui.widgets.chat_bubble import MessageBubble
+from src.ui.widgets.chat_image_loader import _widget_alive
 from src.ui.widgets.context_inspector_dialog import ContextInspectorDialog
 from src.ui.widgets.edit_message_dialog import TextEditDialog
 from src.ui.widgets.memory_dialog import MemoryDialog
@@ -105,6 +109,8 @@ _EXPORT_FILTERS: tuple[tuple[str, str], ...] = (
     ('Text (*.txt)', '.txt'),
     ('JSON (*.json)', '.json'),
     ('SillyTavern chat (*.jsonl)', '.jsonl'),
+    ('Markdown (*.md)', '.md'),
+    ('HTML (*.html)', '.html'),
 )
 _EXPORT_FILE_FILTER = ';;'.join(f for f, _ in _EXPORT_FILTERS)
 _EXPORT_EXTENSIONS = {ext for _, ext in _EXPORT_FILTERS}
@@ -138,6 +144,131 @@ def _safe_variant_pos(value, default: int) -> int:
         return default
 
 
+#: The share of the context window at which the token label turns amber.
+CONTEXT_WARNING_RATIO = 0.7
+
+#: The colours of the token label (readable on the app's dark theme).
+CONTEXT_COLOR_NORMAL = '#777'
+CONTEXT_COLOR_WARNING = '#e0a030'
+CONTEXT_COLOR_OVER = '#ff6666'
+
+#: The suffix appended to the token label when the prompt does not fit.
+CONTEXT_OVER_SUFFIX = ' - over the context window!'
+
+
+def context_pressure_level(tokens: int, limit: int) -> str:
+    """Classify how full the context window is.
+
+    Args:
+        tokens: The number of tokens the prompt uses.
+        limit: The size of the context window (0 = unknown).
+
+    Returns:
+        ``'ok'`` while the prompt uses less than ~70 % of the window,
+        ``'warning'`` from there up to the window size, and ``'over'`` when
+        the prompt does not fit into the window at all.
+    """
+    try:
+        used = max(0, int(tokens))
+    except (TypeError, ValueError):
+        used = 0
+    try:
+        size = int(limit)
+    except (TypeError, ValueError):
+        size = 0
+    if size <= 0:
+        return 'ok'
+    if used > size:
+        return 'over'
+    if used >= size * CONTEXT_WARNING_RATIO:
+        return 'warning'
+    return 'ok'
+
+
+def count_prompt_tokens(messages) -> int:
+    """The number of tokens of the messages that were sent.
+
+    The text of every message is counted with the app's own tokenizer, so
+    the number matches the one the context budget was computed with.  Image
+    parts are not counted (they are charged a flat estimate elsewhere).
+
+    Pure function so the counting is unit-testable without a running chat.
+    """
+    total = 0
+    for message in messages or ():
+        if not isinstance(message, dict):
+            continue
+        content = message.get('content', '')
+        if isinstance(content, str):
+            total += count_tokens(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get('type') == 'text':
+                    total += count_tokens(part.get('text', '') or '')
+    return total
+
+
+def record_generation_usage(
+    provider: str,
+    model: str,
+    card_id: int | None,
+    card_name: str,
+    session_id: str,
+    prompt_messages,
+    reply: str,
+) -> None:
+    """Record one completed generation in the usage ledger.
+
+    The prompt that was sent is charged as the input and the reply as the
+    output.  The two are stored as separate entries (one per role) so the
+    "By role" breakdown of the usage dialog is meaningful.
+
+    The call is guarded - a broken ledger must never break a chat.
+
+    Args:
+        provider: The name of the provider that served the generation.
+        model: The model that served the generation.
+        card_id: The id of the card the chat belongs to.
+        card_name: The name of that card.
+        session_id: The id of the chat session.
+        prompt_messages: The messages that were sent.
+        reply: The reply that came back.
+    """
+    try:
+        from src.usage_ledger import record_generation
+
+        record_generation(
+            provider=provider,
+            model=model,
+            card_id=card_id,
+            card_name=card_name,
+            session_id=session_id,
+            input_tokens=count_prompt_tokens(prompt_messages),
+            output_tokens=count_tokens(reply or ''),
+        )
+    except Exception:
+        logger.exception("Could not record the usage of the generation")
+
+
+def notify_generation_finished(card_id: int | None, provider: str, model: str) -> None:
+    """Announce a finished generation to the plugin/event bus.
+
+    The event module is imported lazily - it is an optional cross-cutting
+    module and must not be pulled in at start-up - and every error is
+    swallowed: a failing user plugin must never break the chat.
+
+    Args:
+        card_id: The id of the card the chat belongs to.
+        provider: The name of the provider that served the generation.
+        model: The model that served the generation.
+    """
+    try:
+        from src import app_events
+        app_events.generation_finished(card_id, provider, model)
+    except Exception:
+        logger.exception("Could not announce the finished generation")
+
+
 class _ChatWorker(QThread):
     """Streams a chat completion over a message history."""
     # Named ``completed`` so the built-in QThread.finished stays available
@@ -157,6 +288,13 @@ class _ChatWorker(QThread):
         examples_block: str = '',
         injections: list | None = None,
         mode: str = 'assistant',
+        name_prefixes: dict[str, str] | None = None,
+        conversation_start_header: str | None = None,
+        card_id: int | None = None,
+        card_name: str = '',
+        session_id: str = '',
+        provider: str = '',
+        model: str = '',
     ):
         super().__init__(parent)
         self.client = client
@@ -170,6 +308,16 @@ class _ChatWorker(QThread):
         # 'user' appends the model-written {{user}} message (Impersonate), and
         # 'continue' extends the last assistant reply.
         self.mode = mode
+        # Context-template knobs: history name prefixes and the header used
+        # when a leading greeting folds into the system message.
+        self.name_prefixes = name_prefixes
+        self.conversation_start_header = conversation_start_header
+        # What the generation is billed to (the usage ledger records it).
+        self.card_id = card_id
+        self.card_name = card_name
+        self.session_id = session_id
+        self.provider = provider
+        self.model = model
         self._cancel = False
 
     def cancel(self):
@@ -182,21 +330,45 @@ class _ChatWorker(QThread):
                 return
             parts: list[str] = []
             for piece in self.client.generate_chat(
-                history_for_api(self.messages), self.system, stream=True,
+                history_for_api(self.messages, self.name_prefixes), self.system,
+                stream=True,
                 post_history=self.post_history,
                 jailbreak=self.jailbreak,
                 examples_block=self.examples_block,
                 injections=self.injections,
+                conversation_start_header=self.conversation_start_header,
             ):
                 if self._cancel:
                     return
                 parts.append(piece)
                 self.chunk.emit(piece)
             if not self._cancel:
-                self.completed.emit(''.join(parts))
+                reply = ''.join(parts)
+                self._record_usage(reply)
+                notify_generation_finished(
+                    self.card_id, self.provider, self.model,
+                )
+                self.completed.emit(reply)
         except Exception as e:
             if not self._cancel:
                 self.error.emit(f"{e}\n{traceback.format_exc()}")
+
+    def _record_usage(self, reply: str) -> None:
+        """Book the finished generation in the usage ledger.
+
+        The prompt is the one the client actually sent (trimmed and with
+        the depth injections spliced in), so the recorded token numbers
+        describe the real request.
+        """
+        record_generation_usage(
+            provider=self.provider,
+            model=self.model,
+            card_id=self.card_id,
+            card_name=self.card_name,
+            session_id=self.session_id,
+            prompt_messages=getattr(self.client, 'last_request_messages', None),
+            reply=reply,
+        )
 
 
 class _SummarizeWorker(QThread):
@@ -413,6 +585,12 @@ class TestTab(QWidget):
         self._store = ChatSessionStore()
         self._worker: _ChatWorker | None = None
         self._summarize_worker: _SummarizeWorker | None = None
+        # Workers whose result has been handled but whose thread may still
+        # be running: they are kept referenced until the thread really
+        # finished, otherwise the QThread could be destroyed while it was
+        # still running ("QThread: Destroyed while thread is still
+        # running" aborts the process).
+        self._pending_workers: list[QThread] = []
         self._generating = False
         self._at_bottom = True
         # True while _render_history tears down/rebuilds the bubbles, so the
@@ -443,15 +621,18 @@ class TestTab(QWidget):
         self._pending_attachments: list[dict] = []
         self._greeting_index = 0
         # SillyTavern-style per-chat prompt knobs (persisted per session):
-        # Author's Note injection, user jailbreak block, active persona,
-        # and the system prompt template.
+        # Author's Note injection, user jailbreak block, and active persona.
         self._author_note: dict = normalize_author_note(None)
         self._jailbreak = ''
         self._persona_id = load_active_persona_id()
         self._persona = get_persona(self._persona_id).get('text', '')
-        self._system_template: str = active_template_id()
         # How the next response is applied (see _ChatWorker.mode).
         self._response_mode = 'assistant'
+        # What the running generation is billed to (card, session, provider
+        # and model); captured when the generation starts.
+        self._generation_meta: dict = {}
+        # The colour of the token label (follows the context pressure).
+        self._token_label_color = CONTEXT_COLOR_NORMAL
         # Number of leading messages already covered by a rolling summary.
         self._summarized_through = 0
         # Seed bump applied per regeneration so fixed seeds still vary.
@@ -532,9 +713,35 @@ class TestTab(QWidget):
         self._set_sampling_widgets(
             self._preset.temperature, self._preset.min_p, self._preset.context_size,
         )
-        # Templates may have been created/edited in Settings > Prompts.
-        self._populate_template_combo()
+        self._refresh_min_p_tooltip()
         self._render_history()
+
+    def _refresh_min_p_tooltip(self) -> None:
+        """Say whether the active provider implements Min-P at all.
+
+        The value is saved either way, but a provider that does not know
+        the parameter ignores it - which looks like a broken slider.
+        """
+        from src.provider_capabilities import unsupported_settings
+
+        widget = getattr(self, '_minp_override', None)
+        if widget is None:
+            return
+        text = (
+            'Min-P sampling override (0 = off); saved to Settings -> LLM '
+            'when changed.\n'
+            'A small value (~0.05) trims unlikely tokens while keeping '
+            'creativity — a good companion to a higher temperature.'
+        )
+        provider = getattr(self._preset, 'name', '')
+        if 'min_p' in unsupported_settings(provider):
+            text += (
+                f'\n{provider} does not implement Min-P: the value is left '
+                'out of the request and has no effect.'
+            )
+        else:
+            text += '\nNot every provider implements Min-P.'
+        widget.setToolTip(text)
 
     def _assemble_system(self) -> str:
         """Single source of truth for the system prompt sent to the API.
@@ -556,8 +763,9 @@ class TestTab(QWidget):
             memories=self._memories,
             attributes=self._attributes,
             custom_macros=self._custom_macros,
-            chat_template=resolve_template(self._system_template).content,
+            chat_template=self._sys_template().content,
             extra_books=self._extra_books,
+            context_template=self._ctx_template(),
         )
         if self._example_placement == 'system':
             block = self._examples_block()
@@ -569,7 +777,10 @@ class TestTab(QWidget):
         """Few-shot example dialogue as one labelled text block ('' = none)."""
         if self._card is None:
             return ''
-        return example_block_text(self._card, self._user_name, self._custom_macros)
+        return example_block_text(
+            self._card, self._user_name, self._custom_macros,
+            context_template=self._ctx_template(),
+        )
 
     def _examples_for_history(self) -> list[dict]:
         """Few-shot examples as fake history turns (legacy placement only)."""
@@ -582,7 +793,7 @@ class TestTab(QWidget):
     def _post_history_text(self) -> str:
         """Trailing instructions for the request (may be empty).
 
-        The card's ``post_history_instructions`` first, then the selected
+        The card's ``post_history_instructions`` first, then the active
         template's own post-history text (SillyTavern sysprompt presets carry
         one), both macro-substituted.
         """
@@ -591,7 +802,7 @@ class TestTab(QWidget):
             card_phi = post_history_text(self._card, self._user_name, self._custom_macros)
             if card_phi:
                 parts.append(card_phi)
-        tpl_phi = resolve_template(self._system_template).post_history.strip()
+        tpl_phi = self._sys_template().post_history.strip()
         if tpl_phi:
             parts.append(substitute_macros(
                 tpl_phi, self._user_name,
@@ -599,12 +810,18 @@ class TestTab(QWidget):
             ))
         return '\n\n'.join(parts)
 
-    def _jailbreak_text(self) -> str:
-        """Macro-substituted user jailbreak block (may be empty)."""
-        if not self._jailbreak.strip():
+    def _jailbreak_text(self, text: str | None = None) -> str:
+        """Macro-substituted user jailbreak block (may be empty).
+
+        *text* overrides the stored jailbreak, which is what the Context
+        Inspector needs: it previews the *edited* note and jailbreak before
+        the user applies them.
+        """
+        source = self._jailbreak if text is None else text
+        if not source.strip():
             return ''
         return substitute_macros(
-            self._jailbreak, self._user_name,
+            source, self._user_name,
             self._card.name if self._card else '', self._custom_macros,
         )
 
@@ -684,15 +901,6 @@ class TestTab(QWidget):
         toolbar_row = QHBoxLayout()
         toolbar_row.setContentsMargins(8, 8, 20, 2)
         toolbar_row.addStretch()
-        self._new_session_btn = QPushButton('New Chat')
-        self._new_session_btn.clicked.connect(self._on_new_session)
-        toolbar_row.addWidget(self._new_session_btn)
-        self._sessions_btn = QPushButton('Chats')
-        self._sessions_btn.setToolTip(
-            'Load, export, import, or delete this character\'s saved chats.'
-        )
-        self._sessions_btn.clicked.connect(self._on_sessions)
-        toolbar_row.addWidget(self._sessions_btn)
         self._memory_btn = QPushButton('Memory')
         self._memory_btn.clicked.connect(self._on_memory)
         toolbar_row.addWidget(self._memory_btn)
@@ -703,14 +911,22 @@ class TestTab(QWidget):
         )
         self._lore_btn.clicked.connect(self._on_lorebooks)
         toolbar_row.addWidget(self._lore_btn)
-        self._context_btn = QPushButton('Context')
+        self._context_btn = QPushButton('Prompt')
         self._context_btn.setToolTip(
-            'Inspect the exact context the next request will send.\n'
-            'The Author\'s Note and Jailbreak tabs edit this chat\'s '
-            'trailing instructions.'
+            'Inspect the exact prompt the next request will send, block by '
+            'block, with the token cost of each one.\n'
+            "The Author's Note and Jailbreak tabs edit this chat's trailing "
+            'instructions.'
         )
         self._context_btn.clicked.connect(self._on_context_inspect)
         toolbar_row.addWidget(self._context_btn)
+        self._pairings_btn = QPushButton('Pairings')
+        self._pairings_btn.setToolTip(
+            'Save this character together with the persona you are chatting '
+            'with, and jump back into it later.'
+        )
+        self._pairings_btn.clicked.connect(self._on_pairings)
+        toolbar_row.addWidget(self._pairings_btn)
         self._auto_summarize_btn = QPushButton('Auto-Summarize')
         self._auto_summarize_btn.setCheckable(True)
         self._auto_summarize_btn.clicked.connect(self._on_auto_summarize_toggled)
@@ -748,7 +964,7 @@ class TestTab(QWidget):
         status_row = QHBoxLayout()
         status_row.setContentsMargins(12, 2, 12, 0)
         self._token_label = QLabel('')
-        self._token_label.setStyleSheet('color: #777;')
+        self._token_label.setStyleSheet(f'color: {CONTEXT_COLOR_NORMAL};')
         status_row.addWidget(self._token_label)
         self._apply_font_sizes()
         status_row.addStretch()
@@ -781,6 +997,18 @@ class TestTab(QWidget):
 
         button_row = QHBoxLayout()
         button_row.setContentsMargins(8, 4, 8, 2)
+        # The chat controls sit on the left of the input row, next to the
+        # message buttons on the right.
+        self._new_session_btn = QPushButton('New Chat')
+        self._new_session_btn.setToolTip('Start a fresh conversation.')
+        self._new_session_btn.clicked.connect(self._on_new_session)
+        button_row.addWidget(self._new_session_btn)
+        self._sessions_btn = QPushButton('Chats')
+        self._sessions_btn.setToolTip(
+            'Load, export, import, or delete this character\'s saved chats.'
+        )
+        self._sessions_btn.clicked.connect(self._on_sessions)
+        button_row.addWidget(self._sessions_btn)
         button_row.addStretch()
         self._impersonate_btn = QPushButton('Impersonate')
         self._impersonate_btn.setToolTip(
@@ -810,21 +1038,6 @@ class TestTab(QWidget):
         settings_row = QHBoxLayout()
         settings_row.setContentsMargins(8, 2, 8, 8)
         small_style = 'color: #777;'
-        tpl_label = QLabel('Template')
-        tpl_label.setStyleSheet(small_style)
-        settings_row.addWidget(tpl_label)
-        self._template_combo = QComboBox()
-        self._template_combo.setMinimumWidth(150)
-        self._template_combo.setToolTip(
-            'System prompt template for this chat (the main prompt).\n'
-            'The card\'s own system prompt is appended after it; "Blank" '
-            'keeps only the card\'s instructions.\n'
-            'Templates are created and edited in Settings > Prompts > '
-            'Manage Templates...'
-        )
-        self._populate_template_combo()
-        self._template_combo.currentIndexChanged.connect(self._on_template_changed)
-        settings_row.addWidget(self._template_combo)
         model_label = QLabel('Model')
         model_label.setStyleSheet(small_style)
         settings_row.addWidget(model_label)
@@ -877,14 +1090,9 @@ class TestTab(QWidget):
         self._minp_override.setSingleStep(0.05)
         self._minp_override.setDecimals(2)
         self._minp_override.setValue(self._preset.min_p)
-        self._minp_override.setToolTip(
-            'Min-P sampling override (0 = off); saved to Settings -> LLM '
-            'when changed.\n'
-            'A small value (~0.05) trims unlikely tokens while keeping '
-            'creativity — a good companion to a higher temperature.'
-        )
         self._minp_override.valueChanged.connect(self._on_sampling_changed)
         settings_row.addWidget(self._minp_override)
+        self._refresh_min_p_tooltip()
         settings_row.addStretch()
         right_layout.addLayout(settings_row)
 
@@ -957,7 +1165,12 @@ class TestTab(QWidget):
         if not data:
             return
         self._session_id = session_id
-        self._messages = [dict(m) for m in data.get('messages', [])]
+        # A session file is on-disk data: it can be hand-edited, written by
+        # another build, or left half-written.  ``dict(m)`` on a non-dict
+        # message raised in a Qt slot, which aborts the process.
+        self._messages = [
+            dict(m) for m in (data.get('messages') or []) if isinstance(m, dict)
+        ]
         self._memories = normalize_memories(data)
         self._summarized_through = 0
         self._regen_bump = 0
@@ -975,12 +1188,10 @@ class TestTab(QWidget):
         self._jailbreak = data.get('jailbreak') or ''
         self._persona_id = load_active_persona_id()
         self._persona = get_persona(self._persona_id).get('text', '')
-        self._system_template = data.get('system_template') or active_template_id()
         self._sync_auto_toggle()
         self._update_memory_button()
         self._refresh_memory_dialog()
         self._update_prompt_buttons()
-        self._sync_template_combo()
         self._at_bottom = True
         self._render_history()
 
@@ -997,11 +1208,9 @@ class TestTab(QWidget):
         self._jailbreak = ''
         self._persona_id = load_active_persona_id()
         self._persona = get_persona(self._persona_id).get('text', '')
-        self._system_template = active_template_id()
         self._sync_auto_toggle()
         self._update_memory_button()
         self._update_prompt_buttons()
-        self._sync_template_combo()
         if self._include_first and self._card is not None and self._card.first_mes:
                 self._messages = build_initial_messages(
                     self._card, self._user_name, custom_macros=self._custom_macros,
@@ -1014,35 +1223,17 @@ class TestTab(QWidget):
         if getattr(self, '_context_btn', None) is not None:
             has_note = bool((self._author_note.get('text') or '').strip())
             has_jb = bool(self._jailbreak.strip())
-            self._context_btn.setText('Context*' if (has_note or has_jb) else 'Context')
+            self._context_btn.setText('Prompt*' if (has_note or has_jb) else 'Prompt')
 
-    def _populate_template_combo(self) -> None:
-        """Fill the template combo and select this chat's template."""
-        combo = getattr(self, '_template_combo', None)
-        if combo is None:
-            return
-        combo.blockSignals(True)
-        combo.clear()
-        for tpl in all_templates():
-            combo.addItem(tpl.name, tpl.id)
-        idx = combo.findData(self._system_template)
-        combo.setCurrentIndex(idx if idx >= 0 else 0)
-        combo.blockSignals(False)
+    def _sys_template(self):
+        """The active system prompt template (Settings > Prompts)."""
+        return resolve_template(active_template_id())
 
-    def _sync_template_combo(self) -> None:
-        """Re-select this chat's template (after a session switch)."""
-        self._populate_template_combo()
-
-    def _on_template_changed(self, index: int) -> None:
-        combo = getattr(self, '_template_combo', None)
-        if combo is None:
-            return
-        template_id = combo.itemData(index)
-        if not template_id or template_id == self._system_template:
-            return
-        self._system_template = str(template_id)
-        self._save_current_session()
-        self._update_token_label()
+    def _ctx_template(self):
+        """The active context template (Settings > Prompts)."""
+        return context_templates.resolve_template(
+            context_templates.active_context_template_id(),
+        )
 
     def _on_new_session(self) -> None:
         if self._current_id is None:
@@ -1196,7 +1387,7 @@ class TestTab(QWidget):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(6)
         label = QLabel('Greeting:')
-        label.setStyleSheet(f'color: #777; font-size: {max(8, self._font_size - 2)}px;')
+        label.setStyleSheet(f'color: #777; font-size: {ui_font_px(-2)}px;')
         h.addWidget(label)
         combo = QComboBox()
         options = self._greeting_options()
@@ -1345,8 +1536,16 @@ class TestTab(QWidget):
             # Keep the reader's place: clearing the bubbles clamps the
             # scrollbar, so restore once the rebuilt layout has settled.
             def _restore() -> None:
-                bar.setValue(min(scroll_pos, bar.maximum()))
-                self._update_at_bottom(bar.value())
+                # The tab may be torn down before the timer fires: calling
+                # into a destroyed scrollbar raises RuntimeError, and an
+                # exception inside a slot aborts the whole process.
+                if not _widget_alive(bar):
+                    return
+                try:
+                    bar.setValue(min(scroll_pos, bar.maximum()))
+                    self._update_at_bottom(bar.value())
+                except RuntimeError:
+                    pass
 
             QTimer.singleShot(0, _restore)
 
@@ -1378,6 +1577,8 @@ class TestTab(QWidget):
     def _recount_tokens(self) -> None:
         if self._current_id is None or self._card is None:
             self._token_label.setText('')
+            self._token_label_color = CONTEXT_COLOR_NORMAL
+            self._apply_font_sizes()
             return
         # The plan is the exact payload the send path builds (system blocks,
         # example dialogue, history + depth injections, post-history and
@@ -1394,14 +1595,34 @@ class TestTab(QWidget):
             example_placement=self._example_placement,
             author_note=self._author_note,
             jailbreak=self._jailbreak,
+            context_template=self._ctx_template(),
         )
         total = plan.total_tokens
         ctx = self._effective_context_size()
         self._apply_font_sizes()
         if ctx:
-            self._token_label.setText(f'{total:,} / {ctx:,} tokens')
+            text = f'{total:,} / {ctx:,} tokens'
         else:
-            self._token_label.setText(f'{total:,} tokens')
+            text = f'{total:,} tokens'
+        self._apply_context_pressure(text, total, ctx)
+
+    def _apply_context_pressure(self, text: str, tokens: int, limit: int) -> None:
+        """Style the token label according to how full the context window is.
+
+        Below ~70 % of the window the label keeps its plain look, from there
+        on it turns amber, and a prompt that does not fit turns red and says
+        so.
+        """
+        level = context_pressure_level(tokens, limit)
+        if level == 'over':
+            self._token_label_color = CONTEXT_COLOR_OVER
+            text = f'{text}{CONTEXT_OVER_SUFFIX}'
+        elif level == 'warning':
+            self._token_label_color = CONTEXT_COLOR_WARNING
+        else:
+            self._token_label_color = CONTEXT_COLOR_NORMAL
+        self._token_label.setText(text)
+        self._apply_font_sizes()
 
     def _update_at_bottom(self, value: int) -> None:
         if self._rebuilding:
@@ -1426,7 +1647,19 @@ class TestTab(QWidget):
     def _scroll_to_bottom(self) -> None:
         self._at_bottom = True
         bar = self._chat_scroll.verticalScrollBar()
-        QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
+
+        def _scroll() -> None:
+            # The tab can be torn down before the timer fires; a destroyed
+            # scrollbar must not raise inside the slot (it would abort the
+            # process).
+            if not _widget_alive(bar):
+                return
+            try:
+                bar.setValue(bar.maximum())
+            except RuntimeError:
+                pass
+
+        QTimer.singleShot(0, _scroll)
 
     # ---- sending / streaming ----
 
@@ -1468,9 +1701,20 @@ class TestTab(QWidget):
         self._start_generation(mode='continue')
 
     def _start_generation(self, mode: str = 'assistant') -> None:
-        client = AIClient(self._effective_preset())
+        preset = self._effective_preset()
+        client = AIClient(preset)
         self._generating = True
         self._response_mode = mode
+        # What the generation is billed to.  It is captured here (and not
+        # read back when the reply arrives) so a selection change in
+        # between cannot mislabel the generation.
+        self._generation_meta = {
+            'card_id': self._current_id,
+            'card_name': self._card.name if self._card else '',
+            'session_id': self._session_id or '',
+            'provider': preset.name,
+            'model': preset.model,
+        }
         self._send_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._input.setEnabled(False)
@@ -1497,20 +1741,38 @@ class TestTab(QWidget):
             custom_macros=self._custom_macros,
         )
         self._summarize_evicted(system, api_history, injections)
+        ctx_template = self._ctx_template()
         jailbreak = self._jailbreak_text()
         mode_prompt = self._mode_prompt(mode)
         if mode_prompt:
             jailbreak = f'{jailbreak}\n\n{mode_prompt}' if jailbreak.strip() else mode_prompt
+        if jailbreak.strip():
+            jailbreak = context_templates.render_jailbreak(ctx_template, jailbreak)
+        post_history = self._post_history_text()
+        if post_history.strip():
+            post_history = context_templates.render_post_history(
+                ctx_template, post_history,
+            )
         examples_block = (
             self._examples_block() if self._example_placement == 'post_history' else ''
         )
         self._worker = _ChatWorker(
             client, system, api_history, self,
-            post_history=self._post_history_text(),
+            post_history=post_history,
             jailbreak=jailbreak,
             examples_block=examples_block,
             injections=injections,
             mode=mode,
+            name_prefixes=context_templates.name_prefixes(
+                ctx_template, self._user_name,
+                self._card.name if self._card else '',
+            ),
+            conversation_start_header=ctx_template.conversation_start_header,
+            card_id=self._generation_meta['card_id'],
+            card_name=self._generation_meta['card_name'],
+            session_id=self._generation_meta['session_id'],
+            provider=self._generation_meta['provider'],
+            model=self._generation_meta['model'],
         )
         self._worker.chunk.connect(self._append_streaming_chunk)
         self._worker.completed.connect(self._on_response)
@@ -1548,7 +1810,10 @@ class TestTab(QWidget):
             api_history = list(self._messages)
         injections = list(injections or [])
         full: list[dict] = [{'role': 'system', 'content': system}]
-        full.extend(history_for_api(api_history))
+        full.extend(history_for_api(api_history, context_templates.name_prefixes(
+            self._ctx_template(), self._user_name,
+            self._card.name if self._card else '',
+        )))
         reserve = sum(count_tokens(i.content) for i in injections)
         _, dropped = split_for_context(
             full, ctx, self._preset.max_tokens, reserve=reserve,
@@ -1672,6 +1937,10 @@ class TestTab(QWidget):
                     signal.disconnect(slot)
                 except (TypeError, RuntimeError):
                     pass   # never connected, or the object is already gone
+            # The result is emitted from *inside* run(), so the thread can
+            # still be a few instructions from returning: keep the worker
+            # referenced until the thread has really finished.
+            self._retire_worker(worker)
         # Remove the streaming placeholder widget too: only _on_response
         # dropped it before, so cancelling a generation left a phantom
         # bubble on screen (and one more bubble than messages) until some
@@ -1687,6 +1956,36 @@ class TestTab(QWidget):
             self._render_history()
         self._update_token_label()
         self._input.setFocus()
+
+    def _retire_worker(self, worker: QThread | None) -> None:
+        """Keep a reference to *worker* until its thread has really finished.
+
+        ``completed`` / ``error`` are emitted from *inside* ``run()``, so the
+        queued slot can run while the worker thread is still a few
+        instructions from returning.  Dropping the last reference then let
+        the QThread be destroyed while it was still running, which aborts
+        the process ("QThread: Destroyed while thread is still running").
+        The worker is released again once the thread reports that it
+        finished.
+        """
+        if worker is None:
+            return
+        self._pending_workers = [
+            pending for pending in self._pending_workers
+            if self._worker_is_alive(pending)
+        ]
+        if not self._worker_is_alive(worker):
+            # Already stopped: destroying it now is safe.
+            return
+        self._pending_workers.append(worker)
+        worker.finished.connect(self._on_worker_finished)
+
+    def _on_worker_finished(self) -> None:
+        """Release the workers whose thread has stopped (GUI thread)."""
+        self._pending_workers = [
+            pending for pending in self._pending_workers
+            if self._worker_is_alive(pending)
+        ]
 
     def _on_cancel(self) -> None:
         if not (self._generating and self._worker_is_alive(self._worker)):
@@ -1946,8 +2245,66 @@ class TestTab(QWidget):
         self._memory_dialog.raise_()
         self._memory_dialog.activateWindow()
 
+    def _build_preview(self, author_note: dict, jailbreak: str):
+        """Build the prompt preview of the next request.
+
+        Mirrors the send path exactly: the same system assembly, the same
+        trailing blocks (example dialogue, post-history instructions and
+        the user's jailbreak) and the same trim, so the preview cannot
+        drift from what the provider receives.
+        """
+        from src.prompt_preview import build_preview
+
+        if self._card is None:
+            return None
+        template = self._sys_template()
+        ctx_template = self._ctx_template()
+
+        # The trailing blocks are rendered the way the send path renders
+        # them, so the preview shows the final text.  The jailbreak comes
+        # from the argument, not from the stored value: the Context
+        # Inspector previews the *edited* text before it is applied.
+        rendered_jailbreak = self._jailbreak_text(jailbreak)
+        if rendered_jailbreak.strip():
+            rendered_jailbreak = context_templates.render_jailbreak(
+                ctx_template, rendered_jailbreak,
+            )
+        rendered_post_history = self._post_history_text()
+        if rendered_post_history.strip():
+            rendered_post_history = context_templates.render_post_history(
+                ctx_template, rendered_post_history,
+            )
+        examples_block = (
+            self._examples_block() if self._example_placement == 'post_history' else ''
+        )
+
+        note_text = str((author_note or {}).get('text', '') or '')
+        return build_preview(
+            self._card,
+            self._messages,
+            system_prompt=template.content,
+            context_limit=self._effective_context_size() or 8192,
+            max_tokens=self._preset.max_tokens,
+            personas=[self._persona] if self._persona else [],
+            memories=self._memories,
+            attributes=self._attributes,
+            author_note=author_note if isinstance(author_note, dict) else note_text,
+            jailbreak=rendered_jailbreak,
+            post_history=rendered_post_history,
+            examples_block=examples_block,
+            example_turns=self._examples_for_history(),
+            extra_books=self._extra_books,
+            user_name=self._user_name,
+            name_prefixes=context_templates.name_prefixes(
+                ctx_template, self._user_name,
+                self._card.name if self._card else '',
+            ),
+            custom_macros=self._custom_macros,
+            context_template=ctx_template,
+        )
+
     def _on_context_inspect(self) -> None:
-        """Show the exact context the next request will send.
+        """Show the exact prompt the next request will send.
 
         The dialog's Author's Note / Jailbreak tabs edit this chat's trailing
         instructions; OK applies them, Cancel discards.
@@ -1955,37 +2312,19 @@ class TestTab(QWidget):
         if self._card is None:
             return
 
-        def plan_factory(author_note: dict, jailbreak: str):
-            template = resolve_template(self._system_template)
-            plan = build_context_plan(
-                self._card,
-                self._messages,
-                memories=self._memories,
-                attributes=self._attributes,
-                user_name=self._user_name,
-                custom_macros=self._custom_macros,
-                persona=self._persona,
-                extra_books=self._extra_books,
-                example_placement=self._example_placement,
-                author_note=author_note,
-                jailbreak=jailbreak,
-                chat_template=template.content,
-                template_post_history=template.post_history,
-            )
-            if plan.sections and template.name:
-                # Show which template the main prompt came from.
-                first = plan.sections[0]
-                if first.title == 'System Prompt':
-                    first.title = f'System Prompt ({template.name})'
-            return plan
+        def preview_factory(author_note: dict, jailbreak: str):
+            return self._build_preview(author_note, jailbreak)
 
+        preview = self._build_preview(self._author_note, self._jailbreak)
+        if preview is None:
+            return
         dialog = ContextInspectorDialog(
-            plan_factory(self._author_note, self._jailbreak),
+            preview,
             self._effective_context_size(),
             self,
             author_note=self._author_note,
             jailbreak=self._jailbreak,
-            plan_factory=plan_factory,
+            preview_factory=preview_factory,
         )
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         note = dialog.author_note()
@@ -1998,6 +2337,44 @@ class TestTab(QWidget):
         self._update_prompt_buttons()
         self._update_token_label()
         self._save_current_session()
+
+    def _on_pairings(self) -> None:
+        """Save / manage the card + persona pairings."""
+        from src.persona_pairings import Pairing, list_pairings, save_pairing
+        from src.ui.widgets.feature_dialogs import PairingsDialog
+
+        if self._card is None:
+            self.status_message.emit('Select a character first.', 3000)
+            return
+
+        existing = list_pairings()
+        same_card = [p for p in existing if p.card_id == self._current_id]
+        if same_card:
+            # The pairing already exists: open the manager on it.
+            dialog = PairingsDialog(self.db, self)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            dialog.exec()
+            return
+
+        from datetime import datetime, timezone
+        persona_name = ''
+        try:
+            from src.settings_manager import get_persona
+            persona_name = str(get_persona(self._persona_id).get('name', '') or '')
+        except Exception:
+            persona_name = ''
+        pairing = Pairing(
+            id=datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f'),
+            card_id=self._current_id,
+            card_name=self._card.name,
+            persona_name=persona_name or 'Default',
+            persona_text=self._persona or '',
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        save_pairing(pairing)
+        self.status_message.emit(
+            f'Saved the pairing "{self._card.name}" / {pairing.persona_name}.', 4000,
+        )
 
     def _on_memories_changed(self, memories: list) -> None:
         self._memories = [dict(m) for m in memories]
@@ -2088,6 +2465,7 @@ class TestTab(QWidget):
 
     @pyqtSlot(str)
     def _on_summary(self, summary: str) -> None:
+        self._retire_worker(self._summarize_worker)
         self._summarize_worker = None
         self._set_summarizing(False)
         if (self._summarize_char_id != self._current_id
@@ -2110,6 +2488,7 @@ class TestTab(QWidget):
 
     @pyqtSlot(str)
     def _on_summary_error(self, error: str) -> None:
+        self._retire_worker(self._summarize_worker)
         self._summarize_worker = None
         self._set_summarizing(False)
         quiet = getattr(self, '_summarize_quiet', False)
@@ -2156,6 +2535,7 @@ class TestTab(QWidget):
 
     @pyqtSlot(str)
     def _on_attribute_update(self, result: str) -> None:
+        self._retire_worker(self._attr_worker)
         self._attr_worker = None
         self._set_updating_attributes(False)
         if (self._attr_char_id != self._current_id
@@ -2178,6 +2558,7 @@ class TestTab(QWidget):
 
     @pyqtSlot(str)
     def _on_attribute_update_error(self, error: str) -> None:
+        self._retire_worker(self._attr_worker)
         self._attr_worker = None
         self._set_updating_attributes(False)
         if getattr(self, '_attr_quiet', True):
@@ -2256,6 +2637,26 @@ class TestTab(QWidget):
                     ),
                     encoding='utf-8',
                 )
+            elif fmt == 'md':
+                from src.chat_export import session_to_markdown
+                Path(path).write_text(
+                    session_to_markdown(
+                        messages,
+                        card_name=self._card.name if self._card else '',
+                        title=title,
+                    ),
+                    encoding='utf-8',
+                )
+            elif fmt == 'html':
+                from src.chat_export import session_to_html
+                Path(path).write_text(
+                    session_to_html(
+                        messages,
+                        card_name=self._card.name if self._card else '',
+                        title=title,
+                    ),
+                    encoding='utf-8',
+                )
             else:
                 Path(path).write_text(self._conversation_text(messages), encoding='utf-8')
             self.status_message.emit(f'Exported chat to {path}', 5000)
@@ -2302,11 +2703,9 @@ class TestTab(QWidget):
         self._jailbreak = ''
         self._persona_id = load_active_persona_id()
         self._persona = get_persona(self._persona_id).get('text', '')
-        self._system_template = active_template_id()
         self._sync_auto_toggle()
         self._update_memory_button()
         self._update_prompt_buttons()
-        self._sync_template_combo()
         self._at_bottom = True
         self._render_history()
         self._save_current_session()
@@ -2327,7 +2726,6 @@ class TestTab(QWidget):
             author_note=self._author_note,
             jailbreak=self._jailbreak,
             persona_id=self._persona_id,
-            system_template=self._system_template,
         )
 
     def refresh_font_size(self) -> None:
@@ -2337,9 +2735,12 @@ class TestTab(QWidget):
         self._render_history()
 
     def _apply_font_sizes(self) -> None:
-        small = max(8, self._font_size - 2)
+        small = ui_font_px(-2)
         if getattr(self, '_token_label', None) is not None:
-            self._token_label.setStyleSheet(f'color: #777; font-size: {small}px;')
+            # The colour follows the context pressure, so it is kept in an
+            # attribute instead of being hard-coded here.
+            color = getattr(self, '_token_label_color', CONTEXT_COLOR_NORMAL)
+            self._token_label.setStyleSheet(f'color: {color}; font-size: {small}px;')
 
     @staticmethod
     def _worker_is_alive(worker) -> bool:
@@ -2357,28 +2758,42 @@ class TestTab(QWidget):
             # before saving so a shutdown mid-generation loses nothing.
             self._restore_interrupted_response()
         self._save_current_session()
+        # One shared deadline for every worker: waiting on each of them
+        # with the full timeout in turn could block the shutdown for
+        # 3 x timeout_ms.
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
         if self._generating and self._worker_is_alive(self._worker):
             try:
                 self._worker.cancel()
-                if not self._worker.wait(timeout_ms):
+                if not self._wait_worker(self._worker, deadline):
                     return False
             except RuntimeError:
                 pass
-        if self._worker_is_alive(self._summarize_worker):
+        for worker in (self._summarize_worker, self._attr_worker):
+            if not self._worker_is_alive(worker):
+                continue
             try:
-                self._summarize_worker.cancel()
-                if not self._summarize_worker.wait(timeout_ms):
+                worker.cancel()
+                if not self._wait_worker(worker, deadline):
                     return False
             except RuntimeError:
                 pass
-        if self._worker_is_alive(self._attr_worker):
+        # Workers whose result was already handled but whose thread may
+        # still be running: destroying them now would abort the process.
+        for worker in list(self._pending_workers):
+            if not self._worker_is_alive(worker):
+                continue
             try:
-                self._attr_worker.cancel()
-                if not self._attr_worker.wait(timeout_ms):
+                if not self._wait_worker(worker, deadline):
                     return False
             except RuntimeError:
                 pass
         return True
+
+    def _wait_worker(self, worker: QThread, deadline: float) -> bool:
+        """Wait for *worker* until *deadline*; True when it stopped."""
+        remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
+        return bool(worker.wait(remaining_ms))
 
     def current_preset(self) -> APIPreset:
         return self._preset

@@ -9,6 +9,9 @@ class ShortcutAction:
 
     Pure-data class so the registry can be unit-tested without a Qt event
     loop.  ``menu_path`` uses ``/`` to denote sub-menus (e.g. ``"View/Sort"``).
+    ``shortcut_aliases`` holds extra key sequences that trigger the same
+    action (e.g. ``Ctrl+P`` next to ``Ctrl+K``); they are never unique to
+    one action.
     """
 
     action_id: str
@@ -16,6 +19,7 @@ class ShortcutAction:
     shortcut: str
     menu_path: str
     separator_before: bool = False
+    shortcut_aliases: tuple[str, ...] = ()
 
 
 ACTIONS: list[ShortcutAction] = [
@@ -25,6 +29,7 @@ ACTIONS: list[ShortcutAction] = [
     ShortcutAction('file.export_json', 'Export as JSON', '', 'File'),
     ShortcutAction('file.backup', 'Backup Now', '', 'File', separator_before=True),
     ShortcutAction('file.backup_library', 'Backup Library...', '', 'File'),
+    ShortcutAction('file.backup_encrypted', 'Encrypted Backup...', '', 'File'),
     ShortcutAction('file.restore_library', 'Restore Library...', '', 'File'),
     ShortcutAction('file.check_library', 'Check Library for Problems...', '', 'File'),
     ShortcutAction('file.quit', 'Quit', 'Ctrl+Q', 'File', separator_before=True),
@@ -44,13 +49,34 @@ ACTIONS: list[ShortcutAction] = [
     ShortcutAction('view.sort_date', 'Sort by Date Added', '', 'View/Sort'),
     ShortcutAction('view.sort_tokens', 'Sort by Token Count', '', 'View/Sort'),
     ShortcutAction('view.sort_favorites', 'Sort by Favorites', '', 'View/Sort'),
+    ShortcutAction('view.sort_rating', 'Sort by Rating', '', 'View/Sort'),
     ShortcutAction('view.sort_random', 'Sort by Random', '', 'View/Sort'),
     ShortcutAction('view.refresh', 'Refresh', 'F5', 'View', separator_before=True),
-    ShortcutAction('view.zoom_in', 'Zoom In', 'Ctrl+=', 'View'),
+    ShortcutAction(
+        'view.zoom_in', 'Zoom In', 'Ctrl+=', 'View',
+        shortcut_aliases=('Ctrl++',),
+    ),
     ShortcutAction('view.zoom_out', 'Zoom Out', 'Ctrl+-', 'View'),
+    ShortcutAction('view.zoom_reset', 'Reset Zoom', 'Ctrl+0', 'View'),
     ShortcutAction('view.font_size', 'Font Size...', '', 'View'),
     ShortcutAction('view.find_duplicates', 'Find Duplicates...', '', 'View', separator_before=True),
     ShortcutAction('view.statistics', 'Statistics...', '', 'View'),
+    ShortcutAction('view.lint_card', 'Check Card...', '', 'View'),
+    ShortcutAction('view.batch_edit', 'Batch Edit...', '', 'View'),
+    ShortcutAction('view.semantic_search', 'Semantic Search...', '', 'View'),
+    ShortcutAction('view.usage_stats', 'Usage & Cost...', '', 'View'),
+    ShortcutAction(
+        'view.command_palette', 'Command Palette...', 'Ctrl+K', 'View',
+        separator_before=True, shortcut_aliases=('Ctrl+P',),
+    ),
+
+    # --- Tab navigation (Ctrl+1 .. Ctrl+6) ---
+    ShortcutAction('tab.library', 'Library', 'Ctrl+1', 'View/Tabs', separator_before=True),
+    ShortcutAction('tab.edit', 'Edit', 'Ctrl+2', 'View/Tabs'),
+    ShortcutAction('tab.gallery', 'Gallery', 'Ctrl+3', 'View/Tabs'),
+    ShortcutAction('tab.generate', 'Generate', 'Ctrl+4', 'View/Tabs'),
+    ShortcutAction('tab.lorebooks', 'Lorebooks', 'Ctrl+5', 'View/Tabs'),
+    ShortcutAction('tab.test', 'Test', 'Ctrl+6', 'View/Tabs'),
 
     # --- SillyTavern ---
     ShortcutAction('st.configure', 'Configure SillyTavern...', '', 'SillyTavern'),
@@ -68,6 +94,7 @@ ACTIONS: list[ShortcutAction] = [
     # --- Help ---
     ShortcutAction('help.about', 'About ST Explorer', '', 'Help'),
     ShortcutAction('help.view_log', 'View Log', '', 'Help'),
+    ShortcutAction('help.crash_report', 'Create Crash Report...', '', 'Help'),
 ]
 
 _ACTION_INDEX: dict[str, ShortcutAction] = {a.action_id: a for a in ACTIONS}

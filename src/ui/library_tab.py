@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
@@ -26,7 +27,9 @@ from PyQt6.QtWidgets import (
 
 from src.card_models import CharacterCard
 from src.card_parser import read_card_data
-from src.database import SORT_LABELS, LibraryDatabase, sanitize_filename
+# ``_escape_like`` is the LIKE-metacharacter escaper the database's own
+# search uses; the bounded search below must escape identically.
+from src.database import SORT_LABELS, LibraryDatabase, _escape_like, sanitize_filename
 from src.settings_manager import load_font_size
 from src.ui.dialog_helper import exec_dialog, exec_dialog_with
 from src.ui.widgets.async_image import (
@@ -37,12 +40,58 @@ from src.ui.widgets.card_thumbnail import CardThumbnail
 from src.ui.widgets.flow_layout import FlowLayout
 from src.ui.widgets.rating_widget import RatingWidget
 from src.ui.widgets.tag_widget import TagChip, TagWidget
+from src import safe_json
 
 logger = logging.getLogger(__name__)
 
 # File types that can be drag-and-dropped / imported.  Lower-cased suffixes
 # (no dot) so the check is suffix-agnostic.
 _IMPORTABLE_EXTENSIONS: tuple[str, ...] = ('.png', '.json')
+
+# How many cards the grid builds at once.  Every card costs one thumbnail
+# widget (two filesystem stats plus a font-metrics measurement), so an
+# unbounded rebuild froze the UI for seconds on a library with thousands of
+# cards.  The rest is reachable through the "Load more" button.
+GRID_PAGE_SIZE = 100
+
+#: The page size that means "every matching card, no paging at all".
+ALL_CARDS = 0
+
+#: The query limit that stands for "every matching card".  Far above any
+#: real library, but a real number so the SQL stays a plain LIMIT.
+NO_LIMIT = 1_000_000
+
+#: The choices offered by the "cards per page" dropdown.
+PAGE_SIZE_CHOICES: tuple[tuple[str, int], ...] = (
+    ('25', 25),
+    ('50', 50),
+    ('100', 100),
+    ('200', 200),
+    ('500', 500),
+    ('1000', 1000),
+    ('All', ALL_CARDS),
+)
+
+#: The default edge length (px) of a Library grid thumbnail.  "Reset Zoom"
+#: (Ctrl+0) restores it.
+DEFAULT_THUMB_SIZE = 152
+
+
+def _configured_page_size() -> int:
+    """The number of cards the grid loads per page (0 = all of them).
+
+    The portable config can raise or lower it (``[library] page_size = 250``);
+    the value is clamped so a typo cannot make the grid unusable.  Zero is
+    the one value that is not clamped: it is the "show everything" choice.
+    """
+    try:
+        from src.portable_config import get
+        value = int(get('library.page_size', GRID_PAGE_SIZE))
+    except Exception:
+        return GRID_PAGE_SIZE
+    if value == ALL_CARDS:
+        return ALL_CARDS
+    return max(10, min(2000, value))
 
 
 def _filter_importable_paths(paths: list[str]) -> list[str]:
@@ -57,12 +106,134 @@ def _filter_importable_paths(paths: list[str]) -> list[str]:
 def _build_import_summary(imported: int, skipped: int) -> str:
     """Build the short status-bar summary for an import operation.
 
-    Pure function so the message formatting can be unit-tested without Qt.
+    Pure function so the message formatting can be unit-testable without Qt.
     """
     msg = f"Imported {imported} card(s)."
     if skipped:
         msg += f" Skipped {skipped} duplicate(s)."
     return msg
+
+
+def notify_card_deleted(card_id: int, name: str) -> None:
+    """Announce a deleted card to the plugin/event bus.
+
+    The event module is imported lazily - it is an optional cross-cutting
+    module and must not be pulled in at start-up - and every error is
+    swallowed: a failing user plugin must never break the deletion.
+
+    Args:
+        card_id: The database id of the deleted card.
+        name: The name of the deleted card.
+    """
+    try:
+        from src import app_events
+        app_events.card_deleted(card_id, name)
+    except Exception:
+        logger.exception("Could not announce the deleted card")
+
+
+def _search_page(
+    db: LibraryDatabase,
+    query: str = '',
+    tags: list[str] | None = None,
+    sort_by: str = 'name',
+    favorites_only: bool = False,
+    min_rating: int = 0,
+    collection_id: int | None = None,
+    limit: int = GRID_PAGE_SIZE,
+    offset: int = 0,
+    only_id: int | None = None,
+    full_text: bool = False,
+    fuzzy: bool = False,
+) -> tuple[list[dict], int]:
+    """Return one page of matching cards plus the total number of matches.
+
+    ``LibraryDatabase.search`` has no LIMIT, so every search / filter /
+    sort pulled *all* matching rows out of SQLite (``SELECT *``) and then
+    built one thumbnail widget per row - the UI froze for seconds on a
+    library with a few thousand cards.  This mirrors the search semantics
+    but bounds the number of rows that come back.
+
+    *only_id* restricts the result to a single card (used to check whether
+    a card passes the current filter without loading the whole page).
+
+    *full_text* also matches the full card body (the description, the other
+    prompt fields, the creator notes and the character book) instead of only
+    the short preview.  *fuzzy* additionally keeps the cards whose name,
+    creator or one of their tags contains every word of the query, in any
+    order.  Both are one extra SQL clause - never a query per row.
+
+    The WHERE clause must be kept in sync with ``LibraryDatabase.search``.
+    """
+    clauses: list[str] = []
+    params: list = []
+    if only_id is not None:
+        clauses.append('id = ?')
+        params.append(int(only_id))
+    if favorites_only:
+        clauses.append('is_favorite = 1')
+    if min_rating and min_rating > 0:
+        clauses.append('rating >= ?')
+        params.append(int(min_rating))
+    if collection_id is not None:
+        if collection_id < 0:
+            # Sentinel: cards that belong to no collection at all.
+            clauses.append('id NOT IN (SELECT character_id FROM card_collections)')
+        else:
+            clauses.append(
+                'id IN (SELECT character_id FROM card_collections '
+                'WHERE collection_id = ?)'
+            )
+            params.append(int(collection_id))
+    # The text clause is built inside the connection block: the full-text
+    # variant needs a column that only exists in a library created by a
+    # newer build, so the schema has to be checked first.
+    text_clauses: list[str] = []
+    text_params: list = []
+    if query:
+        # Escape LIKE metacharacters so a query of "%" doesn't match
+        # every row.
+        q = f"%{_escape_like(query)}%"
+        text_clauses = [
+            "(name LIKE ? ESCAPE '\\' OR description_preview LIKE ? ESCAPE '\\' "
+            "OR tags LIKE ? ESCAPE '\\' OR creator LIKE ? ESCAPE '\\' "
+            "OR creator_notes LIKE ? ESCAPE '\\')"
+        ]
+        text_params = [q, q, q, q, q]
+        if fuzzy:
+            # Word-wise match: every word of the query has to appear in the
+            # name, the creator or one of the tags.
+            text_clauses.append(
+                '(st_fuzzy_match(name, ?) = 1 '
+                'OR st_fuzzy_match(creator, ?) = 1 '
+                'OR st_fuzzy_tags(tags, ?) = 1)'
+            )
+            text_params.extend([query, query, query])
+    for tag in tags or []:
+        # Exact tag match (see LibraryDatabase.search for the details).
+        clauses.append('st_has_tag(tags, ?) = 1')
+        params.append(tag)
+    order = db._sort_order(sort_by)
+    with db._conn() as conn:
+        conn.row_factory = sqlite3.Row
+        if full_text and query:
+            columns = {row[1] for row in conn.execute('PRAGMA table_info(characters)')}
+            if 'body_text' in columns:
+                # The full body of the card, not just its preview.
+                text_clauses.append("body_text LIKE ? ESCAPE '\\'")
+                text_params.append(f"%{_escape_like(query)}%")
+        if text_clauses:
+            clauses.append('(' + ' OR '.join(text_clauses) + ')')
+            params.extend(text_params)
+        where = ' AND '.join(clauses) if clauses else '1=1'
+        total = conn.execute(
+            f'SELECT COUNT(*) FROM characters WHERE {where}', params,
+        ).fetchone()[0]
+        rows = conn.execute(
+            f'SELECT * FROM characters WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?',
+            [*params, int(limit), int(offset)],
+        ).fetchall()
+        return [dict(row) for row in rows], int(total)
 
 
 class SelectionModel:
@@ -161,6 +332,15 @@ class LibraryTab(QWidget):
     sort_label_changed = pyqtSignal(str)
     selection_changed = pyqtSignal(list)
     settings_requested = pyqtSignal()
+    # Emitted when the user edits the search box; the shared sidebar mirrors it.
+    search_changed = pyqtSignal(str)
+    # The favorites filter is shared with the sidebar, so the two lists
+    # always show the same cards.
+    favorites_filter_changed = pyqtSignal(bool)
+    # Emitted with (matched, library_total) whenever the filter result
+    # changes, so the status bar can show how many cards the current filter
+    # matches out of the whole library.
+    filter_stats_changed = pyqtSignal(int, int)
 
     # Map dropdown display text -> DB sort key (shared with the sidebar's
     # sort combo; see SORT_LABELS / LibraryDatabase._SORT_WHITELIST).
@@ -177,7 +357,7 @@ class LibraryTab(QWidget):
         self._full_image_dlg: QWidget | None = None
         self._selected_filter_tags: set[str] = set()
         self._sort_by: str = 'name'
-        self._thumb_img_size: int = 152
+        self._thumb_img_size: int = DEFAULT_THUMB_SIZE
         # In-memory cache of card data read from disk, keyed by char_id.
         # Invalidated when a card is updated or deleted.
         self._card_cache: dict[int, CharacterCard] = {}
@@ -189,6 +369,12 @@ class LibraryTab(QWidget):
         self._progress_dialog: QProgressDialog | None = None
         self._import_force_pending = False
         self._import_cancelled = False
+        # Paging state for the card grid: only ``_load_limit`` cards are
+        # built at once, out of ``_match_count`` matching cards.
+        self._page_size = _configured_page_size()
+        self._load_limit = self._page_limit()
+        self._match_count = 0
+        self._filter_args: dict = {}
 
         # Debounce timer for search input so we don't hit the DB on every keystroke.
         self._search_timer = QTimer(self)
@@ -245,8 +431,24 @@ class LibraryTab(QWidget):
 
         self._favorites_only_cb = QCheckBox('Favorites only')
         self._favorites_only_cb.setStyleSheet('color: #ccc;')
-        self._favorites_only_cb.toggled.connect(self._apply_filters)
+        self._favorites_only_cb.toggled.connect(self._on_favorites_toggled)
         filter_row.addWidget(self._favorites_only_cb)
+
+        self._full_text_cb = QCheckBox('Full text')
+        self._full_text_cb.setToolTip(
+            'Also search the whole card: the description, the other prompt '
+            'fields, the creator notes and the character book.'
+        )
+        self._full_text_cb.toggled.connect(self._apply_filters)
+        filter_row.addWidget(self._full_text_cb)
+
+        self._fuzzy_cb = QCheckBox('Fuzzy')
+        self._fuzzy_cb.setToolTip(
+            'Also match cards whose name, creator or tags contain every word '
+            'of the search, in any order.'
+        )
+        self._fuzzy_cb.toggled.connect(self._apply_filters)
+        filter_row.addWidget(self._fuzzy_cb)
 
         self._collection_combo = QComboBox()
         self._collection_combo.setToolTip('Filter by collection')
@@ -257,6 +459,8 @@ class LibraryTab(QWidget):
         self._manage_cols_btn.setToolTip('Create, rename, or delete collections')
         self._manage_cols_btn.clicked.connect(self._on_manage_collections)
         filter_row.addWidget(self._manage_cols_btn)
+
+        self._build_page_size_combo(filter_row)
 
         filter_row.addStretch()
         layout.addLayout(filter_row)
@@ -306,7 +510,30 @@ class LibraryTab(QWidget):
         self._grid_scroll = QScrollArea()
         self._grid_scroll.setWidgetResizable(True)
         self._grid_scroll.setWidget(grid_container)
-        splitter.addWidget(self._grid_scroll)
+
+        # "Showing X of Y" + "Load more" for libraries that do not fit on
+        # a single page of thumbnails.
+        self._grid_status_row = QWidget()
+        status_layout = QHBoxLayout(self._grid_status_row)
+        status_layout.setContentsMargins(2, 0, 2, 0)
+        status_layout.setSpacing(6)
+        self._grid_status = QLabel('')
+        self._grid_status.setStyleSheet('color: #999;')
+        status_layout.addWidget(self._grid_status)
+        self._load_more_btn = QPushButton('Load More')
+        self._load_more_btn.setToolTip('Show the next page of matching cards')
+        self._load_more_btn.clicked.connect(self._load_more)
+        status_layout.addWidget(self._load_more_btn)
+        status_layout.addStretch()
+        self._grid_status_row.setVisible(False)
+
+        grid_panel = QWidget()
+        grid_panel_layout = QVBoxLayout(grid_panel)
+        grid_panel_layout.setContentsMargins(0, 0, 0, 0)
+        grid_panel_layout.setSpacing(2)
+        grid_panel_layout.addWidget(self._grid_scroll, 1)
+        grid_panel_layout.addWidget(self._grid_status_row)
+        splitter.addWidget(grid_panel)
 
         self._summary_scroll = QScrollArea()
         self._summary_scroll.setWidgetResizable(True)
@@ -453,6 +680,68 @@ class LibraryTab(QWidget):
         self._apply_filters()
         self.library_changed.emit()
 
+    def _build_page_size_combo(self, row) -> None:
+        """Add the "cards per page" dropdown to *row*.
+
+        The dropdown decides how many cards are built before the "Load
+        more" button appears under the grid.  The choice is stored in the
+        portable config, so it survives a restart and travels with the
+        configuration.
+        """
+        label = QLabel('Cards per page:')
+        label.setStyleSheet('color: #ccc;')
+        row.addWidget(label)
+
+        combo = QComboBox()
+        combo.setToolTip(
+            'How many cards are built at once; the rest is reachable '
+            'through the "Load More" button below the grid.\n'
+            '"All" builds every matching card in one go, which takes a '
+            'while on a large library.'
+        )
+        for text, value in PAGE_SIZE_CHOICES:
+            combo.addItem(text, value)
+        if self._page_size and self._page_size not in [v for _, v in PAGE_SIZE_CHOICES]:
+            # A hand-edited config may name a size that is not on the list.
+            combo.addItem(str(self._page_size), self._page_size)
+        index = combo.findData(self._page_size)
+        if index < 0:
+            index = combo.findData(GRID_PAGE_SIZE)
+        # Set the selection before connecting, so the initial value does not
+        # count as a user change.
+        combo.setCurrentIndex(index)
+        combo.currentIndexChanged.connect(self._on_page_size_changed)
+        self._page_size_combo = combo
+        row.addWidget(combo)
+
+    def _on_page_size_changed(self, index: int) -> None:
+        """Apply the new page size and rebuild the grid."""
+        value = self._page_size_combo.itemData(index)
+        if value is None:
+            return
+        value = int(value)
+        if value == self._page_size:
+            return
+        self._page_size = value
+        try:
+            from src.portable_config import set_value
+
+            set_value('library.page_size', value)
+        except Exception:
+            logger.exception("Could not save the library page size")
+        self._load_limit = self._page_limit()
+        self._refresh_grid()
+
+    def _page_limit(self) -> int:
+        """The number of rows the current page may pull.
+
+        The "All" choice has no page limit, so the query is given a limit
+        high enough to cover any library.
+        """
+        if self._page_size == ALL_CARDS:
+            return NO_LIMIT
+        return self._page_size
+
     def _refresh_collection_combo(self) -> None:
         """Rebuild the collection filter dropdown, preserving the selection."""
         current = self._collection_combo.currentData()
@@ -475,7 +764,12 @@ class LibraryTab(QWidget):
         while self._filter_bar_layout.count() > self._filter_header_count:
             item = self._filter_bar_layout.takeAt(self._filter_header_count)
             if item and item.widget():
-                item.widget().deleteLater()
+                chip = item.widget()
+                # Detach the chip first: while it is still parented to the
+                # filter bar it keeps its old geometry and stays on screen
+                # as a ghost until the deferred delete runs.
+                chip.setParent(None)
+                chip.deleteLater()
         for tag in sorted(self._selected_filter_tags):
             chip = TagChip(tag, removable=True)
             chip.removed.connect(self._remove_selected_tag)
@@ -512,12 +806,68 @@ class LibraryTab(QWidget):
         tags = list(self._selected_filter_tags) if self._selected_filter_tags else None
         favorites_only = self._favorites_only_cb.isChecked()
         collection_id = self._collection_combo.currentData()
-        entries = self.db.search(
-            query=query, tags=tags, sort_by=self._sort_by,
-            favorites_only=favorites_only,
-            collection_id=collection_id,
+        self._filter_args = {
+            'query': query,
+            'tags': tags,
+            'favorites_only': favorites_only,
+            'collection_id': collection_id,
+            'full_text': self._full_text_cb.isChecked(),
+            'fuzzy': self._fuzzy_cb.isChecked(),
+        }
+        # A new filter starts at the first page again.
+        self._load_limit = self._page_limit()
+        self._refresh_grid()
+
+    def _refresh_grid(self) -> None:
+        """Re-run the current filter and rebuild the grid from the result.
+
+        The query itself is bounded: only ``_load_limit`` rows come back
+        from the database, so a huge library no longer freezes the UI.
+        """
+        entries, total = _search_page(
+            self.db, sort_by=self._sort_by, limit=self._load_limit, **self._filter_args,
         )
+        self._match_count = total
         self._rebuild_grid(entries)
+
+    def _load_more(self) -> None:
+        """Show the next page of matching cards."""
+        if self._load_limit >= self._match_count:
+            return
+        self._load_limit = min(
+            self._load_limit + self._page_limit(), self._match_count,
+        )
+        self._refresh_grid()
+
+    def _ensure_loaded(self, char_id: int) -> bool:
+        """Grow the loaded window until *char_id* is part of it.
+
+        The grid only holds one page of cards, so a card further down the
+        sorted list is not in ``_all_ids`` yet.  Returns True when the card
+        is loaded afterwards.
+        """
+        if char_id in self._all_ids:
+            return True
+        while self._load_limit < self._match_count:
+            self._load_limit = min(
+                self._load_limit + self._page_limit(), self._match_count,
+            )
+            self._refresh_grid()
+            if char_id in self._all_ids:
+                return True
+        return char_id in self._all_ids
+
+    def _card_matches_filter(self, char_id: int) -> bool:
+        """True when *char_id* passes the current filter.
+
+        A single-row query, so a card that is filtered out is recognised
+        without loading every matching card first.
+        """
+        rows, _total = _search_page(
+            self.db, sort_by=self._sort_by, limit=1, only_id=char_id,
+            **self._filter_args,
+        )
+        return bool(rows)
 
     def _on_manage_collections(self) -> None:
         from src.ui.widgets.collections_dialog import CollectionsManagerDialog
@@ -597,17 +947,73 @@ class LibraryTab(QWidget):
         self._selection.prune(set(self._all_ids))
         self._update_selection_ui()
         self._grid_layout.activate()
+        self._update_grid_status()
         if container:
             container.setUpdatesEnabled(True)
             container.updateGeometry()
             container.update()
 
         def _restore() -> None:
-            scrollbar.setValue(min(scroll_pos, scrollbar.maximum()))
+            # The tab can be torn down before the timer fires; calling into a
+            # destroyed scrollbar raises RuntimeError, and an exception
+            # inside a slot aborts the whole process.
+            from src.ui.widgets.chat_image_loader import _widget_alive
+
+            if not _widget_alive(scrollbar):
+                return
+            try:
+                scrollbar.setValue(min(scroll_pos, scrollbar.maximum()))
+            except RuntimeError:
+                pass
 
         if scroll_pos > 0:
             # After layout settles (the content height may not be final yet).
             QTimer.singleShot(0, _restore)
+
+    def _update_grid_status(self) -> None:
+        """Publish the filter result and refresh the load-more row.
+
+        Three different numbers are involved here and they used to be
+        conflated into one:
+
+        * *matched* - how many cards the current filter matches
+          (``_match_count``).  This is what the status bar reports, as
+          "200 of 522 shown": how much of the library survives the filter.
+        * *loaded* - how many of those cards are currently built as
+          thumbnails.  The grid only holds one page at a time, so this is
+          smaller than *matched* unless everything fits on one page.  It is
+          what the row below the grid reports, next to the "load more"
+          button.
+        * *library total* - how many cards the library holds at all,
+          ignoring the filter.  That is the denominator of the status bar.
+
+        Reporting *loaded* as the numerator made the status bar read
+        "100 of 522" for a filter that actually matched all 522 cards,
+        because only the first page of thumbnails had been built.
+        """
+        loaded = len(self._thumbnails)
+        matched = self._match_count
+        # The status bar shows the filtered count from every tab, so the
+        # filter state is published even when the row below the grid is
+        # hidden (everything fits on one page).
+        self.filter_stats_changed.emit(matched, self._library_total())
+        if matched <= loaded:
+            # Everything fits on one page: keep the old (clean) look.
+            self._grid_status_row.setVisible(False)
+            return
+        self._grid_status_row.setVisible(True)
+        self._grid_status.setText(f'Showing {loaded} of {matched} matching cards')
+        self._load_more_btn.setEnabled(self._load_limit < matched)
+
+    def _library_total(self) -> int:
+        """The number of cards in the whole library, ignoring the filter."""
+        try:
+            return int(self.db.get_library_stats().get('count', 0) or 0)
+        except Exception:
+            # A failed aggregate must not take the grid down with it; the
+            # match count is the next best denominator.
+            logger.exception("Could not read the library size")
+            return self._match_count
 
     def _add_thumbnail(self, entry: dict) -> None:
         thumb = CardThumbnail(
@@ -617,7 +1023,7 @@ class LibraryTab(QWidget):
             is_favorite=bool(entry.get('is_favorite')),
             token_count=entry.get('token_count', 0),
         )
-        if self._thumb_img_size != 152:
+        if self._thumb_img_size != DEFAULT_THUMB_SIZE:
             thumb.set_thumb_size(self._thumb_img_size)
         thumb.selection_requested.connect(self._on_selection_requested)
         thumb.double_clicked.connect(self._show_full_image)
@@ -647,16 +1053,24 @@ class LibraryTab(QWidget):
     def _remove_thumbnail_in_place(self, char_id: int) -> None:
         """Remove a single thumbnail from the grid without a full rebuild."""
         self._card_cache.pop(char_id, None)
+        removed = False
         for i, thumb in enumerate(self._thumbnails):
             if thumb.char_id == char_id:
                 thumb.setParent(None)
                 thumb.deleteLater()
                 self._thumbnails.pop(i)
+                removed = True
                 break
         if char_id in self._all_ids:
             self._all_ids.remove(char_id)
         self._selection.prune(set(self._all_ids))
         self._grid_layout.activate()
+        if removed:
+            # The card is gone from the library, so it no longer matches the
+            # filter either; without this the status bar kept reporting the
+            # pre-delete count until the next rebuild.
+            self._match_count = max(0, self._match_count - 1)
+            self._update_grid_status()
 
     def _on_card_clicked(self, char_id: int) -> None:
         for t in self._thumbnails:
@@ -681,8 +1095,8 @@ class LibraryTab(QWidget):
         tags = []
         if entry.get('tags'):
             try:
-                tags = json.loads(entry['tags'])
-            except (json.JSONDecodeError, TypeError):
+                tags = safe_json.loads_safe(entry['tags'])
+            except (json.JSONDecodeError, TypeError, ValueError):
                 pass
         self._detail_tags.set_tags(tags)
 
@@ -807,6 +1221,9 @@ class LibraryTab(QWidget):
         filter_container = self._filter_bar_scroll.parentWidget()
         if filter_container is not None:
             filter_container.setMaximumHeight(max(160, size * 9 + 40))
+        # The rating stars carry their own pixel size, so they have to be
+        # told about the new one.
+        self._detail_rating.refresh_font_size()
 
     def invalidate_card_cache(self) -> None:
         """Drop the per-card CharacterCard cache.
@@ -828,6 +1245,13 @@ class LibraryTab(QWidget):
     def set_selected_ids(self, ids: list[int]) -> None:
         """Restore a previously saved selection. Only IDs that exist in the current grid are selected."""
         valid = set(self._all_ids)
+        # A saved card may live on a later page: load what is needed to
+        # select it instead of silently dropping the selection.
+        for char_id in list(ids):
+            if char_id in valid:
+                continue
+            if self._card_matches_filter(char_id) and self._ensure_loaded(char_id):
+                valid.add(char_id)
         self._selection.set_selection([i for i in ids if i in valid])
         self._update_selection_ui()
 
@@ -886,12 +1310,22 @@ class LibraryTab(QWidget):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+        # The names are read before the rows are gone: the event carries the
+        # name of the card that was deleted.
+        names: dict[int, str] = {}
+        for char_id in selected:
+            entry = self.db.get_by_id(char_id)
+            names[char_id] = entry.get('name', '') if entry else ''
+        deleted = 0
         for char_id in selected:
             try:
                 self.db.remove_card(char_id, delete_files=True)
                 self._card_cache.pop(char_id, None)
             except Exception:
                 logger.exception("Bulk delete failed for card %s", char_id)
+                continue
+            deleted += 1
+            notify_card_deleted(char_id, names.get(char_id, ''))
         # Remove all deleted thumbnails in-place
         for char_id in list(selected):
             for i, thumb in enumerate(self._thumbnails):
@@ -904,6 +1338,10 @@ class LibraryTab(QWidget):
                 self._all_ids.remove(char_id)
         self._selection.prune(set(self._all_ids))
         self._grid_layout.activate()
+        # The deleted cards no longer match the filter, so the counts have to
+        # follow; otherwise the status bar keeps the pre-delete total.
+        self._match_count = max(0, self._match_count - deleted)
+        self._update_grid_status()
         self.status_message.emit(f"Deleted {len(selected)} card(s).", 5000)
         self._selected_id = None
         self._update_selection_ui()
@@ -958,7 +1396,7 @@ class LibraryTab(QWidget):
             try:
                 vault.copy_out(source, dest)
                 exported += 1
-            except OSError as e:
+            except (OSError, vault.VaultError) as e:
                 errors.append(f"{entry['name']}: {e}")
         msg = f"Exported {exported} PNG(s)."
         if errors:
@@ -1004,6 +1442,70 @@ class LibraryTab(QWidget):
         # Debounce: restart the timer on each keystroke; the filter only runs
         # after the user stops typing for 300ms.
         self._search_timer.start()
+        self.search_changed.emit(text)
+
+    def set_search_text(self, text: str) -> None:
+        """Mirror the shared sidebar's search box (no echo back to it)."""
+        if self._search_edit.text() == text:
+            return
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText(text)
+        self._search_edit.blockSignals(False)
+        self._search_timer.start()
+
+    def _clear_all_filters(self) -> None:
+        """Reset every grid filter so a hidden card can be revealed.
+
+        The search box is cleared through the normal channel so the shared
+        sidebar's search box clears with it.
+        """
+        self._selected_filter_tags.clear()
+        self._refresh_tag_filter()
+        self._favorites_only_cb.blockSignals(True)
+        self._favorites_only_cb.setChecked(False)
+        self._favorites_only_cb.blockSignals(False)
+        self._collection_combo.blockSignals(True)
+        self._collection_combo.setCurrentIndex(0)
+        self._collection_combo.blockSignals(False)
+        self._search_timer.stop()
+        if self._search_edit.text():
+            self._search_edit.blockSignals(True)
+            self._search_edit.clear()
+            self._search_edit.blockSignals(False)
+            self.search_changed.emit('')
+        self._apply_filters()
+
+    def reveal_card(self, char_id: int | None, clear_filters: bool = False) -> None:
+        """Select a card and scroll it into view.
+
+        Used to keep the grid in step with the shared sidebar's selection.
+
+        *clear_filters* decides what happens when the current filters hide
+        the card.  It is on for an *explicit* selection (the user asked for
+        this card, so the grid has to show it) and off when the grid is
+        merely brought into step with the sidebar - switching to the
+        Library tab used to wipe the search box, the tag filter and the
+        collection filter (and the shared sidebar's search box with them)
+        because the selected card happened to be hidden.
+        """
+        if char_id is None:
+            return
+        if char_id not in self._all_ids:
+            if self._card_matches_filter(char_id):
+                # The card matches but sits on a later page: load it.
+                self._ensure_loaded(char_id)
+            elif clear_filters:
+                # Filtered out: clear the filters and try once more.
+                self._clear_all_filters()
+                self._ensure_loaded(char_id)
+            else:
+                entry = self.db.get_by_id(char_id)
+                name = (entry or {}).get('name') or 'The selected card'
+                self.status_message.emit(
+                    f'{name} is hidden by the current filters.', 4000,
+                )
+                return
+        self.select_card(char_id)
 
     def _on_sort_changed(self, label: str) -> None:
         self._sort_by = self._SORT_LABELS.get(label, 'name')
@@ -1042,6 +1544,8 @@ class LibraryTab(QWidget):
         """Create, wire and start an :class:`ImportWorker` for *paths*."""
         from src.ui.widgets.import_worker import ImportWorker
 
+        # A previous dialog must not be left behind as a hidden child.
+        self._dispose_progress_dialog()
         self._import_cancelled = False
         self._import_worker = ImportWorker(
             self.db, paths, force_duplicates=force_duplicates, parent=self,
@@ -1082,10 +1586,26 @@ class LibraryTab(QWidget):
         elif error:
             logger.debug("Import skipped/failed for %s: %s", path, error)
 
+    def _dispose_progress_dialog(self) -> None:
+        """Close and delete the import progress dialog.
+
+        The dialog is parented to the tab, so dropping the Python reference
+        leaves the C++ widget alive (a hidden child) for the lifetime of the
+        tab - one leak per import.
+        """
+        dialog = self._progress_dialog
+        self._progress_dialog = None
+        if dialog is None:
+            return
+        try:
+            dialog.close()
+            dialog.deleteLater()
+        except RuntimeError:
+            # The C++ object is already gone.
+            pass
+
     def _on_import_finished(self, summary) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.close()
-            self._progress_dialog = None
+        self._dispose_progress_dialog()
         msg = summary.message()
         self.status_message.emit(msg, 5000)
 
@@ -1200,6 +1720,7 @@ class LibraryTab(QWidget):
         )
         if reply == QMessageBox.StandardButton.Yes:
             deleted_id = self._selected_id
+            deleted_name = entry.get('name', '')
             try:
                 self.db.remove_card(deleted_id, delete_files=True)
             except Exception as e:
@@ -1208,6 +1729,7 @@ class LibraryTab(QWidget):
                 logger.exception("Delete of card %s failed", deleted_id)
                 QMessageBox.critical(self, 'Delete Character', f'Could not delete the card: {e}')
                 return
+            notify_card_deleted(deleted_id, deleted_name)
             self._remove_thumbnail_in_place(deleted_id)
             self._selected_id = None
             self._update_selection_ui()
@@ -1231,11 +1753,11 @@ class LibraryTab(QWidget):
         )
         if not dest:
             return
+        from src import vault
         try:
-            from src import vault
             vault.copy_out(source, dest)
             self.status_message.emit(f"Exported PNG to {Path(dest).name}", 4000)
-        except OSError as e:
+        except (OSError, vault.VaultError) as e:
             logger.exception("PNG export failed")
             QMessageBox.critical(self, 'Export', f"Failed to export PNG: {e}")
 
@@ -1364,6 +1886,17 @@ class LibraryTab(QWidget):
         """
         self._favorites_only_cb.toggle()
 
+    def _on_favorites_toggled(self, checked: bool) -> None:
+        """The checkbox re-filters the grid and tells the shared sidebar."""
+        self._apply_filters()
+        self.favorites_filter_changed.emit(checked)
+
+    def set_favorites_only(self, checked: bool) -> None:
+        """Mirror the sidebar's "Favorites only" filter (no echo back)."""
+        if self._favorites_only_cb.isChecked() == checked:
+            return
+        self._favorites_only_cb.setChecked(checked)
+
     def set_sort_by_label(self, label: str) -> None:
         """Set the sort dropdown to *label* (triggers re-filter)."""
         self._sort_combo.setCurrentText(label)
@@ -1378,6 +1911,12 @@ class LibraryTab(QWidget):
         new_size = clamp_thumb_size(self._thumb_img_size + delta)
         if new_size != self._thumb_img_size:
             self._thumb_img_size = new_size
+            self._zoom_timer.start()
+
+    def reset_thumbnail_size(self) -> None:
+        """Restore the default thumbnail size (View > Reset Zoom, Ctrl+0)."""
+        if self._thumb_img_size != DEFAULT_THUMB_SIZE:
+            self._thumb_img_size = DEFAULT_THUMB_SIZE
             self._zoom_timer.start()
 
     def _apply_zoom(self) -> None:

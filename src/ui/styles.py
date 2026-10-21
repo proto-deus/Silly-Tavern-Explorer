@@ -38,12 +38,12 @@ def px_to_pt(px: int) -> int:
     return max(1, round(int(px) * 72.0 / dpi))
 
 
-def apply_theme(app, font_size: int = 13) -> None:
-    """Apply the dark theme and application font for the given size.
+def apply_theme(app, font_size: int = 13, theme: str = 'dark') -> None:
+    """Apply the theme and application font for the given size.
 
     Sets the application-wide default font (so menus, buttons, dialogs,
     tooltips, and native windows all scale) in addition to the stylesheet,
-    then re-applies the dark theme at the application level.
+    then re-applies the theme at the application level.
 
     The font uses a *point* size derived from the configured pixel size:
     a pixel-only font leaves ``QFont.pointSize() == -1``, and Qt-internal
@@ -58,7 +58,7 @@ def apply_theme(app, font_size: int = 13) -> None:
     font = QFont(_default_font_family())
     font.setPointSize(px_to_pt(font_size))
     app.setFont(font)
-    app.setStyleSheet(get_dark_theme(font_size))
+    app.setStyleSheet(get_theme(theme, font_size))
 
 
 # The configured base font size. Widgets that want secondary/heading text call
@@ -100,22 +100,30 @@ def _arrow_path(name: str) -> str:
     return (Path(__file__).resolve().parent.parent / 'resources' / 'icons' / name).as_posix()
 
 
-def get_dark_theme(font_size: int = 13) -> str:
-    """Return the dark theme stylesheet with the given base font size."""
-    return """
+#: Colour palettes for the built-in themes.  The stylesheet itself is a
+#: single template; only the palette changes between the themes, so a new
+#: theme never needs a copy of the 300-line QSS.
+DARK_PALETTE = {'bg': '#1e1e1e', 'bg_alt': '#252525', 'panel': '#2a2a2a', 'bg_deep': '#1a1a1a', 'border_dim': '#3a3a3a', 'border': '#3d3d3d', 'border_strong': '#444444', 'border_subtle': '#333333', 'muted': '#555555', 'muted_dim': '#666666', 'fg': '#e0e0e0', 'fg_dim': '#d0d0d0', 'fg_alt': '#cccccc', 'fg_muted': '#aaaaaa', 'fg_bright': '#ffffff', 'hover': '#3a3f4b', 'select': '#3a5068', 'accent_dim': '#4a5060', 'accent': '#5b9bd5', 'ok_dim': '#2a5a3a', 'ok': '#4a8a5a', 'ok_border': '#3a6a4a', 'ok_fg': '#5a9a6a', 'input': '#2a3040'}
+
+LIGHT_PALETTE = {'bg': '#f4f4f4', 'bg_alt': '#eaeaea', 'panel': '#ffffff', 'bg_deep': '#e0e0e0', 'border_dim': '#d6d6d6', 'border': '#cccccc', 'border_strong': '#b4b4b4', 'border_subtle': '#dcdcdc', 'muted': '#9a9a9a', 'muted_dim': '#8a8a8a', 'fg': '#1e1e1e', 'fg_dim': '#333333', 'fg_alt': '#444444', 'fg_muted': '#666666', 'fg_bright': '#000000', 'hover': '#dde4ee', 'select': '#cfe0f2', 'accent_dim': '#9db4cf', 'accent': '#1f6fc0', 'ok_dim': '#dcecdc', 'ok': '#2e7d32', 'ok_border': '#a8d5ab', 'ok_fg': '#1b5e20', 'input': '#ffffff'}
+
+#: The stylesheet template.  ``$token`` placeholders are replaced with the
+#: palette colours; ``string.Template`` is used because CSS braces would
+#: break ``str.format``.
+_THEME_TEMPLATE = """
 QMainWindow {
-    background-color: #1e1e1e;
+    background-color: $bg;
 }
 
 QWidget {
-    background-color: #1e1e1e;
-    color: #e0e0e0;
+    background-color: $bg;
+    color: $fg;
     font-size: __FONT_SIZE__px;
 }
 
 QMenuBar {
-    background-color: #1e1e1e;
-    color: #e0e0e0;
+    background-color: $bg;
+    color: $fg;
     padding: 2px;
 }
 
@@ -125,14 +133,14 @@ QMenuBar::item {
 }
 
 QMenuBar::item:selected {
-    background-color: #3a3f4b;
+    background-color: $hover;
     border-radius: 4px;
 }
 
 QMenu {
-    background-color: #2a2a2a;
-    color: #e0e0e0;
-    border: 1px solid #444;
+    background-color: $panel;
+    color: $fg;
+    border: 1px solid $border_strong;
 }
 
 QMenu::item {
@@ -140,24 +148,24 @@ QMenu::item {
 }
 
 QMenu::item:selected {
-    background-color: #3a5068;
+    background-color: $select;
 }
 
 QMenu::separator {
     height: 1px;
-    background-color: #3a3a3a;
+    background-color: $border_dim;
     margin: 4px 8px;
 }
 
 QTabWidget::pane {
-    border: 1px solid #3a3a3a;
-    background-color: #252525;
+    border: 1px solid $border_dim;
+    background-color: $bg_alt;
 }
 
 QTabBar::tab {
-    background-color: #2a2a2a;
-    color: #aaa;
-    border: 1px solid #3a3a3a;
+    background-color: $panel;
+    color: $fg_muted;
+    border: 1px solid $border_dim;
     border-bottom: none;
     padding: 8px 20px;
     margin-right: 2px;
@@ -166,43 +174,43 @@ QTabBar::tab {
 }
 
 QTabBar::tab:selected {
-    background-color: #252525;
-    color: #e0e0e0;
-    border-bottom: 2px solid #5b9bd5;
+    background-color: $bg_alt;
+    color: $fg;
+    border-bottom: 2px solid $accent;
 }
 
 QTabBar::tab:hover:!selected {
-    background-color: #333;
-    color: #ccc;
+    background-color: $border_subtle;
+    color: $fg_alt;
 }
 
 QGroupBox {
-    border: 1px solid #3a3a3a;
+    border: 1px solid $border_dim;
     border-radius: 6px;
     margin-top: 12px;
     padding-top: 16px;
     font-weight: bold;
-    color: #ccc;
+    color: $fg_alt;
 }
 
 QGroupBox::title {
     subcontrol-origin: margin;
     subcontrol-position: top left;
     padding: 0 8px;
-    color: #aaa;
+    color: $fg_muted;
 }
 
 QLineEdit, QComboBox {
-    background-color: #2a2a2a;
-    border: 1px solid #444;
+    background-color: $panel;
+    border: 1px solid $border_strong;
     border-radius: 4px;
     padding: 5px 8px;
-    color: #e0e0e0;
-    selection-background-color: #5b9bd5;
+    color: $fg;
+    selection-background-color: $accent;
 }
 
 QLineEdit:focus, QComboBox:focus {
-    border: 1px solid #5b9bd5;
+    border: 1px solid $accent;
 }
 
 QComboBox::drop-down {
@@ -220,57 +228,57 @@ QComboBox::down-arrow {
 }
 
 QComboBox QAbstractItemView {
-    background-color: #2a2a2a;
-    border: 1px solid #444;
-    color: #e0e0e0;
-    selection-background-color: #3a5068;
+    background-color: $panel;
+    border: 1px solid $border_strong;
+    color: $fg;
+    selection-background-color: $select;
 }
 
 QTextEdit, QPlainTextEdit {
-    background-color: #1a1a1a;
-    border: 1px solid #3a3a3a;
+    background-color: $bg_deep;
+    border: 1px solid $border_dim;
     border-radius: 4px;
     padding: 4px;
-    color: #d0d0d0;
-    selection-background-color: #5b9bd5;
+    color: $fg_dim;
+    selection-background-color: $accent;
 }
 
 QTextEdit:focus, QPlainTextEdit:focus {
-    border: 1px solid #5b9bd5;
+    border: 1px solid $accent;
 }
 
 QPushButton {
-    background-color: #3a3f4b;
-    border: 1px solid #555;
+    background-color: $hover;
+    border: 1px solid $muted;
     border-radius: 4px;
     padding: 6px 16px;
-    color: #e0e0e0;
+    color: $fg;
     font-weight: bold;
 }
 
 QPushButton:hover {
-    background-color: #4a5060;
-    border: 1px solid #666;
+    background-color: $accent_dim;
+    border: 1px solid $muted_dim;
 }
 
 QPushButton:checked {
-    background-color: #2a5a3a;
-    border: 1px solid #4a8a5a;
+    background-color: $ok_dim;
+    border: 1px solid $ok;
 }
 
 QPushButton:checked:hover {
-    background-color: #3a6a4a;
-    border: 1px solid #5a9a6a;
+    background-color: $ok_border;
+    border: 1px solid $ok_fg;
 }
 
 QPushButton:pressed {
-    background-color: #2a3040;
+    background-color: $input;
 }
 
 QPushButton:disabled {
-    background-color: #2a2a2a;
-    color: #666;
-    border: 1px solid #3a3a3a;
+    background-color: $panel;
+    color: $muted_dim;
+    border: 1px solid $border_dim;
 }
 
 QScrollArea {
@@ -279,19 +287,19 @@ QScrollArea {
 }
 
 QScrollBar:vertical {
-    background-color: #1e1e1e;
+    background-color: $bg;
     width: 10px;
     margin: 0;
 }
 
 QScrollBar::handle:vertical {
-    background-color: #444;
+    background-color: $border_strong;
     border-radius: 5px;
     min-height: 30px;
 }
 
 QScrollBar::handle:vertical:hover {
-    background-color: #555;
+    background-color: $muted;
 }
 
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
@@ -299,19 +307,19 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
 }
 
 QScrollBar:horizontal {
-    background-color: #1e1e1e;
+    background-color: $bg;
     height: 10px;
     margin: 0;
 }
 
 QScrollBar::handle:horizontal {
-    background-color: #444;
+    background-color: $border_strong;
     border-radius: 5px;
     min-width: 30px;
 }
 
 QScrollBar::handle:horizontal:hover {
-    background-color: #555;
+    background-color: $muted;
 }
 
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
@@ -319,7 +327,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 }
 
 QSplitter::handle {
-    background-color: #3a3a3a;
+    background-color: $border_dim;
 }
 
 QSplitter::handle:horizontal {
@@ -336,12 +344,12 @@ QLabel {
 
 QRadioButton {
     spacing: 6px;
-    color: #d0d0d0;
+    color: $fg_dim;
     background-color: transparent;
 }
 
 QRadioButton:checked {
-    color: #ffffff;
+    color: $fg_bright;
     font-weight: bold;
 }
 
@@ -351,23 +359,23 @@ QRadioButton::indicator {
 }
 
 QRadioButton::indicator:checked {
-    background-color: #5b9bd5;
-    border: 2px solid #5b9bd5;
+    background-color: $accent;
+    border: 2px solid $accent;
     border-radius: 8px;
 }
 
 QRadioButton::indicator:unchecked {
-    background-color: #2a2a2a;
-    border: 2px solid #555;
+    background-color: $panel;
+    border: 2px solid $muted;
     border-radius: 8px;
 }
 
 QDoubleSpinBox, QSpinBox {
-    background-color: #2a2a2a;
-    border: 1px solid #444;
+    background-color: $panel;
+    border: 1px solid $border_strong;
     border-radius: 4px;
     padding: 4px 8px;
-    color: #e0e0e0;
+    color: $fg;
 }
 
 /* Style the spin box buttons explicitly: without this, the native
@@ -379,8 +387,8 @@ QSpinBox::up-button, QDoubleSpinBox::up-button {
     subcontrol-position: top right;
     width: 18px;
     border: none;
-    border-left: 1px solid #444;
-    background-color: #333333;
+    border-left: 1px solid $border_strong;
+    background-color: $border_subtle;
     border-top-right-radius: 4px;
 }
 
@@ -389,19 +397,19 @@ QSpinBox::down-button, QDoubleSpinBox::down-button {
     subcontrol-position: bottom right;
     width: 18px;
     border: none;
-    border-left: 1px solid #444;
-    background-color: #333333;
+    border-left: 1px solid $border_strong;
+    background-color: $border_subtle;
     border-bottom-right-radius: 4px;
 }
 
 QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
 QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
-    background-color: #3d3d3d;
+    background-color: $border;
 }
 
 QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
 QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {
-    background-color: #2a2a2a;
+    background-color: $panel;
 }
 
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
@@ -417,24 +425,225 @@ QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
 }
 
 QDoubleSpinBox:focus, QSpinBox:focus {
-    border: 1px solid #5b9bd5;
+    border: 1px solid $accent;
 }
 
 QMessageBox {
-    background-color: #252525;
+    background-color: $bg_alt;
 }
 
 QDialog {
-    background-color: #252525;
+    background-color: $bg_alt;
+}
+
+QDialogButtonBox {
+    background-color: transparent;
 }
 
 QToolTip {
-    background-color: #2a2a2a;
-    color: #e0e0e0;
-    border: 1px solid #444;
+    background-color: $panel;
+    color: $fg;
+    border: 1px solid $border_strong;
     padding: 4px;
 }
-""".replace('__FONT_SIZE__', str(font_size)) \
-   .replace('__SPIN_ARROW_UP__', _arrow_path('spin_arrow_up.png')) \
-   .replace('__SPIN_ARROW_DOWN__', _arrow_path('spin_arrow_down.png')) \
-   .replace('__COMBO_ARROW_DOWN__', _arrow_path('combo_arrow_down.png'))
+
+/* --- Check boxes ------------------------------------------------------ */
+
+QCheckBox {
+    spacing: 6px;
+    background-color: transparent;
+    color: $fg_dim;
+}
+
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid $muted;
+    border-radius: 3px;
+    background-color: $panel;
+}
+
+QCheckBox::indicator:hover {
+    border: 1px solid $accent;
+}
+
+QCheckBox::indicator:checked {
+    background-color: $accent;
+    border: 1px solid $accent;
+}
+
+QCheckBox:focus {
+    color: $fg_bright;
+}
+
+QCheckBox:disabled {
+    color: $muted_dim;
+}
+
+/* --- Item views (lists, trees, tables) -------------------------------- */
+
+QAbstractItemView {
+    background-color: $bg_deep;
+    alternate-background-color: $bg_alt;
+    border: 1px solid $border_dim;
+    border-radius: 4px;
+    color: $fg;
+    selection-background-color: $select;
+    selection-color: $fg_bright;
+    outline: none;
+}
+
+QListWidget, QTreeWidget, QTableWidget,
+QListView, QTreeView, QTableView {
+    background-color: $bg_deep;
+    alternate-background-color: $bg_alt;
+    border: 1px solid $border_dim;
+    border-radius: 4px;
+    color: $fg;
+    selection-background-color: $select;
+    selection-color: $fg_bright;
+    outline: none;
+}
+
+QListWidget::item, QTreeWidget::item, QTableWidget::item {
+    padding: 3px;
+    color: $fg;
+}
+
+QListWidget::item:hover, QTreeWidget::item:hover, QTableWidget::item:hover {
+    background-color: $hover;
+}
+
+QListWidget::item:selected, QTreeWidget::item:selected, QTableWidget::item:selected {
+    background-color: $select;
+    color: $fg_bright;
+}
+
+QListWidget::item:disabled, QTreeWidget::item:disabled {
+    color: $muted_dim;
+}
+
+QHeaderView::section {
+    background-color: $panel;
+    color: $fg_muted;
+    border: none;
+    border-right: 1px solid $border_dim;
+    border-bottom: 1px solid $border_dim;
+    padding: 4px 6px;
+}
+
+QHeaderView::section:hover {
+    background-color: $border_subtle;
+}
+
+/* --- Progress and the status bar -------------------------------------- */
+
+QProgressBar {
+    background-color: $bg_deep;
+    border: 1px solid $border_dim;
+    border-radius: 4px;
+    color: $fg;
+    text-align: center;
+    min-height: 18px;
+}
+
+QProgressBar::chunk {
+    background-color: $accent;
+    border-radius: 3px;
+}
+
+QStatusBar {
+    background-color: $bg_alt;
+    border-top: 1px solid $border_dim;
+    color: $fg_muted;
+}
+
+QStatusBar::item {
+    border: none;
+}
+
+QFrame[frameShape="4"] {
+    background-color: $accent;
+}
+
+/* --- Focus and disabled states ---------------------------------------- */
+
+QPushButton:focus {
+    border: 1px solid $accent;
+}
+
+QTabBar::tab:focus {
+    color: $fg_bright;
+}
+
+QTabBar::tab:disabled {
+    background-color: $bg;
+    color: $muted_dim;
+}
+
+QMenu::item:disabled {
+    color: $muted_dim;
+}
+
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled,
+QDoubleSpinBox:disabled, QTextEdit:disabled, QPlainTextEdit:disabled {
+    background-color: $bg_alt;
+    border: 1px solid $border_dim;
+    color: $muted_dim;
+}
+"""
+
+
+def get_theme(theme: str = 'dark', font_size: int = 13) -> str:
+    """Return the stylesheet for *theme* with the given base font size.
+
+    Args:
+        theme: ``'dark'`` or ``'light'``.  An unknown name falls back to
+            ``'dark'`` so a bad setting can never leave the app unstyled.
+        font_size: the base pixel font size.
+
+    Returns:
+        The complete Qt stylesheet.
+    """
+    palette = LIGHT_PALETTE if str(theme).strip().lower() == 'light' else DARK_PALETTE
+    from string import Template
+    css = Template(_THEME_TEMPLATE).safe_substitute(palette)
+    return (css.replace('__FONT_SIZE__', str(font_size))
+               .replace('__SPIN_ARROW_UP__', _arrow_path('spin_arrow_up.png'))
+               .replace('__SPIN_ARROW_DOWN__', _arrow_path('spin_arrow_down.png'))
+               .replace('__COMBO_ARROW_DOWN__', _arrow_path('combo_arrow_down.png')))
+
+
+def get_dark_theme(font_size: int = 13) -> str:
+    """Return the dark theme stylesheet with the given base font size."""
+    return get_theme('dark', font_size)
+
+
+def get_light_theme(font_size: int = 13) -> str:
+    """Return the light theme stylesheet with the given base font size."""
+    return get_theme('light', font_size)
+
+
+def available_themes() -> list[str]:
+    """The names of the built-in themes."""
+    return ['dark', 'light']
+
+
+def palette_for(theme: str) -> dict[str, str]:
+    """Return the colour palette of *theme*.
+
+    An unknown name falls back to the dark palette.  Widgets that paint
+    themselves (the command palette) take their colours from here so they
+    follow the active theme instead of hard-coding the dark one.
+    """
+    return LIGHT_PALETTE if str(theme).strip().lower() == 'light' else DARK_PALETTE
+
+
+def current_palette() -> dict[str, str]:
+    """The palette of the theme the user has configured."""
+    try:
+        from src.settings_manager import load_theme
+        theme = load_theme()
+    except Exception:
+        theme = 'dark'
+    return palette_for(theme)

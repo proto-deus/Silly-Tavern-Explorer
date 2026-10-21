@@ -50,6 +50,41 @@ def wait_for_token_warmup(timeout_ms: int = 5000) -> None:
             pass   # already deleted
 
 
+def notify_card_saved(card_id: int, name: str) -> None:
+    """Announce a saved card to the plugin/event bus.
+
+    The event module is imported lazily - it is an optional cross-cutting
+    module and must not be pulled in at start-up - and every error is
+    swallowed: a failing user plugin must never break the save.
+
+    Args:
+        card_id: The database id of the saved card.
+        name: The name of the saved card.
+    """
+    try:
+        from src import app_events
+        app_events.card_saved(card_id, name)
+    except Exception:
+        logger.exception("Could not announce the saved card")
+
+
+def notify_card_deleted(card_id: int, name: str) -> None:
+    """Announce a deleted card to the plugin/event bus.
+
+    The event module is imported lazily and every error is swallowed: a
+    failing user plugin must never break the deletion.
+
+    Args:
+        card_id: The database id of the deleted card.
+        name: The name of the deleted card.
+    """
+    try:
+        from src import app_events
+        app_events.card_deleted(card_id, name)
+    except Exception:
+        logger.exception("Could not announce the deleted card")
+
+
 class DirtyState:
     """Track whether the edit form has unsaved changes.
 
@@ -749,6 +784,13 @@ class EditTab(QWidget):
         """The currently selected card id (mirrors CharacterSidebar.current_id)."""
         return self._current_id
 
+    def current_card(self) -> CharacterCard | None:
+        """The card currently loaded in the editor (or None).
+
+        The object is the live one, so its fields reflect unsaved edits.
+        """
+        return self._current_card
+
     def _load_card(self, token_count: int | None = None,
                    refresh_labels: bool = True,
                    keep_history: bool = False) -> None:
@@ -1205,6 +1247,7 @@ class EditTab(QWidget):
             )
             self._dirty_state.clear()
             self.status_message.emit(f"'{card.name}' saved", 4000)
+            notify_card_saved(self._current_id, card.name)
             # The labels already describe the saved text (the gathered card
             # *is* what was written), so only the form reload below is needed
             # - a second token pass would re-encode everything needlessly.
@@ -1376,6 +1419,7 @@ class EditTab(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
         deleted_id = self._current_id
+        deleted_name = entry.get('name', '')
         try:
             self.db.remove_card(deleted_id, delete_files=True)
         except Exception as e:
@@ -1384,6 +1428,7 @@ class EditTab(QWidget):
             logger.exception("Failed to delete card %s", deleted_id)
             QMessageBox.critical(self, 'Error', f"Failed to delete card: {e}")
             return
+        notify_card_deleted(deleted_id, deleted_name)
         self._current_id = None
         self._current_card = None
         self._form_loaded_for_id = None
