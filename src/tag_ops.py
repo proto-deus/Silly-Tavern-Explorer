@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from typing import Iterable
 
 
@@ -13,6 +14,10 @@ def normalize_tag(tag: object) -> str:
     nested list (``"tags": [1, "ok", ["x"]]``). Coerce rather than crash: the
     library-level tag listing runs over *every* card, so a single malformed
     card would otherwise take down the tag sidebar and tag manager.
+
+    The text is normalised to NFC: on a normalising file system two
+    differently-normalised spellings of the same tag are the same file, and
+    they must not end up as two separate tags.
     """
     if tag is None:
         return ''
@@ -21,12 +26,17 @@ def normalize_tag(tag: object) -> str:
             tag = str(tag)
         except Exception:
             return ''
-    return tag.strip().lower()
+    return unicodedata.normalize('NFC', tag).strip().lower()
 
 
 def _normalize_all(tags: Iterable[str]) -> list[str]:
     normalized = (normalize_tag(t) for t in tags)
     return [n for n in normalized if n]
+
+
+def _keep_original(tag: object) -> str:
+    """The tag's original spelling (as a string)."""
+    return tag if isinstance(tag, str) else str(tag)
 
 
 def rename_tag(tags: list[str], old: str, new: str) -> list[str]:
@@ -35,6 +45,10 @@ def rename_tag(tags: list[str], old: str, new: str) -> list[str]:
     Case-insensitive match on *old*.  The new tag is normalized.  Duplicates
     introduced by the rename are collapsed (the renamed tag keeps its original
     position; any later duplicate is dropped).  Order is otherwise preserved.
+
+    The tags that are *not* renamed keep their original spelling: a bulk
+    rename is applied to every card in the library, and lower-casing every
+    other tag would rewrite cards the operation does not concern.
     """
     old_n = normalize_tag(old)
     new_n = normalize_tag(new)
@@ -45,11 +59,13 @@ def rename_tag(tags: list[str], old: str, new: str) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     replaced = False
+    found = False
     for tag in tags:
         n = normalize_tag(tag)
         if not n:
             continue
         if n == old_n:
+            found = True
             if not replaced:
                 if new_n not in seen:
                     result.append(new_n)
@@ -58,8 +74,11 @@ def rename_tag(tags: list[str], old: str, new: str) -> list[str]:
             # drop additional occurrences of old (dedupe)
             continue
         if n not in seen:
-            result.append(n)
+            result.append(_keep_original(tag))
             seen.add(n)
+    if not found:
+        # The tag is not on this list: nothing to do, and nothing to change.
+        return list(tags)
     return result
 
 
@@ -69,6 +88,9 @@ def merge_tag(tags: list[str], source: str, target: str) -> list[str]:
     If *target* already exists in the list, *source* is simply removed.
     Otherwise *source* is replaced in-place by *target* (preserving position).
     Case-insensitive on both.  Duplicates are collapsed.
+
+    The tags that are not merged keep their original spelling (see
+    :func:`rename_tag`).
     """
     source_n = normalize_tag(source)
     target_n = normalize_tag(target)
@@ -80,36 +102,50 @@ def merge_tag(tags: list[str], source: str, target: str) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     source_replaced = False
+    found = False
     for tag in tags:
         n = normalize_tag(tag)
         if not n:
             continue
         if n == source_n:
+            found = True
             if not source_replaced and target_n not in seen:
                 result.append(target_n)
                 seen.add(target_n)
             source_replaced = True
             continue
         if n not in seen:
-            result.append(n)
+            result.append(_keep_original(tag))
             seen.add(n)
-    # If source was never present but target isn't either, don't add target
-    # (merge only affects cards that had the source tag).
+    if not found:
+        # The source tag is not on this list: the merge does not apply, and
+        # the list is left exactly as it was.
+        return list(tags)
     return result
 
 
 def remove_tag(tags: list[str], tag: str) -> list[str]:
-    """Return a new tag list with *tag* removed (case-insensitive)."""
+    """Return a new tag list with *tag* removed (case-insensitive).
+
+    The remaining tags keep their original spelling; a list that does not
+    contain *tag* is returned unchanged.
+    """
     tag_n = normalize_tag(tag)
     result: list[str] = []
     seen: set[str] = set()
+    found = False
     for t in tags:
         n = normalize_tag(t)
-        if not n or n == tag_n:
+        if not n:
+            continue
+        if n == tag_n:
+            found = True
             continue
         if n not in seen:
-            result.append(n)
+            result.append(_keep_original(t))
             seen.add(n)
+    if not found:
+        return list(tags)
     return result
 
 

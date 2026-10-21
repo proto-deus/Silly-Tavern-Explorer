@@ -29,15 +29,23 @@ def _finite_float(val: Any) -> float | None:
     through a strict JSON parser: ``json.dumps`` emits the same non-standard
     tokens, which SillyTavern (and every other consumer) rejects. Anything
     non-finite is treated as absent.
+
+    ``OverflowError`` is caught alongside ``ValueError``: ``float(10 ** 400)``
+    raises it, and it is *not* a ``ValueError`` (it derives from
+    ``ArithmeticError``), so it escaped every ``except ValueError`` guard in
+    the codebase and aborted the app on a single malformed number.
     """
     if isinstance(val, bool):
         return None
     if isinstance(val, (int, float)):
-        f = float(val)
+        try:
+            f = float(val)
+        except (OverflowError, ValueError):
+            return None
     elif isinstance(val, str):
         try:
             f = float(val)
-        except ValueError:
+        except (OverflowError, ValueError):
             return None
     else:
         return None

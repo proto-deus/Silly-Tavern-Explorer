@@ -13,6 +13,8 @@ from typing import Optional
 from PIL import Image
 
 from src import vault
+from src import safe_json
+from src import image_safety
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,15 @@ PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
 # otherwise act as a decompression bomb (a few MB of compressed data
 # expanding to gigabytes of RAM).
 _MAX_DECOMPRESSED_TEXT = 32 * 1024 * 1024
+
+# Upper bound on the size of a card file.  A card is a PNG with a JSON
+# payload in a text chunk; anything bigger is not a card, and reading it
+# into memory would let a single file exhaust the process.
+_MAX_CARD_FILE_BYTES = 128 * 1024 * 1024
+
+# Upper bound on the number of chunks in a PNG.  A crafted file with a
+# million empty chunks would otherwise build a million dicts.
+_MAX_PNG_CHUNKS = 4096
 
 
 class PNGParseError(Exception):
@@ -57,6 +68,11 @@ def extract_chunks(png_data: bytes) -> list[dict]:
     chunks = []
     offset = 8
     while offset < len(png_data):
+        if len(chunks) >= _MAX_PNG_CHUNKS:
+            # A crafted file with a million empty chunks would otherwise
+            # build a million dicts.
+            logger.warning("Stopped reading chunks: more than %d chunks", _MAX_PNG_CHUNKS)
+            break
         try:
             chunk_type, chunk_data, offset = _read_chunk(png_data, offset)
         except PNGParseError:
@@ -196,8 +212,8 @@ def _decode_card_text(text_value: str) -> Optional[dict]:
         logger.warning("Failed to decode character card base64: %s", e)
         return None
     try:
-        return json.loads(decoded)
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+        return safe_json.loads_safe(decoded)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, OverflowError) as e:
         logger.warning("Failed to decode character card data: %s", e)
         return None
 
@@ -212,8 +228,26 @@ def _is_card_payload(value) -> bool:
     return isinstance(value, dict)
 
 
+def _check_card_file_size(path: str | Path) -> None:
+    """Refuse a card file that is far too large to be a card.
+
+    The file is read into memory in one piece, so a multi-gigabyte file
+    would exhaust the process before the PNG parser ever sees it.
+    """
+    try:
+        size = Path(path).stat().st_size
+    except OSError:
+        return
+    if size > _MAX_CARD_FILE_BYTES:
+        raise PNGParseError(
+            f"The card file is too large ({size // (1024 * 1024)} MiB); "
+            f"the limit is {_MAX_CARD_FILE_BYTES // (1024 * 1024)} MiB."
+        )
+
+
 def read_chara_card(png_path: str | Path) -> Optional[dict]:
     try:
+        _check_card_file_size(png_path)
         png_data = vault.read_bytes(png_path)
         chunks = extract_chunks(png_data)
     except (PNGParseError, OSError, vault.VaultError) as e:
@@ -261,8 +295,10 @@ def read_card_from_json(json_path: str | Path) -> Optional[dict]:
     """
     try:
         from src.fs_utils import decode_text
-        data = json.loads(decode_text(vault.read_bytes(json_path)))
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError, vault.VaultError) as e:
+        _check_card_file_size(json_path)
+        data = safe_json.loads_safe(decode_text(vault.read_bytes(json_path)))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError,
+            OverflowError, PNGParseError, vault.VaultError) as e:
         logger.warning("Failed to read JSON card from %s: %s", json_path, e)
         return None
     if not isinstance(data, dict):
@@ -396,8 +432,8 @@ def replace_card_image(
     # Re-encode through the source's own pixel format. A blanket
     # .convert('RGBA') inflated palette/greyscale/16-bit images to 8-bit RGBA
     # (bigger files, banding) and the skipped PLTE/tRNS made that irreversible.
-    with Image.open(new_image_path) as src_img:
-        src_img.load()
+    with image_safety.open_checked(new_image_path) as src_img:
+        image_safety.load_checked(src_img)
         if src_img.mode == 'P':
             # Keep the palette; carry transparency across if the source had it.
             new_img = src_img.copy()

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -140,6 +141,15 @@ def decode_text(data: bytes) -> str:
         return data.decode('utf-8', errors='replace')
 
 
+#: Windows device names: a file called ``NUL`` (or ``CON``, ``PRN``, ...)
+#: cannot be created, and the name silently ends up somewhere else.
+_RESERVED_NAMES = frozenset({
+    'CON', 'PRN', 'AUX', 'NUL',
+    'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+    'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
+})
+
+
 def safe_filename_component(name: str | None) -> str:
     """Return *name* reduced to a single safe path component ('' if unusable).
 
@@ -147,10 +157,23 @@ def safe_filename_component(name: str | None) -> str:
     does **not** stop a crafted or legacy DB value from escaping its
     directory.  Empty/``.``/``..`` results are rejected outright; the caller
     sees ``''`` and must decide (skip the row, refuse the write, ...).
+
+    The characters that are illegal in a Windows file name are replaced as
+    well: a colon opens an *alternate data stream* (``x:y`` writes a stream
+    of ``x``), and a trailing dot or space is dropped by Windows, so the
+    stored name would not match the file on disk.
     """
     base = Path(str(name or '')).name
     if base in ('', '.', '..'):
         return ''
+    base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', base)
+    # Windows drops trailing dots and spaces from a file name.
+    base = base.rstrip('. ')
+    if not base:
+        return ''
+    stem = base.split('.', 1)[0].upper()
+    if stem in _RESERVED_NAMES:
+        base = '_' + base
     return base
 
 
@@ -182,21 +205,24 @@ def _unique_collision_target(directory: Path, name: str) -> Path:
     return unique_temp_path(directory, f'{stem}__', suffix)
 
 
-def move_contents_into(old_dir: str | Path, new_dir: str | Path) -> list[str]:
+def move_contents_into(old_dir: str | Path, new_dir: str | Path) -> list[tuple[str, str]]:
     """Move every entry of *old_dir* into *new_dir*, never losing data.
 
     An entry whose target name already exists is renamed to a unique
     ``<stem>__<n><suffix>`` form instead of being skipped - the previous
     skip-and-``rmtree`` pattern silently destroyed every colliding entry.
-    Returns human-readable notes for renamed collisions.
+
+    Returns the renames as ``(old_name, new_name)`` pairs so the caller can
+    update whatever refers to the files (the gallery rows in the database
+    point at a file name, and a stale one shows the wrong image).
     """
     old_dir = Path(old_dir)
     new_dir = Path(new_dir)
-    notes: list[str] = []
+    renames: list[tuple[str, str]] = []
     for item in old_dir.iterdir():
         target = new_dir / item.name
         if target.exists():
             target = _unique_collision_target(new_dir, item.name)
-            notes.append(f"'{item.name}' merged as '{target.name}'")
+            renames.append((item.name, target.name))
         item.rename(target)
-    return notes
+    return renames

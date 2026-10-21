@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
 import time
 from dataclasses import dataclass, field, replace
-from typing import Any, Generator, Optional
+from typing import Any, Generator, Iterable, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
 from src.card_models import CharacterCard
 from src import ai_prompts
+from src.provider_capabilities import request_key
+
+#: The llama.cpp family's DRY look-back window.  The app's "0 = the whole
+#: context" has no direct equivalent there, so it maps to their default.
+_DRY_LOOKBACK_DEFAULT = 320
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +37,6 @@ _RETRYABLE_TRANSPORT_ERRORS = (
     requests.exceptions.ChunkedEncodingError,
     requests.exceptions.ContentDecodingError,
     requests.exceptions.TooManyRedirects,
-    requests.exceptions.SSLError,
 )
 
 # Bad request *configuration* (malformed URL, illegal header value) is
@@ -40,6 +46,10 @@ _RETRYABLE_TRANSPORT_ERRORS = (
 _PERMANENT_CONFIG_ERRORS = (
     requests.exceptions.InvalidHeader,
     requests.exceptions.InvalidURL,
+    # A certificate-verification failure is permanent: the same request will
+    # fail the same way every time, so retrying it only delays the error the
+    # user needs to see (and the retries cost seconds each).
+    requests.exceptions.SSLError,
     # http.client raises a bare UnicodeEncodeError for a header value that
     # isn't latin-1 encodable (e.g. a pasted API key with a smart quote).
     UnicodeEncodeError,
@@ -68,18 +78,41 @@ def is_cleartext_remote(base_url: str) -> bool:
     return host not in ('', 'localhost', '127.0.0.1', '::1', '0:0:0:0:0:0:0:1')
 
 
-def redact_secrets(message: object) -> str:
+def redact_secrets(message: object, extra_secrets: Optional[Iterable[str]] = None) -> str:
     """Return *message* with anything that looks like a credential removed.
 
     Applied to every transport error string that reaches a log or the UI:
     exception messages can echo request headers, including ``Authorization``,
     and server error prose can echo the key back ("Incorrect API key
     provided: sk-live-...").
+
+    *extra_secrets* holds literals the caller already knows - most importantly
+    the configured API key.  Pattern matching alone can never be complete
+    (a key can have any format), so the literal value is removed as well.
+
+    The key-shaped heuristics below are deliberately generous: over-redacting
+    a word in an error message is a cosmetic problem, while under-redacting
+    an API key writes it to the plaintext log and shows it in a dialog.
     """
     text = str(message)
+    # 1. The literal secrets we know about.  Done first so the patterns
+    #    cannot accidentally mangle the key before it is matched.
+    for secret in extra_secrets or ():
+        literal = str(secret or '').strip()
+        # Very short values would match far too much text; four characters
+        # is already the shortest plausible credential.
+        if len(literal) >= 4:
+            text = text.replace(literal, '[redacted]')
+    # 2. Label-shaped values.  The label may be quoted (a JSON body echoes
+    #    the key as ``"api_key": "..."``), so the optional quote is part of
+    #    the pattern.
     text = re.sub(r'(?i)(bearer\s+)[^\s\'"]+', r'\1[redacted]', text)
-    text = re.sub(r'(?i)((?:api[ _-]?key|authorization|token)\s*[:=]\s*)[^\s,;\'"]+',
-                  r'\1[redacted]', text)
+    text = re.sub(
+        r'(?i)(["\']?(?:api[ _-]?key|authorization|access[ _-]?token|token|secret'
+        r'|password|passphrase|credential|bearer)["\']?\s*[:=]\s*)'
+        r'[^\s,;\'"}]+',
+        r'\1[redacted]', text,
+    )
     # Key-shaped tokens anywhere: servers echo keys in prose where the label
     # rule above cannot see them ("api key provided: sk-live-SECRET").
     text = re.sub(
@@ -89,10 +122,69 @@ def redact_secrets(message: object) -> str:
     # Bare ``key=...`` / ``key: ...`` values (query strings, form bodies).
     text = re.sub(r'(?i)(\bkey\s*[:=]\s*)[^\s,;\'"]+', r'\1[redacted]', text)
     text = re.sub(r'(?i)(header value\s*[:=]?\s*)([\'"]?)[^\s\'"]+', r'\1\2[redacted]', text)
+    # 3. Well-known provider key shapes that carry no "sk"/"key" marker.
+    text = re.sub(
+        r'(?i)\b(?:gsk|hf|r8|csk|nvapi|api|xai|sk)[_-][A-Za-z0-9_\-]{12,}',
+        '[redacted]', text,
+    )
+    text = re.sub(r'\bAIza[A-Za-z0-9_\-]{20,}', '[redacted]', text)
+    # 4. Anything long enough to be an opaque credential: at least 20
+    #    characters with both letters and digits.  This is what catches
+    #    "Incorrect API key provided: gsk_9xYzAbCdEf0123...".
+    text = _redact_opaque_tokens(text)
+    # 5. Base64-encoded secrets: a key can travel base64-encoded (a config
+    #    file, a gateway), and no label rule sees that.
+    text = _redact_base64_secrets(text, extra_secrets)
     return text
 
 
-def _permanent_config_message(exc: BaseException) -> str:
+#: Words that mark a decoded blob as a credential.
+_CREDENTIAL_WORDS = (
+    'key', 'token', 'secret', 'password', 'passwd', 'credential', 'auth',
+)
+
+_BASE64_TOKEN_RE = re.compile(
+    r'(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/=])'
+)
+
+
+def _redact_base64_secrets(text: str, extra_secrets=None) -> str:
+    """Redact base64 tokens that decode to something credential-shaped."""
+
+    def repl(match: re.Match) -> str:
+        token = match.group(0)
+        try:
+            decoded = base64.b64decode(token + '===', validate=False).decode('utf-8')
+        except Exception:
+            return token
+        if not decoded or not decoded.isprintable():
+            return token
+        lowered = decoded.casefold()
+        if any(word in lowered for word in _CREDENTIAL_WORDS):
+            return '[redacted]'
+        for secret in extra_secrets or ():
+            literal = str(secret or '').strip()
+            if literal and literal in decoded:
+                return '[redacted]'
+        return token
+
+    return _BASE64_TOKEN_RE.sub(repl, text)
+
+
+def _redact_opaque_tokens(text: str) -> str:
+    """Replace long, mixed alphanumeric tokens with ``[redacted]``."""
+    def repl(match: re.Match) -> str:
+        token = match.group(0)
+        if any(c.isdigit() for c in token) and any(c.isalpha() for c in token):
+            return '[redacted]'
+        return token
+
+    return re.sub(r'(?<![\w-])[A-Za-z0-9][A-Za-z0-9_.\-]{19,}(?![\w-])', repl, text)
+
+
+def _permanent_config_message(
+    exc: BaseException, secrets: Optional[Iterable[str]] = None,
+) -> str:
     """Safe, user-facing message for a permanent request-configuration error."""
     if isinstance(exc, requests.exceptions.InvalidHeader):
         return (
@@ -104,7 +196,7 @@ def _permanent_config_message(exc: BaseException) -> str:
             'The API key contains characters that cannot be sent '
             '(e.g. smart quotes). Re-enter it in Settings.'
         )
-    return redact_secrets(exc)
+    return redact_secrets(exc, secrets)
 
 
 # Error-message fingerprints of a chat-template / role-shape rejection.  Both
@@ -137,12 +229,226 @@ class _RetryableError(Exception):
 
 
 def _is_complete_json(text: str) -> bool:
-    """True when *text* is a self-contained JSON value."""
+    """True when *text* is a self-contained JSON value.
+
+    ``RecursionError`` is caught as well: it is a ``RuntimeError``, not a
+    ``ValueError``, so it escaped this guard and aborted the request on a
+    deeply nested payload ("[" * 200000).
+    """
     try:
         json.loads(text)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return False
     return True
+
+
+def _url_host(base_url: str) -> str:
+    """The host of *base_url* without any userinfo.
+
+    A base URL may carry "https://user:pass@host"; logging the raw
+    authority would write the password to the log in cleartext.
+    """
+    text = (base_url or '').strip()
+    if not text:
+        return ''
+    if '://' not in text:
+        text = 'http://' + text
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return ''
+    return parsed.hostname or parsed.netloc
+
+
+_MAX_ERROR_BODY_BYTES = 64 * 1024
+
+# Streaming limits.  ``max_tokens`` is only advisory to the server, so the
+# client enforces its own ceiling: a runaway or hostile endpoint must not be
+# able to exhaust the process's memory.
+_MAX_STREAM_LINE_BYTES = 1024 * 1024      # 1 MiB for a single SSE line
+_MAX_STREAM_CHARS = 4 * 1024 * 1024       # 4 MiB of decoded text per reply
+
+#: The total time one request may take.  The socket timeout is a per-read
+#: deadline, so a server that dribbles out one byte every 100 s would keep
+#: the worker thread blocked indefinitely.
+_MAX_REQUEST_SECONDS = 600.0
+
+
+def _bounded_response_text(response) -> str:
+    """Read at most :data:`_MAX_ERROR_BODY_BYTES` of an error body.
+
+    The response is opened with ``stream=True``, so ``response.text``
+    materialises the *entire* body in memory and then parses it.  A hostile or
+    broken endpoint can return gigabytes and exhaust the process before the
+    400-character clamp is ever applied.  The raw stream is read with a cap
+    instead.
+    """
+    raw = None
+    try:
+        candidate = response.raw.read(_MAX_ERROR_BODY_BYTES + 1)
+        if isinstance(candidate, (bytes, bytearray)):
+            raw = bytes(candidate)
+    except Exception:
+        raw = None
+    if raw:
+        truncated = len(raw) > _MAX_ERROR_BODY_BYTES
+        text = raw[:_MAX_ERROR_BODY_BYTES].decode(
+            getattr(response, 'encoding', None) or 'utf-8', errors='replace',
+        )
+        return text + ('... [truncated]' if truncated else '')
+    # Fallback for response objects without a usable raw stream.  The read
+    # stays bounded: ``response.text`` materialises the *whole* body, which
+    # is exactly what this function exists to prevent - so it is only used
+    # when the body is known to be small.
+    try:
+        length = response.headers.get('Content-Length')
+    except Exception:
+        length = None
+    try:
+        if length is not None and str(length).isdigit() \
+                and int(length) > _MAX_ERROR_BODY_BYTES:
+            return ''
+    except (TypeError, ValueError):
+        pass
+    try:
+        text = response.text
+    except Exception:
+        return ''
+    if not isinstance(text, str):
+        return ''
+    if len(text) > _MAX_ERROR_BODY_BYTES:
+        text = text[:_MAX_ERROR_BODY_BYTES] + '... [truncated]'
+    return text
+
+
+class _CancellableHTTPAdapter(requests.adapters.HTTPAdapter):
+    """Adapter that keeps a handle on the live connection.
+
+    ``requests`` only returns the response object *after* the response
+    headers have arrived, so ``AIClient.cancel()`` had nothing to close while
+    the request was still waiting for them - Cancel appeared to do nothing for
+    up to the full request timeout, and the window refused to close.
+
+    The adapter records the urllib3 connection as soon as it is created, which
+    makes its socket reachable during the connect and header phases.  The
+    patch is applied to the pool *instance*, so it never affects other
+    clients in the process; if urllib3's internals ever change, the getattr
+    fallbacks keep the old behaviour instead of raising.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.last_connection = None
+        self.cancelled = False
+
+    def _capture(self, url: str) -> None:
+        """Patch the pool for *url* so it records the connection it uses."""
+        try:
+            pool = self.poolmanager.connection_from_url(url)
+        except Exception:
+            return
+        if pool is None or getattr(pool, '_ste_capture_patched', False):
+            return
+        original = getattr(pool, '_make_request', None)
+        if original is None:
+            return
+
+        def _make_request(conn, *args, **kwargs):
+            self.last_connection = conn
+            self._instrument_connect(conn)
+            return original(conn, *args, **kwargs)
+
+        try:
+            pool._make_request = _make_request
+            pool._ste_capture_patched = True
+        except Exception:
+            logger.debug("Could not instrument the connection pool", exc_info=True)
+
+    def _instrument_connect(self, conn) -> None:
+        """Make a pending connect abort when the request was cancelled.
+
+        ``cancel()`` can only close a socket that already exists, so a
+        cancel that arrives while the connection is still being established
+        (DNS, TCP, TLS) was silently ignored.  Hooking ``connect`` lets the
+        cancellation be honoured as soon as the connect is about to start.
+        """
+        try:
+            original_connect = getattr(conn, 'connect', None)
+            if original_connect is None or getattr(conn, '_ste_connect_patched', False):
+                return
+
+            def connect(*args, **kwargs):
+                if self.cancelled:
+                    raise OSError('The request was cancelled.')
+                return original_connect(*args, **kwargs)
+
+            conn.connect = connect
+            conn._ste_connect_patched = True
+        except Exception:
+            logger.debug("Could not instrument connect()", exc_info=True)
+
+    def send(self, request, **kwargs):
+        self._capture(request.url)
+        return super().send(request, **kwargs)
+
+    def close_connection(self, conn) -> None:
+        """Close the socket of the live connection, if there is one."""
+        sock = getattr(conn, 'sock', None)
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        # Also ask urllib3 to close the connection itself: it marks the
+        # connection unusable so a later read fails instead of blocking.
+        try:
+            closer = getattr(conn, 'close', None)
+            if closer is not None:
+                closer()
+        except Exception:
+            pass
+
+
+def _iter_sse_lines(resp) -> Generator[bytes, None, None]:
+    """Yield the response body as lines, with a bounded buffer.
+
+    ``requests``' ``iter_lines()`` keeps buffering until it sees a newline, so
+    a server that never sends one grows the buffer without limit.  Reading
+    fixed-size chunks and splitting them here keeps the buffer bounded.
+
+    Falls back to ``iter_lines()`` when the response object does not provide
+    chunked content.
+    """
+    buffer = bytearray()
+    produced = False
+    try:
+        chunks = resp.iter_content(chunk_size=8192)
+    except (AttributeError, TypeError):
+        chunks = None
+    if chunks is not None:
+        for chunk in chunks:
+            if not chunk:
+                continue
+            produced = True
+            buffer.extend(chunk)
+            while True:
+                index = buffer.find(b'\n')
+                if index < 0:
+                    break
+                line = bytes(buffer[:index])
+                del buffer[:index + 1]
+                yield line
+            if len(buffer) > _MAX_STREAM_LINE_BYTES:
+                # A single line longer than the cap: emit it and drop the rest
+                # rather than growing the buffer without limit.
+                yield bytes(buffer)
+                buffer.clear()
+        if produced:
+            if buffer:
+                yield bytes(buffer)
+            return
+    # No chunked content (an older requests, or a response double).
+    yield from resp.iter_lines()
 
 
 def _http_error_detail(exc: requests.HTTPError) -> str:
@@ -155,11 +461,8 @@ def _http_error_detail(exc: requests.HTTPError) -> str:
     response = getattr(exc, 'response', None)
     if response is None:
         return base
-    try:
-        body = response.text
-    except Exception:
-        return base
-    if not isinstance(body, str) or not body.strip():
+    body = _bounded_response_text(response)
+    if not body or not body.strip():
         return base
     body = body.strip()
     try:
@@ -231,6 +534,35 @@ class APIPreset:
     retry_attempts: int = 2
     # Custom stop sequences (SillyTavern's "Custom Stopping Strings").
     stop: list[str] = field(default_factory=list)
+    # Advanced samplers (llama.cpp-compatible names).  Only the local
+    # llama.cpp-family servers implement them, and each spells them slightly
+    # differently - see ``src.provider_capabilities``, which maps them onto
+    # the key the active provider expects and leaves out the ones it does
+    # not know.
+    # Mirostat: 0 = off, 1 = Mirostat v1, 2 = Mirostat v2.
+    mirostat: int = 0
+    mirostat_tau: float = 5.0
+    mirostat_eta: float = 0.1
+    # DRY ("Don't Repeat Yourself") repetition sampler.
+    dry_multiplier: float = 0.0  # 0 = off
+    dry_base: float = 1.75
+    dry_allowed_length: int = 2
+    dry_penalty_range: int = 0  # 0 = full context window
+    # XTC ("Exclude Top Choices").
+    xtc_threshold: float = 0.1
+    xtc_probability: float = 0.0  # 0 = off
+    # Typical P (1.0 = off).
+    typical_p: float = 1.0
+    # Dynamic temperature (0 range = off).
+    dynatemp_range: float = 0.0
+    dynatemp_exponent: float = 1.0
+    # Quadratic / smoothing sampling (0 = off).
+    smoothing_factor: float = 0.0
+    min_tokens_to_keep: int = 1
+    # Repetition penalty (1.0 = off).  The llama.cpp spelling, which is what
+    # LM Studio's OpenAI-compatible endpoint accepts; OpenRouter spells the
+    # same thing ``repetition_penalty`` and ignores this key.
+    repeat_penalty: float = 1.0
     # Rewrite chat messages into a single leading system message followed by
     # strict user/assistant alternation before sending.  Required by Llama
     # 3.x / Gemma chat templates; harmless elsewhere but it does change the
@@ -239,6 +571,7 @@ class APIPreset:
 
 
 PRESETS: dict[str, APIPreset] = {
+    # -- Local servers (OpenAI-compatible) ----------------------------------
     'LM Studio': APIPreset(
         name='LM Studio',
         base_url='http://localhost:1234/v1',
@@ -257,6 +590,65 @@ PRESETS: dict[str, APIPreset] = {
         max_tokens=2048,
         min_p=0.05,
     ),
+    'text-generation-webui': APIPreset(
+        # Needs the "--api" flag; the OpenAI-compatible API listens on 5000.
+        name='text-generation-webui',
+        base_url='http://localhost:5000/v1',
+        api_key='textgenwebui',
+        model='',
+        temperature=1.0,
+        max_tokens=2048,
+    ),
+    'KoboldCpp': APIPreset(
+        name='KoboldCpp',
+        base_url='http://localhost:5001/v1',
+        api_key='koboldcpp',
+        model='',
+        temperature=1.0,
+        max_tokens=2048,
+    ),
+    'llama.cpp': APIPreset(
+        # llama-server's OpenAI-compatible endpoint.
+        name='llama.cpp',
+        base_url='http://localhost:8080/v1',
+        api_key='llama-cpp',
+        model='',
+        temperature=1.0,
+        max_tokens=2048,
+    ),
+    'vLLM': APIPreset(
+        name='vLLM',
+        base_url='http://localhost:8000/v1',
+        api_key='vllm',
+        model='',
+        temperature=1.0,
+        max_tokens=2048,
+    ),
+    'Jan': APIPreset(
+        name='Jan',
+        base_url='http://localhost:1337/v1',
+        api_key='jan',
+        model='',
+        temperature=1.0,
+        max_tokens=2048,
+    ),
+    'GPT4All': APIPreset(
+        name='GPT4All',
+        base_url='http://localhost:4891/v1',
+        api_key='gpt4all',
+        model='',
+        temperature=1.0,
+        max_tokens=2048,
+    ),
+    'LocalAI': APIPreset(
+        name='LocalAI',
+        base_url='http://localhost:8080/v1',
+        api_key='localai',
+        model='',
+        temperature=1.0,
+        max_tokens=2048,
+    ),
+    # -- Remote APIs ---------------------------------------------------------
     'OpenRouter': APIPreset(
         name='OpenRouter',
         base_url='https://openrouter.ai/api/v1',
@@ -273,6 +665,46 @@ PRESETS: dict[str, APIPreset] = {
         base_url='https://api.openai.com/v1',
         api_key='',
         model='gpt-4o-mini',
+        temperature=1.0,
+        max_tokens=2048,
+    ),
+    'Gemini': APIPreset(
+        name='Gemini',
+        base_url='https://generativelanguage.googleapis.com/v1beta/openai',
+        api_key='',
+        model='gemini-2.0-flash',
+        temperature=1.0,
+        max_tokens=2048,
+    ),
+    'Mistral': APIPreset(
+        name='Mistral',
+        base_url='https://api.mistral.ai/v1',
+        api_key='',
+        model='mistral-small-latest',
+        temperature=1.0,
+        max_tokens=2048,
+    ),
+    'DeepSeek': APIPreset(
+        name='DeepSeek',
+        base_url='https://api.deepseek.com',
+        api_key='',
+        model='deepseek-chat',
+        temperature=1.0,
+        max_tokens=2048,
+    ),
+    'Groq': APIPreset(
+        name='Groq',
+        base_url='https://api.groq.com/openai/v1',
+        api_key='',
+        model='',
+        temperature=1.0,
+        max_tokens=2048,
+    ),
+    'xAI Grok': APIPreset(
+        name='xAI Grok',
+        base_url='https://api.x.ai/v1',
+        api_key='',
+        model='',
         temperature=1.0,
         max_tokens=2048,
     ),
@@ -322,17 +754,67 @@ def preset_from_saved(saved: dict) -> APIPreset:
         base_url=saved.get('base_url') or base.base_url,
         api_key=saved.get('api_key') or base.api_key,
         model=saved.get('model') or base.model,
-        temperature=saved.get('temperature', base.temperature),
-        max_tokens=saved.get('max_tokens', base.max_tokens),
-        top_p=saved.get('top_p', base.top_p),
-        top_k=saved.get('top_k', base.top_k),
-        min_p=saved.get('min_p', base.min_p),
-        context_size=saved.get('context_size', base.context_size),
-        frequency_penalty=saved.get('frequency_penalty', base.frequency_penalty),
-        presence_penalty=saved.get('presence_penalty', base.presence_penalty),
-        seed=saved.get('seed', base.seed),
-        retry_attempts=saved.get('retry_attempts', base.retry_attempts),
+        temperature=_as_float(saved.get('temperature', base.temperature),
+                              base.temperature),
+        max_tokens=_as_int(saved.get('max_tokens', base.max_tokens),
+                           base.max_tokens),
+        top_p=_as_float(saved.get('top_p', base.top_p), base.top_p),
+        top_k=_as_int(saved.get('top_k', base.top_k), base.top_k),
+        min_p=_as_float(saved.get('min_p', base.min_p), base.min_p),
+        context_size=_as_int(saved.get('context_size', base.context_size),
+                              base.context_size),
+        frequency_penalty=_as_float(
+            saved.get('frequency_penalty', base.frequency_penalty),
+            base.frequency_penalty,
+        ),
+        presence_penalty=_as_float(
+            saved.get('presence_penalty', base.presence_penalty),
+            base.presence_penalty,
+        ),
+        seed=_as_int(saved.get('seed', base.seed), base.seed),
+        retry_attempts=_as_int(saved.get('retry_attempts', base.retry_attempts),
+                                base.retry_attempts),
         stop=_parse_stop_sequences(saved.get('stop')),
+        mirostat=_as_int(saved.get('mirostat', base.mirostat), base.mirostat),
+        mirostat_tau=_as_float(saved.get('mirostat_tau', base.mirostat_tau),
+                               base.mirostat_tau),
+        mirostat_eta=_as_float(saved.get('mirostat_eta', base.mirostat_eta),
+                               base.mirostat_eta),
+        dry_multiplier=_as_float(saved.get('dry_multiplier', base.dry_multiplier),
+                                 base.dry_multiplier),
+        dry_base=_as_float(saved.get('dry_base', base.dry_base), base.dry_base),
+        dry_allowed_length=_as_int(
+            saved.get('dry_allowed_length', base.dry_allowed_length),
+            base.dry_allowed_length,
+        ),
+        dry_penalty_range=_as_int(
+            saved.get('dry_penalty_range', base.dry_penalty_range),
+            base.dry_penalty_range,
+        ),
+        xtc_threshold=_as_float(saved.get('xtc_threshold', base.xtc_threshold),
+                                base.xtc_threshold),
+        xtc_probability=_as_float(
+            saved.get('xtc_probability', base.xtc_probability),
+            base.xtc_probability,
+        ),
+        typical_p=_as_float(saved.get('typical_p', base.typical_p),
+                            base.typical_p),
+        dynatemp_range=_as_float(saved.get('dynatemp_range', base.dynatemp_range),
+                                 base.dynatemp_range),
+        dynatemp_exponent=_as_float(
+            saved.get('dynatemp_exponent', base.dynatemp_exponent),
+            base.dynatemp_exponent,
+        ),
+        smoothing_factor=_as_float(
+            saved.get('smoothing_factor', base.smoothing_factor),
+            base.smoothing_factor,
+        ),
+        min_tokens_to_keep=_as_int(
+            saved.get('min_tokens_to_keep', base.min_tokens_to_keep),
+            base.min_tokens_to_keep,
+        ),
+        repeat_penalty=_as_float(saved.get('repeat_penalty', base.repeat_penalty),
+                                 base.repeat_penalty),
         strict_chat_template=_as_bool(
             saved.get('strict_chat_template', base.strict_chat_template)
         ),
@@ -344,6 +826,34 @@ def _as_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ('true', '1', 'yes', 'on')
     return bool(value)
+
+
+def _as_int(value, default):
+    """Coerce a saved settings value to int, falling back to *default*.
+
+    The saved values come from the registry, but they are also loaded from
+    hand-edited config files and from raw dicts; a non-numeric value must
+    not raise out of the settings path.
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _as_float(value, default: float) -> float:
+    """Coerce a saved settings value to float, falling back to *default*."""
+    if value is None:
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if result != result or result in (float('inf'), float('-inf')):
+        return default
+    return result
 
 
 def vary_seed(preset: APIPreset, bump: int) -> APIPreset:
@@ -388,7 +898,35 @@ class AIClient:
         self.preset = preset
         self._session: Optional[requests.Session] = None
         self._response = None   # the in-flight streamed response, for cancel()
+        self._adapter = None    # the cancellable adapter, for cancel()
         self._cancel_requested = False
+        self._stream_chars = 0  # decoded characters yielded by the current reply
+        # The messages of the last request, exactly as they were sent (after
+        # trimming and injection splicing).  The usage ledger counts them so
+        # the recorded token numbers describe the real prompt.
+        self.last_request_messages: list[dict[str, Any]] = []
+
+    def _permanent_config_message(self, exc: BaseException) -> str:
+        """Client-aware variant that also strips the configured API key."""
+        return _permanent_config_message(exc, self._known_secrets())
+
+    def _redact(self, message: object) -> str:
+        """Redact *message*, including this client's literal API key.
+
+        The pattern-based filter cannot know every key format, so the
+        configured key is removed by value as well.  Without this a server
+        that echoes the key back ("Invalid API key provided: <KEY>") leaks it
+        into the plaintext log and into a message box.
+        """
+        return redact_secrets(message, self._known_secrets())
+
+    def _known_secrets(self) -> list[str]:
+        """Literal values that must never appear in a message."""
+        secrets = []
+        key = getattr(self.preset, 'api_key', '') or ''
+        if key.strip():
+            secrets.append(key.strip())
+        return secrets
 
     def _headers(self) -> dict[str, str]:
         h = {'Content-Type': 'application/json'}
@@ -411,16 +949,40 @@ class AIClient:
                     '(e.g. smart quotes). Re-enter it in Settings.'
                 ) from None
             if is_cleartext_remote(self.preset.base_url):
+                # Only the host name is logged: a base URL with userinfo
+                # ("https://user:pass@host") would otherwise write the
+                # password to the log in cleartext.
                 logger.warning(
                     "Sending the API key to %s over unencrypted http://",
-                    (self.preset.base_url or '').split('//', 1)[-1].split('/', 1)[0],
+                    _url_host(self.preset.base_url),
                 )
             h['Authorization'] = f'Bearer {key}'
         return h
 
     def _url(self) -> str:
-        base = self.preset.base_url.rstrip('/')
-        return f'{base}/chat/completions'
+        """The chat-completions endpoint for the configured base URL.
+
+        The path is inserted *before* any query string: a base URL like
+        "https://host/v1?api-version=2024" used to become
+        ".../v1?api-version=2024/chat/completions", which sent the path
+        segment into the query and made the request 404.
+
+        Userinfo ("https://user:pass@host") is rejected: requests turns it
+        into HTTP Basic auth and *overwrites* the Bearer header, so the API
+        key would silently never be sent - and the URL password would become
+        the credential on the wire.
+        """
+        base = (self.preset.base_url or '').strip()
+        parsed = urlsplit(base)
+        if parsed.username or parsed.password:
+            raise RuntimeError(
+                'The base URL must not contain a user name or password. '
+                'Put the key in the API key field instead.'
+            )
+        path = parsed.path.rstrip('/')
+        url = urlunsplit((parsed.scheme, parsed.netloc, f'{path}/chat/completions',
+                          parsed.query, ''))
+        return url
 
     def cancel(self) -> None:
         """Request cancellation of any in-progress generation.
@@ -453,6 +1015,18 @@ class AIClient:
                 response.close()
             except Exception:
                 pass
+        # The response object only exists once the headers have arrived, so
+        # the connection captured by the adapter is what makes Cancel work
+        # while the request is still waiting for them.
+        adapter = getattr(self, '_adapter', None)
+        if adapter is not None:
+            adapter.cancelled = True
+            conn = getattr(adapter, 'last_connection', None)
+            if conn is not None:
+                try:
+                    adapter.close_connection(conn)
+                except Exception:
+                    pass
         session = self._session
         if session is not None:
             try:
@@ -498,6 +1072,7 @@ class AIClient:
         # Fields" request (which pastes every card field) could exceed the
         # provider's context and be rejected outright.
         messages = trim_messages(messages, self.preset.context_size, self.preset.max_tokens)
+        self.last_request_messages = list(messages)
         payload = self._build_payload(messages, stream)
 
         if stream:
@@ -508,11 +1083,14 @@ class AIClient:
         """Assemble a chat-completions payload from the preset + messages.
 
         Standard OpenAI-compatible sampling parameters are always sent;
-        non-standard/optional ones (``top_k``, ``min_p``, penalties, seed)
-        are only included when they are set to a non-neutral value so they
-        don't trip up backends that reject unknown keys.
+        the optional ones are only included when they are set to a
+        non-neutral value, and only when the provider implements them at
+        all - see ``src.provider_capabilities``.  A provider that does not
+        know a parameter either ignores it or rejects the request, so
+        sending it would be pointless at best.
         """
         p = self.preset
+        provider = p.name
         # The settings dialog allows any combination, including a 512-token
         # context with a 32768 output length. Every provider rejects a
         # max_tokens larger than the window, so clamp it to something that can
@@ -532,21 +1110,75 @@ class AIClient:
             'stream': stream,
         }
         if p.top_p < 1.0:
-            payload['top_p'] = p.top_p
+            self._put(payload, provider, 'top_p', p.top_p)
         if p.top_k and p.top_k > 0:
-            payload['top_k'] = p.top_k
+            self._put(payload, provider, 'top_k', p.top_k)
         if p.min_p and p.min_p > 0:
-            payload['min_p'] = p.min_p
+            self._put(payload, provider, 'min_p', p.min_p)
         if p.frequency_penalty:
-            payload['frequency_penalty'] = p.frequency_penalty
+            self._put(payload, provider, 'frequency_penalty', p.frequency_penalty)
         if p.presence_penalty:
-            payload['presence_penalty'] = p.presence_penalty
+            self._put(payload, provider, 'presence_penalty', p.presence_penalty)
         if p.seed is not None and p.seed >= 0:
-            payload['seed'] = p.seed
+            self._put(payload, provider, 'seed', p.seed)
         stops = [s for s in (p.stop or []) if s]
         if stops:
-            payload['stop'] = stops
+            self._put(payload, provider, 'stop', stops)
+        if p.repeat_penalty != 1.0:
+            self._put(payload, provider, 'repeat_penalty', p.repeat_penalty)
+        # The advanced samplers only the llama.cpp-family servers implement.
+        # Each group is switched on by its main setting; the members the
+        # provider does not know are left out one by one.
+        if p.mirostat and p.mirostat > 0:
+            self._put(payload, provider, 'mirostat', p.mirostat)
+            self._put(payload, provider, 'mirostat_tau', p.mirostat_tau)
+            self._put(payload, provider, 'mirostat_eta', p.mirostat_eta)
+        if p.dry_multiplier and p.dry_multiplier > 0:
+            self._put(payload, provider, 'dry_multiplier', p.dry_multiplier)
+            self._put(payload, provider, 'dry_base', p.dry_base)
+            self._put(payload, provider, 'dry_allowed_length', p.dry_allowed_length)
+            self._put(
+                payload, provider, 'dry_penalty_range',
+                self._dry_penalty_range(provider, p),
+            )
+        if p.xtc_probability and p.xtc_probability > 0:
+            self._put(payload, provider, 'xtc_probability', p.xtc_probability)
+            self._put(payload, provider, 'xtc_threshold', p.xtc_threshold)
+        if p.typical_p < 1.0:
+            self._put(payload, provider, 'typical_p', p.typical_p)
+        if p.dynatemp_range and p.dynatemp_range > 0:
+            self._put(payload, provider, 'dynatemp_range', p.dynatemp_range)
+            self._put(payload, provider, 'dynatemp_exponent', p.dynatemp_exponent)
+        if p.smoothing_factor and p.smoothing_factor > 0:
+            self._put(payload, provider, 'smoothing_factor', p.smoothing_factor)
+        if p.min_tokens_to_keep != 1:
+            self._put(payload, provider, 'min_tokens_to_keep', p.min_tokens_to_keep)
         return payload
+
+    @staticmethod
+    def _put(payload: dict[str, Any], provider: str, setting: str, value: Any) -> None:
+        """Put *value* into *payload* under the key *provider* expects.
+
+        A setting the provider does not implement is left out entirely:
+        most servers ignore it, but OpenAI, Mistral and GPT4All reject the
+        whole request over it.
+        """
+        key = request_key(provider, setting)
+        if key is not None:
+            payload[key] = value
+
+    @staticmethod
+    def _dry_penalty_range(provider: str, p: APIPreset) -> int:
+        """The DRY look-back window in the shape *provider* expects.
+
+        The app's "0 = the whole context" has no direct equivalent in the
+        llama.cpp family, which counts the tokens it scans back
+        (``dry_penalty_last_n``).  Their own default of 320 is the closest
+        thing to "the whole context".
+        """
+        if request_key(provider, 'dry_penalty_range') == 'dry_penalty_last_n':
+            return p.dry_penalty_range or _DRY_LOOKBACK_DEFAULT
+        return p.dry_penalty_range
 
     def _generate_sync(self, payload: dict, rebuild=None) -> str:
         # Route through the streaming path so cancel() can interrupt an
@@ -570,9 +1202,19 @@ class AIClient:
         propagates ``requests.HTTPError`` for permanent HTTP failures.
         """
         self._session = requests.Session()
+        # A cancellable adapter so Cancel works while the request is still
+        # waiting for the response headers (see _CancellableHTTPAdapter).
+        adapter = _CancellableHTTPAdapter()
+        self._session.mount('http://', adapter)
+        self._session.mount('https://', adapter)
+        self._adapter = adapter
         self._response = None
         produced = False
         resp = None
+        # A *total* budget for the request.  The socket timeout (120 s) is a
+        # per-read deadline: an endpoint that emits one byte every 100 s
+        # would keep the worker thread blocked forever.
+        deadline = time.monotonic() + _MAX_REQUEST_SECONDS
         try:
             try:
                 resp = self._session.post(
@@ -580,9 +1222,15 @@ class AIClient:
                     headers=self._headers(),
                     json=payload,
                     stream=True,
-                    timeout=120,
+                    # The connect timeout is short on purpose: a cancel
+                    # cannot close a socket that does not exist yet, so the
+                    # window in which the connection is being established
+                    # (DNS, TCP, TLS) is one in which Cancel is ineffective.
+                    timeout=(10, 120),
                 )
                 self._response = resp
+                if self._cancel_requested:
+                    raise RuntimeError('Generation cancelled')
                 resp.raise_for_status()
             except requests.HTTPError as exc:
                 # Surface the server's explanation: a bare HTTPError string for
@@ -591,25 +1239,31 @@ class AIClient:
                 detail = _http_error_detail(exc)
                 if self._http_error_is_retryable(exc):
                     retry_after = _parse_retry_after(exc)
+                    # The original HTTPError is kept as the cause, but its
+                    # message carries the full request URL - which may hold
+                    # the API key as a query parameter.  Redact it in place so
+                    # the chained traceback (written to the log and shown in
+                    # the UI) cannot leak the key.
+                    exc.args = (self._redact(str(exc)),) + tuple(exc.args[1:])
                     raise _RetryableError(
-                        f"API error: {redact_secrets(detail)}", retry_after=retry_after,
+                        f"API error: {self._redact(detail)}", retry_after=retry_after,
                     ) from exc
                 # Keep raising HTTPError (callers and tests rely on the type)
                 # but fold the server's explanation into the message, which
                 # would otherwise be just "401 Client Error: Unauthorized".
                 if detail != str(exc):
-                    exc.args = (redact_secrets(detail),) + tuple(exc.args[1:])
+                    exc.args = (self._redact(detail),) + tuple(exc.args[1:])
                 raise
             except _PERMANENT_CONFIG_ERRORS as exc:
                 # Permanent config problem: no retry, and no verbatim message
                 # (it can carry the API key). ``from None`` keeps the original
                 # exception - and its leaky message - out of every traceback.
-                raise RuntimeError(_permanent_config_message(exc)) from None
+                raise RuntimeError(self._permanent_config_message(exc)) from None
             except _RETRYABLE_TRANSPORT_ERRORS as exc:
                 if produced:
                     raise
                 raise _RetryableError(
-                    f"Connection failed: {redact_secrets(exc)}"
+                    f"Connection failed: {self._redact(exc)}"
                 ) from None
 
             # SSE: an event may span several "data:" lines which must be joined
@@ -630,9 +1284,14 @@ class AIClient:
                         produced = True
                         yield piece
 
-            for line in resp.iter_lines():
+            for line in _iter_sse_lines(resp):
                 if self._cancel_requested:
                     raise RuntimeError('Generation cancelled')
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        'The request took too long and was stopped after '
+                        f'{int(_MAX_REQUEST_SECONDS // 60)} minutes.',
+                    )
                 if not line:
                     yield from flush()
                     continue
@@ -641,6 +1300,17 @@ class AIClient:
                     # A non-data field (event:, id:, comment) terminates an
                     # event per the SSE spec.
                     yield from flush()
+                    # Some gateways ignore "stream": true and answer with a
+                    # plain (non-SSE) JSON body, one object per line.  Such a
+                    # line is a complete reply, not a field of an event, so
+                    # it is parsed and emitted instead of being dropped -
+                    # otherwise the user's reply vanishes silently.
+                    stripped = line_str.strip()
+                    if stripped.startswith('{'):
+                        yield from flush()
+                        for piece in self._emit_sse_event(stripped):
+                            produced = True
+                            yield piece
                     continue
                 data_str = line_str[5:].lstrip(' ')
                 if data_str.strip() == '[DONE]':
@@ -662,7 +1332,7 @@ class AIClient:
                     raise RuntimeError('Generation cancelled') from exc
                 raise
             raise _RetryableError(
-                f"Connection failed: {redact_secrets(exc)}"
+                f"Connection failed: {self._redact(exc)}"
             ) from None
         except requests.HTTPError:
             # Already enriched with the response body above; the type is part
@@ -675,7 +1345,7 @@ class AIClient:
             if produced:
                 raise
             raise RuntimeError(
-                f"API request failed: {redact_secrets(exc)}"
+                f"API request failed: {self._redact(exc)}"
             ) from None
         finally:
             # Always release the connection: without this a streamed response
@@ -694,12 +1364,11 @@ class AIClient:
                 except Exception:
                     pass
 
-    @staticmethod
-    def _emit_sse_event(data_str: str) -> Generator[str, None, None]:
+    def _emit_sse_event(self, data_str: str) -> Generator[str, None, None]:
         """Yield the text content of one assembled SSE event payload."""
         try:
             chunk = json.loads(data_str)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError, ValueError):
             logger.debug("Skipping unparsable SSE payload: %r", data_str[:200])
             return
         if not isinstance(chunk, dict):
@@ -709,13 +1378,46 @@ class AIClient:
         if chunk.get('error'):
             err = chunk['error']
             msg = err.get('message', str(err)) if isinstance(err, dict) else str(err)
-            raise RuntimeError(f"API stream error: {msg}")
+            # The server's prose is the one message that routinely echoes the
+            # key back ("Invalid API key provided: <KEY>").  It must be
+            # redacted like every other server-controlled string.
+            raise RuntimeError(f"API stream error: {self._redact(msg)}")
         choices = chunk.get('choices') or []
         if not choices:
             return
-        delta = choices[0].get('delta') or {}
-        if isinstance(delta, dict) and delta.get('content'):
-            yield delta['content']
+        first = choices[0]
+        if not isinstance(first, dict):
+            return
+        # A streamed chunk carries ``delta.content``; a complete (non-SSE)
+        # body carries ``message.content``.  Some gateways also use
+        # ``text``.  All three are accepted so a server that ignores
+        # "stream": true does not silently return an empty reply.
+        delta = first.get('delta') or {}
+        content = None
+        if isinstance(delta, dict):
+            content = delta.get('content')
+        if not content:
+            message = first.get('message') or {}
+            if isinstance(message, dict):
+                content = message.get('content')
+        if not content:
+            content = first.get('text')
+        if content:
+            content = str(content)
+            # A local ceiling: ``max_tokens`` is advisory to the server and
+            # bounds nothing on the client side.
+            self._stream_chars += len(content)
+            if self._stream_chars > _MAX_STREAM_CHARS:
+                room = max(0, _MAX_STREAM_CHARS - (self._stream_chars - len(content)))
+                logger.warning(
+                    "The reply exceeded %d characters; truncating.",
+                    _MAX_STREAM_CHARS,
+                )
+                self._stream_chars = _MAX_STREAM_CHARS
+                if room:
+                    yield content[:room]
+                return
+            yield content
 
     def _generate_stream(self, payload: dict, rebuild=None) -> Generator[str, None, None]:
         """Stream one chat completion, retrying transient failures.
@@ -728,6 +1430,7 @@ class AIClient:
         max_retries = self._max_retries()
         attempt = 0
         template_retry_used = False
+        self._stream_chars = 0
         while True:
             if self._cancel_requested:
                 raise RuntimeError('Generation cancelled')
@@ -736,6 +1439,15 @@ class AIClient:
                 for piece in self._stream_once(payload):
                     produced = True
                     yield piece
+                if not produced:
+                    # The server answered, but the reply was empty (or was
+                    # formatted in a way the client does not understand).
+                    # Saying so is far better than showing the user a blank
+                    # message bubble with no explanation.
+                    logger.warning(
+                        "The API returned an empty reply; the response did not "
+                        "contain any content.",
+                    )
                 return
             except _RetryableError as exc:
                 if attempt >= max_retries:
@@ -770,7 +1482,7 @@ class AIClient:
                         "resending with normalised user/assistant roles. "
                         "Enable 'strict chat template' for this provider to "
                         "always send the normalised form.",
-                        redact_secrets(exc),
+                        self._redact(exc),
                     )
                     payload = rebuild()
                     continue
@@ -807,6 +1519,7 @@ class AIClient:
         jailbreak: str = '',
         examples_block: str = '',
         injections: Optional[list] = None,
+        conversation_start_header: Optional[str] = None,
     ) -> str | Generator[str, None, None]:
         """Generate a chat completion over a full message history.
 
@@ -825,7 +1538,13 @@ class AIClient:
         history *after* trimming at ``depth`` messages from the end.  Their
         tokens are reserved from the trim budget so the payload cannot
         overshoot the context window.
+
+        *conversation_start_header* labels the system fold-in of a leading
+        assistant greeting when strict chat-template normalisation runs (the
+        context template's header; defaults to the classic one).
         """
+        from src.chat_builder import CONVERSATION_START_HEADER
+        header = conversation_start_header or CONVERSATION_START_HEADER
         full_messages: list[dict[str, Any]] = []
         if system and system.strip():
             full_messages.append({'role': 'system', 'content': system})
@@ -877,15 +1596,25 @@ class AIClient:
         rebuild = None
         if getattr(self.preset, 'strict_chat_template', False):
             from src.chat_builder import normalize_chat_roles
-            full_messages = normalize_chat_roles(full_messages)
+            full_messages = normalize_chat_roles(
+                full_messages, conversation_start_header=header,
+            )
         else:
             def _rebuild() -> dict[str, Any]:
                 # Always rebuilds the streaming form: the retry lives inside
                 # ``_generate_stream``, which posts stream=True payloads.
                 from src.chat_builder import normalize_chat_roles
-                return self._build_payload(normalize_chat_roles(full_messages), True)
+                return self._build_payload(
+                    normalize_chat_roles(
+                        full_messages, conversation_start_header=header,
+                    ),
+                    True,
+                )
 
             rebuild = _rebuild
+        # Remember the exact payload messages: the usage ledger counts them
+        # so the recorded token numbers describe the prompt that was sent.
+        self.last_request_messages = list(full_messages)
         payload = self._build_payload(full_messages, stream)
         if stream:
             return self._generate_stream(payload, rebuild=rebuild)
@@ -1123,57 +1852,174 @@ def trim_messages(
     return kept
 
 
+#: Longest tag accepted from a model reply.  Anything longer is prose, not
+#: a tag, and writing it into a card would pollute the tag filter.
+_TAG_MAX_LEN = 64
+
+#: Characters that never occur in a tag.  Their presence means the model
+#: returned a JSON fragment instead of a tag.
+_TAG_FORBIDDEN = '{}[]"\'`'
+
+
 def _parse_tags(text: str) -> list[str]:
-    try:
-        tags = json.loads(text)
-        if isinstance(tags, list):
-            return [str(t).strip().lower() for t in tags if t]
-    except json.JSONDecodeError:
-        pass
-    matches = re.findall(r'"([^"]+)"', text)
-    if matches:
-        return [m.strip().lower() for m in matches]
-    return [t.strip().lower() for t in text.split(',') if t.strip()]
+    """Extract a list of tags from a model reply.
+
+    The reply is normally a JSON array, but models also answer with
+    ``{"tags": [...]}``, with a list of objects, or with plain prose.  A
+    value that is not a clean tag (a JSON fragment, an object, a very long
+    string) is dropped rather than written into the card.
+    """
+    from src.ai_output import clean_tags
+
+    if not text:
+        return []
+    value = _parse_json_value(text)
+    if isinstance(value, list):
+        return clean_tags(value)
+    if isinstance(value, dict):
+        for key in ('tags', 'tag', 'keywords', 'result', 'results', 'data', 'output'):
+            inner = value.get(key)
+            if isinstance(inner, list):
+                return clean_tags(inner)
+            if isinstance(inner, str):
+                return clean_tags([inner])
+        flat = [v for v in value.values() if isinstance(v, (str, int, float))]
+        if flat:
+            return clean_tags(flat)
+    quoted = re.findall(r'"([^"]+)"', text)
+    if quoted:
+        return clean_tags(quoted)
+    return clean_tags(text.split(','))
 
 
 def _extract_json(text: str, expected_keys: set[str] | None = None) -> Optional[dict]:
-    text = text.strip()
-    if text.startswith('```'):
-        text = re.sub(r'^```(?:json)?\s*', '', text)
-        text = re.sub(r'\s*```$', '', text)
-        text = text.strip()
-    result = _try_parse_json(text)
-    if result is not None and expected_keys:
-        result = _unwrap_nested(result, expected_keys)
-    return result
+    """Extract a JSON object from a model reply.
+
+    Handles markdown code fences (with or without a language tag, in any
+    case), JSON embedded in prose, and a one-element array of objects -
+    several models answer a "return a JSON object" request with
+    ``[{"...": "..."}]``.
+    """
+    value = _parse_json_value(text)
+    if isinstance(value, list):
+        objects = [item for item in value if isinstance(item, dict)]
+        if not objects:
+            return None
+        merged: dict = {}
+        for item in objects:
+            for key, item_value in item.items():
+                merged.setdefault(key, item_value)
+        value = merged
+    if not isinstance(value, dict):
+        return None
+    if expected_keys:
+        value = _unwrap_nested(value, expected_keys)
+    return value
 
 
-def _try_parse_json(text: str) -> Optional[dict]:
+def _strip_code_fences(text: str) -> str:
+    """Remove a markdown code fence wrapped around the payload.
+
+    The language tag is ignored (models write `````JSON`` as often as
+    `````json``), and an unclosed fence is tolerated.
+    """
+    stripped = text.strip()
+    if not stripped.startswith('```'):
+        return text
+    opening = re.match(r'```[^\n`]*\n?', stripped)
+    if opening is None:
+        return text
+    body = stripped[opening.end():]
+    if body.rstrip().endswith('```'):
+        body = body.rstrip()[:-3]
+    return body.strip()
+
+
+def _parse_json_value(text: str):
+    """Parse *text* into a JSON value (dict, list or scalar), or ``None``.
+
+    Tries the whole text first, then scans for the first balanced JSON
+    object and the first balanced JSON array - a greedy ``\\[.*\\]`` match
+    would span from the first bracket to the LAST one, so trailing prose
+    (or a second object) after the JSON made the whole reply unparsable.
+    """
+    if not text:
+        return None
+    candidate = _strip_code_fences(text).strip()
+    if not candidate:
+        return None
     try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except (json.JSONDecodeError, ValueError):
+        return json.loads(candidate)
+    except (json.JSONDecodeError, ValueError, RecursionError):
         pass
-    # Scan for the first balanced JSON object instead of a greedy
-    # ``\{.*\}``: the greedy match spans from the first '{' to the LAST '}', so
-    # any trailing prose (or a second object) after the JSON made it
-    # unparsable and the whole generation was discarded.
-    for start in (i for i, ch in enumerate(text) if ch == '{'):
-        candidate = _balanced_object(text, start)
-        if candidate is None:
-            continue
-        try:
-            obj = json.loads(candidate)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if isinstance(obj, dict):
-            return obj
+    # One linear scan finds every balanced span.  Scanning to the end of the
+    # string once per opening bracket is quadratic: a reply of N unmatched
+    # "{" characters (which a hostile endpoint, or a model that was told to
+    # "output JSON" and then hallucinated braces, can produce) cost minutes
+    # of CPU for a few hundred KB - and the reply cap is 4 MiB.
+    spans = _balanced_spans(candidate)
+    for want in ('{', '['):
+        for span in spans:
+            if not span.startswith(want):
+                continue
+            try:
+                return json.loads(span)
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                continue
     return None
 
 
-def _balanced_object(text: str, start: int) -> Optional[str]:
-    """Return the brace-balanced JSON object starting at *start*, or None.
+def _try_parse_json(text: str) -> Optional[dict]:
+    value = _parse_json_value(text)
+    if isinstance(value, dict):
+        return value
+    return None
+
+
+#: How many balanced spans are considered.  A reply with thousands of
+#: sibling objects would otherwise mean thousands of ``json.loads`` calls.
+_MAX_JSON_SPANS = 64
+
+
+def _balanced_spans(text: str) -> list[str]:
+    """Every bracket-balanced JSON value in *text*, in order of appearance.
+
+    A single linear scan with an explicit stack.  String literals and their
+    escapes are skipped so a brace inside a value does not end the object
+    early.  Only the first :data:`_MAX_JSON_SPANS` spans are returned.
+    """
+    stack: list[tuple[str, int]] = []
+    found: list[tuple[int, str]] = []
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in '{[':
+            stack.append((ch, i))
+        elif ch in '}]':
+            if not stack:
+                continue
+            opener, start = stack.pop()
+            if (opener, ch) not in (('{', '}'), ('[', ']')):
+                continue
+            found.append((start, text[start:i + 1]))
+            if len(found) >= _MAX_JSON_SPANS:
+                break
+    found.sort(key=lambda pair: pair[0])
+    return [span for _start, span in found]
+
+
+def _balanced_span(text: str, start: int, opener: str, closer: str) -> Optional[str]:
+    """Return the bracket-balanced JSON value starting at *start*, or None.
 
     String literals and their escapes are skipped so a '}' inside a value
     doesn't end the object early.
@@ -1193,13 +2039,18 @@ def _balanced_object(text: str, start: int) -> Optional[str]:
             continue
         if ch == '"':
             in_string = True
-        elif ch == '{':
+        elif ch == opener:
             depth += 1
-        elif ch == '}':
+        elif ch == closer:
             depth -= 1
             if depth == 0:
                 return text[start:i + 1]
     return None
+
+
+def _balanced_object(text: str, start: int) -> Optional[str]:
+    """Return the brace-balanced JSON object starting at *start*, or None."""
+    return _balanced_span(text, start, '{', '}')
 
 
 def _unwrap_nested(data: dict, expected_keys: set[str]) -> dict:

@@ -24,7 +24,12 @@ def _get_settings() -> QSettings:
 _PROVIDER_KEYS = (
     'base_url', 'model', 'temperature', 'max_tokens', 'top_p', 'top_k',
     'min_p', 'context_size', 'frequency_penalty', 'presence_penalty', 'seed',
-    'retry_attempts', 'stop', 'strict_chat_template',
+    'retry_attempts', 'stop', 'strict_chat_template', 'repeat_penalty',
+    'mirostat', 'mirostat_tau', 'mirostat_eta',
+    'dry_multiplier', 'dry_base', 'dry_allowed_length', 'dry_penalty_range',
+    'xtc_threshold', 'xtc_probability', 'typical_p',
+    'dynatemp_range', 'dynatemp_exponent', 'smoothing_factor',
+    'min_tokens_to_keep',
 )
 
 _LEGACY_KEYS = _PROVIDER_KEYS + ('preset_name',)
@@ -44,6 +49,21 @@ _PROVIDER_DEFAULTS: dict = {
     'retry_attempts': 2,
     'stop': '',
     'strict_chat_template': False,
+    'repeat_penalty': 1.0,
+    'mirostat': 0,
+    'mirostat_tau': 5.0,
+    'mirostat_eta': 0.1,
+    'dry_multiplier': 0.0,
+    'dry_base': 1.75,
+    'dry_allowed_length': 2,
+    'dry_penalty_range': 0,
+    'xtc_threshold': 0.1,
+    'xtc_probability': 0.0,
+    'typical_p': 1.0,
+    'dynatemp_range': 0.0,
+    'dynatemp_exponent': 1.0,
+    'smoothing_factor': 0.0,
+    'min_tokens_to_keep': 1,
 }
 
 
@@ -245,6 +265,21 @@ def _read_config(s: QSettings, prefix: str, name: str = '') -> dict:
         'strict_chat_template': _safe_bool(
             s.value(prefix + 'strict_chat_template', False), False,
         ),
+        'repeat_penalty': _clamp(_safe_float(s.value(prefix + 'repeat_penalty', 1.0), 1.0), 1.0, 3.0, 1.0),
+        'mirostat': _clamp(_safe_int(s.value(prefix + 'mirostat', 0), 0), 0, 2, 0),
+        'mirostat_tau': _clamp(_safe_float(s.value(prefix + 'mirostat_tau', 5.0), 5.0), 0.0, 10.0, 5.0),
+        'mirostat_eta': _clamp(_safe_float(s.value(prefix + 'mirostat_eta', 0.1), 0.1), 0.0, 1.0, 0.1),
+        'dry_multiplier': _clamp(_safe_float(s.value(prefix + 'dry_multiplier', 0.0), 0.0), 0.0, 10.0, 0.0),
+        'dry_base': _clamp(_safe_float(s.value(prefix + 'dry_base', 1.75), 1.75), 1.0, 10.0, 1.75),
+        'dry_allowed_length': _clamp(_safe_int(s.value(prefix + 'dry_allowed_length', 2), 2), 0, 100, 2),
+        'dry_penalty_range': _clamp(_safe_int(s.value(prefix + 'dry_penalty_range', 0), 0), 0, 10_000, 0),
+        'xtc_threshold': _clamp(_safe_float(s.value(prefix + 'xtc_threshold', 0.1), 0.1), 0.0, 1.0, 0.1),
+        'xtc_probability': _clamp(_safe_float(s.value(prefix + 'xtc_probability', 0.0), 0.0), 0.0, 1.0, 0.0),
+        'typical_p': _clamp(_safe_float(s.value(prefix + 'typical_p', 1.0), 1.0), 0.0, 1.0, 1.0),
+        'dynatemp_range': _clamp(_safe_float(s.value(prefix + 'dynatemp_range', 0.0), 0.0), 0.0, 5.0, 0.0),
+        'dynatemp_exponent': _clamp(_safe_float(s.value(prefix + 'dynatemp_exponent', 1.0), 1.0), 0.0, 10.0, 1.0),
+        'smoothing_factor': _clamp(_safe_float(s.value(prefix + 'smoothing_factor', 0.0), 0.0), 0.0, 10.0, 0.0),
+        'min_tokens_to_keep': _clamp(_safe_int(s.value(prefix + 'min_tokens_to_keep', 1), 1), 1, 100, 1),
     }
     return result
 
@@ -319,7 +354,19 @@ def _migrate_legacy_settings(s: QSettings) -> None:
     s.setValue('api/active_provider', legacy_name or 'LM Studio')
     for key in _LEGACY_KEYS:
         s.remove('api/' + key)
-    s.remove('api/api_key')
+    if 'api' in _UNDECRYPTABLE_KEYS:
+        # The ciphertext could not be decrypted, so the migrated copy holds no
+        # key.  A readable plaintext copy may therefore be the ONLY recoverable
+        # key - deleting it would lose the credential for good.  Keep it.
+        if s.value('api/api_key', ''):
+            logger.warning(
+                "The legacy API key could not be decrypted; the plaintext copy "
+                "was kept so it can be recovered manually."
+            )
+        else:
+            s.remove('api/api_key')
+    else:
+        s.remove('api/api_key')
     if 'api' not in _UNDECRYPTABLE_KEYS:
         # Only drop the legacy ciphertext once it has been read and re-stored
         # under the provider prefix. If decryption failed the copy may still
@@ -681,6 +728,86 @@ def load_active_system_template() -> str:
     return _DEFAULT_SYSTEM_TEMPLATE_ID
 
 
+# Context templates (chat-context framing presets)
+_CONTEXT_TEMPLATES_KEY = 'prompts/context_templates'
+_ACTIVE_CONTEXT_TEMPLATE_KEY = 'prompts/active_context_template'
+_DEFAULT_CONTEXT_TEMPLATE_ID = 'default'
+
+# Keys a stored context template may carry; anything else is dropped so a
+# schema change can't resurrect stale fields.
+_CONTEXT_TEMPLATE_FIELDS = (
+    'id', 'name', 'block_format', 'main_format', 'block_separator',
+    'names_behavior', 'name_format', 'example_separator',
+    'example_user_prefix', 'example_char_prefix',
+    'post_history_format', 'jailbreak_format', 'conversation_start_header',
+)
+
+
+def save_context_templates(templates: list[dict]) -> None:
+    """Persist the user-defined context templates (list replaces previous)."""
+    clean: list[dict] = []
+    for item in templates or []:
+        if not isinstance(item, dict):
+            continue
+        tid = str(item.get('id') or '')
+        if not tid:
+            continue
+        row = {'id': tid, 'name': str(item.get('name') or 'Context Template')}
+        for key in _CONTEXT_TEMPLATE_FIELDS:
+            if key in ('id', 'name'):
+                continue
+            if key in item and item[key] is not None:
+                row[key] = item[key]
+        clean.append(row)
+    _get_settings().setValue(
+        _CONTEXT_TEMPLATES_KEY, json.dumps(clean, ensure_ascii=False),
+    )
+
+
+def load_context_templates() -> list[dict]:
+    """Return the user-defined context templates (may be empty)."""
+    raw = _get_settings().value(_CONTEXT_TEMPLATES_KEY, '')
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("Corrupted context template list; resetting")
+        return []
+    out: list[dict] = []
+    if isinstance(parsed, list):
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            tid = str(item.get('id') or '')
+            if not tid:
+                continue
+            row = {'id': tid, 'name': str(item.get('name') or 'Context Template')}
+            for key in _CONTEXT_TEMPLATE_FIELDS:
+                if key in ('id', 'name'):
+                    continue
+                if key in item and item[key] is not None:
+                    row[key] = item[key]
+            out.append(row)
+    return out
+
+
+def save_active_context_template(template_id: str) -> None:
+    """Persist which context template new chats use by default."""
+    _get_settings().setValue(
+        _ACTIVE_CONTEXT_TEMPLATE_KEY,
+        str(template_id or _DEFAULT_CONTEXT_TEMPLATE_ID),
+    )
+
+
+def load_active_context_template() -> str:
+    """Return the active context template id (default: 'default')."""
+    tid = _get_settings().value(_ACTIVE_CONTEXT_TEMPLATE_KEY, '')
+    if isinstance(tid, str) and tid.strip():
+        return tid.strip()
+    return _DEFAULT_CONTEXT_TEMPLATE_ID
+
+
 def save_active_lorebooks(filenames: list[str]) -> None:
     """Persist which standalone lorebooks are injected into Test chats."""
     s = _get_settings()
@@ -805,14 +932,57 @@ def load_window_geometry() -> Optional[bytes]:
 def save_font_size(size: int) -> None:
     s = _get_settings()
     s.setValue('ui/font_size', size)
+    # Keep the portable config in sync, so the two never disagree about
+    # what the app is supposed to look like.
+    try:
+        from src.portable_config import set_value
+        set_value('ui.font_size', int(size))
+    except Exception:
+        logger.debug("Could not update the portable config", exc_info=True)
 
 
 def load_font_size() -> int:
+    # The portable config wins: it is the explicit, hand-edited override.
+    try:
+        from src.portable_config import get
+        override = get('ui.font_size', None)
+        if override is not None:
+            return min(32, max(8, _safe_int(override, 13)))
+    except Exception:
+        logger.debug("Could not read the portable config", exc_info=True)
     s = _get_settings()
     val = _safe_int(s.value('ui/font_size', 13), 13)
     # Clamp to the same range the Font Size dialog allows so a corrupted
     # registry value can never produce a <= 0 font size downstream.
     return min(32, max(8, val))
+
+
+def save_theme(name: str) -> None:
+    """Persist the UI theme name ('dark' or 'light')."""
+    _get_settings().setValue('ui/theme', str(name or 'dark'))
+    try:
+        from src.portable_config import set_value
+        set_value('ui.theme', str(name or 'dark'))
+    except Exception:
+        logger.debug("Could not update the portable config", exc_info=True)
+
+
+def load_theme() -> str:
+    """The configured UI theme name.
+
+    The portable config wins over the registry, because it is the explicit
+    override.  An unknown value is coerced to 'dark' so a corrupted setting
+    can never leave the app unstyled.
+    """
+    value = ''
+    try:
+        from src.portable_config import get
+        value = str(get('ui.theme', '') or '').strip().lower()
+    except Exception:
+        value = ''
+    if not value:
+        value = str(_get_settings().value('ui/theme', '') or '').strip().lower()
+    return value if value in ('dark', 'light') else 'dark'
 
 
 def save_spellcheck_enabled(enabled: bool) -> None:
@@ -1083,7 +1253,11 @@ def _decrypt_dpapi(hex_str: str) -> Optional[str]:
         CryptUnprotectData = ctypes.windll.crypt32.CryptUnprotectData
         LocalFree = ctypes.windll.kernel32.LocalFree
         CryptUnprotectData.argtypes = [
-            ctypes.POINTER(DATA_BLOB), ctypes.c_wchar_p, ctypes.POINTER(DATA_BLOB),
+            # The second parameter is an *out* pointer (LPWSTR *ppszDataDescr);
+            # declaring it as a plain c_wchar_p would make ctypes marshal a
+            # string where a pointer-to-pointer is expected.
+            ctypes.POINTER(DATA_BLOB), ctypes.POINTER(ctypes.c_wchar_p),
+            ctypes.POINTER(DATA_BLOB),
             ctypes.c_void_p, ctypes.c_void_p, ctypes.wintypes.DWORD, ctypes.POINTER(DATA_BLOB),
         ]
         CryptUnprotectData.restype = ctypes.wintypes.BOOL

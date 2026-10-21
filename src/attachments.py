@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 from PIL import Image
+from src import image_safety
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,8 @@ def prepare_image_attachment(
     """
     p = Path(path)
     try:
-        with Image.open(p) as img:
+        with image_safety.open_checked(p) as img:
+            image_safety.check_size(img.width, img.height)
             # Honour the EXIF orientation tag before any transform.
             from PIL import ImageOps
             img = ImageOps.exif_transpose(img)

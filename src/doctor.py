@@ -12,12 +12,86 @@ Only *read-only* inspection happens here; fixes are applied by the caller.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
+from src import safe_json
 
 logger = logging.getLogger(__name__)
+
+# Card ids whose gallery images and chat sessions must never be auto-deleted.
+# A repair that removes a card row because its PNG vanished keeps the user's
+# pictures and conversation history; the registry is what stops the *next*
+# run of the orphan checks from deleting them.
+_PRESERVED_FILE = 'preserved-orphans.json'
+
+
+def preserved_registry_path() -> Path:
+    """Path of the preserved-orphan registry."""
+    from src.app_paths import data_dir
+    return data_dir() / _PRESERVED_FILE
+
+
+def load_preserved_ids() -> set[str]:
+    """Card ids whose data the doctor must not delete."""
+    path = preserved_registry_path()
+    try:
+        raw = safe_json.loads_safe(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(raw, list):
+        return set()
+    return {str(item) for item in raw}
+
+
+def preserve_orphan_ids(ids) -> None:
+    """Record *ids* as "keep the data" and persist the registry."""
+    current = load_preserved_ids()
+    current |= {str(i) for i in ids}
+    path = preserved_registry_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sorted(current), indent=2), encoding='utf-8')
+    except OSError:
+        logger.exception("Could not write the preserved-orphan registry")
+
+
+def forget_preserved_ids(ids) -> None:
+    """Remove *ids* from the preserved registry (the user asked to delete)."""
+    current = load_preserved_ids()
+    current -= {str(i) for i in ids}
+    # The file is rewritten even when the registry becomes empty: an empty
+    # list is a valid registry, and skipping the write left the last
+    # forgotten id behind - which kept the gallery folder of a card the user
+    # explicitly deleted protected from the orphan sweep forever.
+    path = preserved_registry_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sorted(current), indent=2), encoding='utf-8')
+    except OSError:
+        logger.exception("Could not write the preserved-orphan registry")
+
+
+def _file_status(path: str | Path) -> str:
+    """Classify a path as ``'ok'``, ``'missing'`` or ``'unreachable'``.
+
+    ``Path.exists()`` collapses "the file is gone" and "I am not allowed to
+    look" into the same answer, which made the doctor treat a permission
+    error or an unplugged drive as a deleted card.
+    """
+    try:
+        os.stat(str(path))
+    except FileNotFoundError:
+        return 'missing'
+    except NotADirectoryError:
+        return 'missing'
+    except OSError:
+        return 'unreachable'
+    return 'ok'
 
 
 @dataclass
@@ -43,8 +117,31 @@ class Finding:
 
 
 @dataclass
+class RepairPlan:
+    """One planned repair - what :func:`repair` *would* do.
+
+    Used by the dry-run preview so the user can see every deletion before
+    anything is touched.
+    """
+
+    finding: Finding
+    action: str          # e.g. 'delete-session-folders', 'remove-card-row'
+    targets: list[str] = field(default_factory=list)
+    description: str = ''
+
+    @property
+    def destructive(self) -> bool:
+        """True when applying this plan deletes user data."""
+        return self.action.startswith('delete')
+
+
+@dataclass
 class DoctorReport:
     findings: list[Finding] = field(default_factory=list)
+    # False when the character list could not be read.  Repairs that delete
+    # data are skipped in that case: a busy or corrupt database must never be
+    # mistaken for an empty library.
+    characters_listed: bool = True
 
     def add(self, finding: Finding) -> None:
         if not any(f.key == finding.key for f in self.findings):
@@ -63,19 +160,39 @@ class DoctorReport:
         return not self.errors
 
 
-def _iter_characters(db) -> list[dict]:
-    """All character rows, tolerating a minimal/absent get_all()."""
+def _iter_characters(db) -> Optional[list[dict]]:
+    """All character rows, or ``None`` when the listing could not be read.
+
+    ``None`` must never be confused with an empty list.  An empty library is a
+    legitimate state; a *failed* listing (database locked, corrupt, swapped
+    mid-scan) is not.  Treating the failure as "the library is empty" made the
+    orphan checks report every chat session and gallery folder as belonging to
+    a deleted card, and "Apply Automatic Fixes" then deleted all of them.
+    """
     try:
-        return db.get_all()
+        return db.get_all(light=True)
     except Exception:
         logger.exception("Doctor could not list characters")
-        return []
+        return None
+
+
+def _listing_failed() -> list[Finding]:
+    """The finding reported when the character listing is unavailable."""
+    return [Finding(
+        'check-failed', 'warning',
+        'The character list could not be read, so related checks were skipped',
+        detail=('The database was unreadable or busy. No changes were made. '
+                'Re-run the check once the library is idle.'),
+    )]
 
 
 def check_missing_card_files(db) -> list[Finding]:
     """Cards whose backing PNG/JSON no longer exists on disk."""
     out: list[Finding] = []
-    for row in _iter_characters(db):
+    rows = _iter_characters(db)
+    if rows is None:
+        return _listing_failed()
+    for row in rows:
         source = row.get('source_path') or ''
         if not source:
             out.append(Finding(
@@ -84,11 +201,21 @@ def check_missing_card_files(db) -> list[Finding]:
                 detail=f"id={row.get('id')}", card_id=row.get('id'),
             ))
             continue
-        if not Path(source).exists():
+        status = _file_status(source)
+        if status == 'missing':
             out.append(Finding(
                 'missing-file', 'error',
                 f"File missing for '{row.get('name', '?')}'",
                 detail=source, fixable=True, card_id=row.get('id'),
+            ))
+        elif status == 'unreachable':
+            # A permission error or an unplugged drive looks exactly like a
+            # deleted file to ``Path.exists()``; repairing that would drop a
+            # perfectly good card (and its gallery) from the library.
+            out.append(Finding(
+                'unreachable-file', 'warning',
+                f"File for '{row.get('name', '?')}' could not be read",
+                detail=source, card_id=row.get('id'),
             ))
     return out
 
@@ -102,7 +229,10 @@ def check_unreadable_cards(db) -> list[Finding]:
     from src.card_parser import read_card_data
 
     out: list[Finding] = []
-    for row in _iter_characters(db):
+    rows = _iter_characters(db)
+    if rows is None:
+        return _listing_failed()
+    for row in rows:
         source = row.get('source_path') or ''
         if not source or not Path(source).exists():
             continue    # already reported as a missing file
@@ -161,8 +291,20 @@ def check_orphan_files(db, library_dir: str | Path | None = None) -> list[Findin
     lib = Path(library_dir)
     if not lib.is_dir():
         return []
-    known = {str(Path(r['source_path'])) for r in _iter_characters(db)
+    rows = _iter_characters(db)
+    if rows is None:
+        # Without a trustworthy character list every file would look orphaned.
+        return _listing_failed()
+    known = {str(Path(r['source_path'])) for r in rows
              if r.get('source_path')}
+    # Resolve the known paths once: ``Path.resolve()`` hits the filesystem, and
+    # doing it per file made this check O(n^2) in syscalls.
+    known_resolved: set[str] = set()
+    for p in known:
+        try:
+            known_resolved.add(str(Path(p).resolve()))
+        except OSError:
+            known_resolved.add(str(Path(p)))
     orphans: list[str] = []
     for path in sorted(lib.iterdir()):
         if not path.is_file() or path.suffix.lower() not in ('.png', '.json'):
@@ -171,10 +313,11 @@ def check_orphan_files(db, library_dir: str | Path | None = None) -> list[Findin
         if path.name.startswith('.ste-') or path.name.endswith('.tmp'):
             continue
         try:
-            if str(path.resolve()) not in {str(Path(p).resolve()) for p in known}:
-                orphans.append(path.name)
+            resolved = str(path.resolve())
         except OSError:
             continue
+        if resolved not in known_resolved:
+            orphans.append(path.name)
     if not orphans:
         return []
     return [Finding(
@@ -197,10 +340,18 @@ def check_orphan_sessions(db, sessions_dir: str | Path | None = None) -> list[Fi
     root = Path(sessions_dir)
     if not root.is_dir():
         return []
-    live = {str(r.get('id')) for r in _iter_characters(db)}
+    rows = _iter_characters(db)
+    if rows is None:
+        # A failed listing means "no card ids" - which would turn every
+        # session folder into an orphan and delete the user's chat history.
+        return _listing_failed()
+    live = {str(r.get('id')) for r in rows}
+    preserved = load_preserved_ids()
     orphans = []
     for child in sorted(root.iterdir()):
         if child.is_dir() and child.name.isdigit() and child.name not in live:
+            if child.name in preserved:
+                continue
             orphans.append(child.name)
     if not orphans:
         return []
@@ -226,7 +377,13 @@ def check_gallery_images(db, gallery_dir: str | Path | None = None) -> list[Find
         from src.app_paths import data_dir
         gallery_dir = data_dir() / 'gallery'
     root = Path(gallery_dir)
-    live = {str(r.get('id')) for r in _iter_characters(db)}
+    rows = _iter_characters(db)
+    if rows is None:
+        # See check_orphan_sessions: a failed listing must not turn every
+        # gallery folder into an orphan.
+        return _listing_failed()
+    live = {str(r.get('id')) for r in rows}
+    preserved = load_preserved_ids()
     out: list[Finding] = []
 
     known_files: dict[str, set[str]] = {}
@@ -254,6 +411,10 @@ def check_gallery_images(db, gallery_dir: str | Path | None = None) -> list[Find
 
     for child in sorted(root.iterdir()):
         if not child.is_dir() or not child.name.isdigit():
+            continue
+        if child.name in preserved:
+            # Deliberately kept by a previous repair: the card's file is gone
+            # but its gallery images are still the user's data.
             continue
         if child.name not in live:
             out.append(Finding(
@@ -292,7 +453,10 @@ def check_stale_links(db, characters_dir: str | Path | None = None) -> list[Find
         return []
     present = {p.name.casefold() for p in cdir.iterdir() if p.is_file()}
     out: list[Finding] = []
-    for row in _iter_characters(db):
+    rows = _iter_characters(db)
+    if rows is None:
+        return _listing_failed()
+    for row in rows:
         url = row.get('st_avatar_url')
         if url and str(url).casefold() not in present:
             out.append(Finding(
@@ -368,11 +532,15 @@ def check_cleartext_api_url() -> list[Finding]:
         if not cfg.get('api_key'):
             continue
         if is_cleartext_remote(cfg.get('base_url') or ''):
+            # Only the host is shown: a base URL may carry the API key as a
+            # query parameter, and the report can be pasted into a public
+            # issue tracker.
+            from src.ai_client import _url_host
+            host = _url_host(cfg.get('base_url') or '') or '(unknown host)'
             out.append(Finding(
                 'cleartext-api-url', 'warning',
                 f"Provider '{name}' sends its API key over unencrypted http://",
-                detail=(f"{cfg.get('base_url')} - prefer https:// for "
-                        "non-local servers."),
+                detail=(f"{host} - prefer https:// for non-local servers."),
                 items=[name],
             ))
     return out
@@ -412,6 +580,9 @@ def run_all(db, db_path: str | Path | None = None,
             st_characters_dir: str | Path | None = None) -> DoctorReport:
     """Run every check and return a combined report."""
     report = DoctorReport()
+    # Probe the character list once up front.  Every orphan check depends on
+    # it, and a failed listing must disable the data-destroying repairs.
+    report.characters_listed = _iter_characters(db) is not None
     # (name, callable) pairs: a bare lambda reports as '<lambda>' and, since
     # Finding.key includes detail, every failed check deduped into ONE
     # useless 'check-failed' finding.
@@ -447,56 +618,205 @@ def run_all(db, db_path: str | Path | None = None,
     return report
 
 
-def repair(db, report: DoctorReport) -> list[str]:
+def plan_repairs(report: DoctorReport) -> list[RepairPlan]:
+    """Describe what :func:`repair` *would* do, without doing anything.
+
+    This is the dry-run: the user can see every file that would be deleted
+    and every row that would be dropped before anything happens.  Repairs
+    that are skipped (because the character list could not be read) are
+    reported as such, so the preview matches what the repair really does.
+    """
+    plans: list[RepairPlan] = []
+    for finding in report.findings:
+        if not finding.fixable:
+            continue
+        if finding.category == 'missing-file' and finding.card_id is not None:
+            plans.append(RepairPlan(
+                finding,
+                action='remove-card-row',
+                targets=[finding.detail],
+                description=(
+                    f'Remove the library entry for {finding.detail} (the chat '
+                    f'history and gallery images are kept)'
+                ),
+            ))
+        elif finding.category == 'orphan-sessions':
+            if not report.characters_listed:
+                plans.append(RepairPlan(
+                    finding, action='skip', targets=[],
+                    description=(
+                        'Chat sessions are left alone: the character list could '
+                        'not be read.'
+                    ),
+                ))
+                continue
+            plans.append(RepairPlan(
+                finding, action='delete-session-folders', targets=list(finding.items),
+                description=(
+                    f'Delete {len(finding.items)} chat-session folder(s) that '
+                    f'belong to cards that no longer exist'
+                ),
+            ))
+        elif finding.category == 'orphan-gallery':
+            if not report.characters_listed:
+                plans.append(RepairPlan(
+                    finding, action='skip', targets=[],
+                    description=(
+                        'Gallery folders are left alone: the character list '
+                        'could not be read.'
+                    ),
+                ))
+                continue
+            plans.append(RepairPlan(
+                finding, action='delete-gallery-folders', targets=list(finding.items),
+                description=(
+                    f'Delete {len(finding.items)} gallery folder(s) that belong '
+                    f'to cards that no longer exist'
+                ),
+            ))
+        elif finding.category == 'gallery-missing-file':
+            plans.append(RepairPlan(
+                finding, action='drop-gallery-rows', targets=list(finding.items),
+                description=(
+                    f'Drop {len(finding.items)} gallery row(s) whose image file '
+                    f'is already gone (the files are not touched)'
+                ),
+            ))
+        elif finding.category == 'stale-tombstone':
+            plans.append(RepairPlan(
+                finding, action='clear-tombstones', targets=list(finding.items),
+                description=(
+                    f'Clear {len(finding.items)} deletion record(s) whose '
+                    f'SillyTavern file is already gone'
+                ),
+            ))
+        elif finding.category == 'malformed-tags':
+            plans.append(RepairPlan(
+                finding, action='clean-tag-blob', targets=[],
+                description='Remove the non-text tag values from this card',
+            ))
+        elif finding.category in ('orphan-file', 'gallery-orphan-file'):
+            plans.append(RepairPlan(
+                finding, action='report-only', targets=list(finding.items),
+                description='Nothing is deleted; the files are only reported',
+            ))
+    return plans
+
+
+def plan_summary(plans: list[RepairPlan]) -> str:
+    """A one-line summary of a repair plan."""
+    if not plans:
+        return 'Nothing to fix.'
+    destructive = [p for p in plans if p.action.startswith('delete')]
+    if not destructive:
+        return f'{len(plans)} change(s) would be applied; no files are deleted.'
+    files = sum(len(p.targets) for p in destructive)
+    return (f'{len(plans)} change(s) would be applied, including the deletion '
+            f'of {files} folder(s).')
+
+
+def repair(db, report: DoctorReport,
+           plans: list[RepairPlan] | None = None) -> list[str]:
     """Apply the safe, automatic fixes for the findings in *report*.
 
     Returns a list of human-readable descriptions of what was changed. Nothing
     here deletes a card file: a missing-file row is dropped from the database
     only (the file is already gone), never the other way round.
+
+    Repairs that *delete* data (the orphan session and gallery folders) are
+    skipped entirely when the character list could not be read - see
+    :func:`_iter_characters`.  A library whose database is briefly busy must
+    never be mistaken for an empty library.
+
+    When *plans* is given, only those plans are applied, and each plan is
+    limited to its own ``targets``.  This is what makes the dry-run preview
+    authoritative: a user who unticks "delete the chat sessions of these 12
+    deleted cards" must not have those folders deleted anyway.  Without
+    *plans* the full set of automatic repairs is derived from the report.
     """
+    if plans is None:
+        plans = plan_repairs(report)
     applied: list[str] = []
-    for finding in report.findings:
-        if not finding.fixable:
-            continue
+    for plan in plans:
         try:
-            if finding.category == 'missing-file' and finding.card_id is not None:
-                db.remove_card(finding.card_id, delete_files=False,
-                               record_tombstone=False)
-                applied.append(f"Removed the library entry for {finding.detail}")
-            elif finding.category == 'orphan-sessions':
-                applied.extend(_remove_dirs(finding))
-            elif finding.category == 'orphan-gallery':
-                applied.extend(_remove_gallery_dirs(finding))
-            elif finding.category == 'gallery-missing-file':
-                applied.extend(_drop_gallery_rows(db, finding))
-            elif finding.category == 'stale-tombstone':
-                applied.extend(_clear_tombstones(db, finding))
-            elif finding.category == 'malformed-tags':
-                applied.extend(_clean_tag_blob(db, finding))
-            elif finding.category == 'orphan-file':
-                applied.append(
-                    'Files in the library folder that are not in the library '
-                    'were left in place; import them if you still want them.'
-                )
-            elif finding.category == 'gallery-orphan-file':
-                applied.append(
-                    'Files in the gallery folder that are not in the library '
-                    'were left in place; add them to the gallery if you still '
-                    'want them.'
-                )
+            applied.extend(_apply_plan(db, plan))
         except Exception as exc:
-            logger.exception("Doctor repair failed for %s", finding.category)
+            logger.exception("Doctor repair failed for %s", plan.action)
             applied.append(f"Could not apply a fix: {exc}")
     return applied
 
 
-def _remove_dirs(finding: Finding) -> list[str]:
+def _apply_plan(db, plan: RepairPlan) -> list[str]:
+    """Apply a single :class:`RepairPlan`."""
+    action = plan.action
+    finding = plan.finding
+    if action == 'remove-card-row':
+        return _drop_missing_card(db, finding)
+    if action == 'delete-session-folders':
+        return _remove_dirs(finding, plan.targets)
+    if action == 'delete-gallery-folders':
+        return _remove_gallery_dirs(finding, plan.targets)
+    if action == 'drop-gallery-rows':
+        return _drop_gallery_rows(db, finding, plan.targets)
+    if action == 'clear-tombstones':
+        return _clear_tombstones(db, finding, plan.targets)
+    if action == 'clean-tag-blob':
+        return _clean_tag_blob(db, finding)
+    if action == 'skip':
+        # The character list could not be read: the orphans cannot be
+        # identified safely, so nothing is touched.
+        if finding.category == 'orphan-sessions':
+            return [
+                'Chat sessions were left alone: the character list could '
+                'not be read, so orphaned folders cannot be identified '
+                'safely.'
+            ]
+        if finding.category == 'orphan-gallery':
+            return [
+                'Gallery folders were left alone: the character list '
+                'could not be read, so orphaned folders cannot be '
+                'identified safely.'
+            ]
+        return []
+    if action == 'report-only':
+        if finding.category == 'gallery-orphan-file':
+            return [
+                'Files in the gallery folder that are not in the library '
+                'were left in place; add them to the gallery if you still '
+                'want them.'
+            ]
+        return [
+            'Files in the library folder that are not in the library '
+            'were left in place; import them if you still want them.'
+        ]
+    return []
+
+
+def _drop_missing_card(db, finding: Finding) -> list[str]:
+    """Remove a ghost card row while keeping the user's pictures and chats.
+
+    The card's PNG is gone, so the row can no longer be used - but the gallery
+    images and chat sessions under ``gallery/<id>/`` and ``sessions/<id>/`` are
+    independent assets and are still the user's data.  They are preserved (and
+    registered so no later run deletes them) instead of being cascaded away.
+    """
+    card_id = finding.card_id
+    db.remove_card(card_id, delete_files=False, record_tombstone=False,
+                   delete_sessions=False, preserve_related=True)
+    preserve_orphan_ids([card_id])
+    return [
+        f"Removed the library entry for {finding.detail} "
+        "(chat history and gallery images were kept)"
+    ]
+
+
+def _remove_dirs(finding: Finding, targets: list[str] | None = None) -> list[str]:
     import shutil
 
     from src.app_paths import data_dir
     root = data_dir() / 'sessions'
     removed = []
-    for name in finding.items:
+    for name in (finding.items if targets is None else targets):
         name = str(name).strip()
         if not name:
             continue
@@ -511,13 +831,13 @@ def _remove_dirs(finding: Finding) -> list[str]:
     return removed
 
 
-def _remove_gallery_dirs(finding: Finding) -> list[str]:
+def _remove_gallery_dirs(finding: Finding, targets: list[str] | None = None) -> list[str]:
     import shutil
 
     from src.app_paths import data_dir
     root = data_dir() / 'gallery'
     removed = []
-    for name in finding.items:
+    for name in (finding.items if targets is None else targets):
         name = str(name).strip()
         if not name:
             continue
@@ -532,10 +852,11 @@ def _remove_gallery_dirs(finding: Finding) -> list[str]:
     return removed
 
 
-def _drop_gallery_rows(db, finding: Finding) -> list[str]:
+def _drop_gallery_rows(db, finding: Finding,
+                       targets: list[str] | None = None) -> list[str]:
     """Delete gallery rows whose file is already gone (never a file itself)."""
     dropped = 0
-    for item in finding.items:
+    for item in (finding.items if targets is None else targets):
         try:
             image_id = int(str(item).strip())
         except (TypeError, ValueError):
@@ -552,9 +873,10 @@ def _drop_gallery_rows(db, finding: Finding) -> list[str]:
             f'whose image file is missing']
 
 
-def _clear_tombstones(db, finding: Finding) -> list[str]:
+def _clear_tombstones(db, finding: Finding,
+                      targets: list[str] | None = None) -> list[str]:
     cleared = 0
-    for url in finding.items:
+    for url in (finding.items if targets is None else targets):
         url = str(url).strip()
         if not url:
             continue

@@ -6,13 +6,16 @@ import os
 import re
 import shutil
 import sqlite3
+import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
 from src.card_models import CharacterCard
-from src.card_parser import read_chara_card, read_card_from_json, save_thumbnail
+from src.card_parser import read_card_data, read_chara_card, read_card_from_json, save_thumbnail
+from src import safe_json
 from src import vault
 from src.fs_utils import unique_temp_path
 from src.tag_ops import (
@@ -30,15 +33,24 @@ logger = logging.getLogger(__name__)
 # already been applied instead of scanning the whole table every launch.
 _SCHEMA_VERSION = 3
 
+# How many cards the one-off body-text backfill may read per launch, and
+# how long it may take. Keeps the first start after the update from
+# freezing on a large library.
+_BODY_BACKFILL_BATCH = 2000
+_BODY_BACKFILL_SECONDS = 2.0
+
 
 def _escape_like(text: str) -> str:
     """Escape SQL LIKE wildcards so user input matches literally.
 
-    The double-quote delimiter used by the tag filter is escaped too, otherwise
-    a tag containing a quote (``say "hi"``) can never match its own JSON blob.
+    Only the LIKE metacharacters are escaped.  A double quote has no special
+    meaning in a LIKE pattern, and escaping it made a query for ``say "hi"``
+    look for a literal backslash and never match - not even the card's own
+    name.  (The tag blob is no longer matched with LIKE at all: it stores
+    JSON-escaped values, so it is compared through the ``st_tags_contain``
+    helper instead.)
     """
-    return (text.replace('\\', '\\\\').replace('%', '\\%')
-            .replace('_', '\\_').replace('"', '\\"'))
+    return text.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
 
 
 def _st_norm(value) -> str:
@@ -76,6 +88,34 @@ def _has_tag(tags_json, tag) -> int:
     return 0
 
 
+#: The columns a library-wide listing needs.  ``body_text`` is deliberately
+#: absent: it holds the whole card, and a listing that only needs the
+#: metadata would pull megabytes of text through memory.
+_CARD_LIST_COLUMNS = (
+    'id, name, source_path, thumbnail_path, tags, creator, '
+    'description_preview, creator_notes, token_count, spec_version, '
+    'is_favorite, rating, create_date, date_modified'
+)
+
+
+def _unique_gallery_name(name: str, taken: set) -> str:
+    """A free ``<stem>__<n><suffix>`` gallery file name."""
+    p = Path(name)
+    stem, suffix = p.stem, p.suffix
+    for n in range(1, 10_000):
+        candidate = f'{stem}__{n}{suffix}'
+        if candidate not in taken:
+            return candidate
+    return f'{stem}__{uuid.uuid4().hex[:8]}{suffix}'
+
+
+def _tag_set(tags) -> set:
+    """The normalised set of a tag list (used to compare two lists)."""
+    from src.tag_ops import normalize_tag
+
+    return {normalize_tag(t) for t in (tags or []) if normalize_tag(t)}
+
+
 def _decode_tag_blob(tags_json) -> list:
     """Decode a card's stored ``tags`` JSON blob into a list.
 
@@ -86,10 +126,102 @@ def _decode_tag_blob(tags_json) -> list:
     if not tags_json:
         return []
     try:
-        parsed = json.loads(tags_json)
+        parsed = safe_json.loads_safe(tags_json)
     except (json.JSONDecodeError, TypeError, ValueError):
         return []
     return parsed if isinstance(parsed, list) else []
+
+
+def fuzzy_match(query: str, candidate: str) -> bool:
+    """Return True when *query* matches *candidate* leniently.
+
+    A match is either an exact match (case-insensitive) or a match of
+    *every* whitespace-separated word of the query inside the candidate,
+    in any order and regardless of the word order in the query.  An empty
+    query never matches: there is nothing to look for.
+
+    Pure and dependency-free, so it can be used from SQL (through the
+    ``st_fuzzy_match`` helper below) and from Python code alike.
+    """
+    wanted = (query or '').strip().casefold()
+    if not wanted:
+        return False
+    text = (candidate or '').casefold()
+    if wanted == text:
+        return True
+    return all(word in text for word in wanted.split())
+
+
+def _sql_fuzzy_match(candidate, query) -> int:
+    """SQL helper: does *candidate* fuzzy-match *query*? (1 or 0)."""
+    try:
+        return 1 if fuzzy_match(query, candidate or '') else 0
+    except Exception:
+        return 0
+
+
+def _sql_fuzzy_tags(tags_json, query) -> int:
+    """SQL helper: does any tag of the blob fuzzy-match *query*? (1 or 0)."""
+    for tag in _decode_tag_blob(tags_json):
+        if fuzzy_match(query, tag):
+            return 1
+    return 0
+
+
+def _sql_tags_contain(tags_json, query) -> int:
+    """SQL helper: does any tag of the blob contain *query*? (1 or 0).
+
+    The free-text search used to match the raw JSON blob with LIKE, but the
+    blob stores the JSON-*escaped* form of a tag: a card tagged ``say "hi"``
+    stores ``say \\"hi\\"``, so a search for ``say "hi"`` could never match
+    it.  The tags are decoded here and compared as values.
+    """
+    wanted = (query or '').strip().casefold()
+    if not wanted:
+        return 0
+    for tag in _decode_tag_blob(tags_json):
+        if not isinstance(tag, str):
+            continue
+        if wanted in tag.casefold():
+            return 1
+    return 0
+
+
+def _card_body_text(card: CharacterCard) -> str:
+    """Return the searchable body of *card*.
+
+    Everything the full-text search looks at: the long description and the
+    other prompt fields, the creator notes and the entries of the embedded
+    character book (their name, content and keys).
+    """
+    parts: list[str] = [
+        card.description or '',
+        card.personality or '',
+        card.scenario or '',
+        card.first_mes or '',
+        card.mes_example or '',
+        card.system_prompt or '',
+        card.post_history_instructions or '',
+        card.creator_notes or '',
+    ]
+    book = card.character_book
+    if isinstance(book, dict):
+        entries = book.get('entries')
+        if isinstance(entries, dict):
+            # SillyTavern's native shape: entries keyed by uid.
+            entries = list(entries.values())
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                parts.append(str(entry.get('name') or ''))
+                parts.append(str(entry.get('content') or ''))
+                keys = entry.get('keys')
+                if isinstance(keys, str):
+                    keys = [keys]
+                if isinstance(keys, (list, tuple)):
+                    parts.extend(str(key) for key in keys)
+    return '\n'.join(part for part in parts if part)
 
 
 def _get_data_dir() -> Path:
@@ -125,6 +257,10 @@ _WINDOWS_RESERVED = re.compile(
 
 
 def _sanitize_filename(name: str) -> str:
+    # Normalise to NFC first: on a normalising file system (macOS) two
+    # differently-normalised spellings of the same name are the same file,
+    # so the second import would overwrite the first card.
+    name = unicodedata.normalize('NFC', str(name or ''))
     name = re.sub(r'[<>:"/\\|?*]', '_', name)
     name = name.strip('. ')
     # Truncate before the reserved-name check: "CON" + 100 chars is still the
@@ -213,6 +349,86 @@ def hash_hamming_distance(a: str, b: str) -> int:
         return 64
 
 
+# Perceptual hashes are 8x8 grids, i.e. 64 bits.
+_HASH_BITS = 64
+
+
+def _band_width(max_distance: int) -> int:
+    """Bits per band for a bucket count that is larger than *max_distance*.
+
+    Two hashes that differ in at most *max_distance* bits can differ in at
+    most *max_distance* bands, so with more bands than that they must
+    share at least one identical band. Returns 0 when no such split
+    exists (a tolerance of 64 bits or more), in which case every group has
+    to be compared.
+    """
+    for width in (32, 16, 8, 4, 2, 1):
+        if (_HASH_BITS // width) > max_distance:
+            return width
+    return 0
+
+
+def _hash_bands(digest: str, width: int) -> list[tuple[int, str]]:
+    """Split *digest* into bands of *width* bits.
+
+    Returns ``(band index, band key)`` pairs. The hash is read as a plain
+    integer - exactly like :func:`hash_hamming_distance` does - so a short
+    hex string and its zero-padded equivalent land in the same bands.
+    """
+    try:
+        value = int(digest, 16)
+    except (TypeError, ValueError):
+        # An unparseable hash is 64 bits away from everything, so it
+        # gets a band of its own and never matches.
+        return [(0, 'invalid')]
+    mask = (1 << width) - 1
+    return [
+        (index, format((value >> (index * width)) & mask, '0%db' % width))
+        for index in range(_HASH_BITS // width)
+    ]
+
+
+def group_by_perceptual_hash(
+    hashed: list[tuple[str, dict]], max_distance: int = 5,
+) -> list[list[dict]]:
+    """Group ``(hash, row)`` pairs whose hashes are within *max_distance* bits.
+
+    The grouping semantics are unchanged: a row joins the first group (in
+    creation order) whose representative hash is within *max_distance*
+    bits, and starts a new group when no group matches.
+
+    What changed is how the candidates are found. Comparing every new
+    hash with every group made a library-wide scan quadratic. The hashes
+    are bucketed into bands instead: two hashes that differ in at most
+    *max_distance* bits must share at least one identical band, so only
+    the groups in a shared band can match and the scan stays linear for a
+    normal library.
+    """
+    width = _band_width(max_distance)
+    groups: list[tuple[str, list[dict]]] = []
+    band_index: dict[tuple[int, str], list[int]] = {}
+    for digest, row in hashed:
+        bands = _hash_bands(digest, width) if width else None
+        candidates: set[int] = set()
+        if bands is not None:
+            for band in bands:
+                candidates.update(band_index.get(band, ()))
+        else:
+            candidates = set(range(len(groups)))
+        for index in sorted(candidates):
+            representative, members = groups[index]
+            if hash_hamming_distance(digest, representative) <= max_distance:
+                members.append(row)
+                break
+        else:
+            groups.append((digest, [row]))
+            index = len(groups) - 1
+            if bands is not None:
+                for band in bands:
+                    band_index.setdefault(band, []).append(index)
+    return [members for _, members in groups]
+
+
 # Map dropdown display text -> sort key in LibraryDatabase._SORT_WHITELIST.
 # Shared by the Library tab's sort combo and the character sidebar's sort
 # combo so the two dropdowns can never drift apart or pass a key that isn't
@@ -246,6 +462,10 @@ class LibraryDatabase:
         # gives Unicode-aware, case-insensitive matching.
         conn.create_function('st_norm', 1, _st_norm, deterministic=True)
         conn.create_function('st_has_tag', 2, _has_tag, deterministic=True)
+        # Fuzzy (word-wise) matching for the optional typo-tolerant search.
+        conn.create_function('st_fuzzy_match', 2, _sql_fuzzy_match, deterministic=True)
+        conn.create_function('st_fuzzy_tags', 2, _sql_fuzzy_tags, deterministic=True)
+        conn.create_function('st_tags_contain', 2, _sql_tags_contain, deterministic=True)
         return conn
 
     @contextmanager
@@ -286,7 +506,8 @@ class LibraryDatabase:
                     is_favorite INTEGER DEFAULT 0,
                     create_date TEXT DEFAULT '',
                     date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    date_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    date_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    body_text TEXT DEFAULT ''
                 )
             ''')
             # Query-path indexes: sorting/filtering would otherwise
@@ -352,9 +573,29 @@ class LibraryDatabase:
         # same .bak.tmp.
         tmp_path = unique_temp_path(bak_path.parent, f'.{bak_path.name}.', '.tmp')
         try:
-            # Vault-aware copy: the backup is sealed like every other data
-            # file when encryption is on, so no plaintext DB copy lingers.
-            vault.write_bytes(tmp_path, vault.read_bytes(db_file))
+            # The copy is taken through SQLite's backup API rather than by
+            # reading the file: read + encrypt + write held three copies of
+            # the database in memory at once.
+            snap_path = unique_temp_path(bak_path.parent, f'.{bak_path.name}.', '.snap.tmp')
+            try:
+                src_conn = self._connect()
+                try:
+                    snap_conn = sqlite3.connect(str(snap_path), timeout=5.0)
+                    try:
+                        src_conn.backup(snap_conn)
+                    finally:
+                        snap_conn.close()
+                finally:
+                    src_conn.close()
+                # Vault-aware copy: the backup is sealed like every other
+                # data file when encryption is on, so no plaintext DB copy
+                # lingers.
+                vault.write_bytes(tmp_path, vault.read_bytes(snap_path))
+            finally:
+                try:
+                    snap_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             if bak_path.exists():
                 if bak2_path.exists():
                     bak2_path.unlink()
@@ -408,6 +649,12 @@ class LibraryDatabase:
                 conn.execute("ALTER TABLE characters ADD COLUMN rating INTEGER DEFAULT 0")
             if 'user_notes' not in cols:
                 conn.execute("ALTER TABLE characters ADD COLUMN user_notes TEXT DEFAULT ''")
+            if 'body_text' not in cols:
+                # The searchable body of the card (description, prompts,
+                # creator notes and the character book). Kept in the
+                # database so the full-text search is a single SQL
+                # clause instead of a file read per card.
+                conn.execute("ALTER TABLE characters ADD COLUMN body_text TEXT DEFAULT ''")
             conn.execute(
                 'CREATE INDEX IF NOT EXISTS idx_characters_st_avatar_url '
                 'ON characters (st_avatar_url)'
@@ -428,9 +675,37 @@ class LibraryDatabase:
                 'CREATE INDEX IF NOT EXISTS idx_characters_token_count '
                 'ON characters (token_count)'
             )
-            if schema_version < 1:
-                # Legacy \uXXXX-escaped tag JSON: the pre-2024 storage encoding.
-                self._migrate_tag_encoding(conn)
+            # The default grid order is "favorites first, then name"; a
+            # composite index lets SQLite use it instead of sorting the
+            # whole table on every refresh.
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_characters_fav_name '
+                'ON characters (is_favorite, name COLLATE NOCASE)'
+            )
+            # The duplicate check filters on the creator, which had no
+            # index at all.
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_characters_creator '
+                'ON characters (creator)'
+            )
+            # Bookkeeping for the one-off data migrations below. The
+            # PRAGMA user_version cannot be used for them: it is a single
+            # number for the whole schema, so a migration introduced
+            # after the version was last bumped stays unreachable (the
+            # legacy tag encoding was gated on ``user_version < 1`` and
+            # therefore never ran for a database that had ever had a
+            # version set). Each migration records its own completion
+            # here instead, so it runs exactly once per database - for
+            # every legacy database, whatever version it carries.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    name TEXT PRIMARY KEY,
+                    value TEXT DEFAULT '',
+                    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            self._run_tag_encoding_migration(conn)
+            self._run_body_text_backfill(conn)
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS collections (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -487,12 +762,39 @@ class LibraryDatabase:
                 'CREATE INDEX IF NOT EXISTS idx_gallery_images_character '
                 'ON gallery_images (character_id, sort_order)'
             )
-            if schema_version != _SCHEMA_VERSION:
-                # Only write when it actually changes: an unconditional write
-                # bumps the DB mtime on every launch, which made the startup
-                # backup fire every single time.
+            if schema_version < _SCHEMA_VERSION:
+                # Only ever *raise* the version: a database written by a
+                # NEWER build (a user_version above ours) must not be
+                # downgraded, or every ``schema_version < N`` migration
+                # re-runs on the next launch. Only write when it actually
+                # changes: an unconditional write bumps the DB mtime on
+                # every launch, which made the startup backup fire every
+                # single time.
                 conn.execute('PRAGMA user_version = %d' % _SCHEMA_VERSION)
             conn.commit()
+
+    def _migration_applied(self, conn: sqlite3.Connection, name: str) -> bool:
+        """True when the one-off migration *name* already ran on this database."""
+        row = conn.execute(
+            'SELECT 1 FROM schema_migrations WHERE name = ?', (name,),
+        ).fetchone()
+        return row is not None
+
+    def _migration_value(self, conn: sqlite3.Connection, name: str) -> str:
+        """Return the recorded value of a migration marker ('' when unset)."""
+        row = conn.execute(
+            'SELECT value FROM schema_migrations WHERE name = ?', (name,),
+        ).fetchone()
+        return str(row[0]) if row and row[0] is not None else ''
+
+    def _mark_migration_applied(
+        self, conn: sqlite3.Connection, name: str, value: str = '',
+    ) -> None:
+        """Record that the one-off migration *name* ran (idempotent)."""
+        conn.execute(
+            'INSERT OR REPLACE INTO schema_migrations (name, value) VALUES (?, ?)',
+            (name, value),
+        )
 
     @staticmethod
     def _migrate_tag_encoding(conn: sqlite3.Connection) -> None:
@@ -502,14 +804,17 @@ class LibraryDatabase:
         LIKE-based tag filter can never match against the user-visible text.
         Rows are rewritten with literal (``ensure_ascii=False``) encoding;
         anything that isn't valid JSON or a list is left untouched.
+
+        The migration is idempotent: re-running it over already-fixed rows
+        changes nothing.
         """
         rows = conn.execute('SELECT id, tags FROM characters').fetchall()
         for char_id, tags_json in rows:
             if not tags_json or '\\u' not in tags_json:
                 continue
             try:
-                parsed = json.loads(tags_json)
-            except (json.JSONDecodeError, TypeError):
+                parsed = safe_json.loads_safe(tags_json)
+            except (json.JSONDecodeError, TypeError, ValueError):
                 continue
             if not isinstance(parsed, list):
                 continue
@@ -519,6 +824,89 @@ class LibraryDatabase:
                     'UPDATE characters SET tags = ? WHERE id = ?',
                     (re_encoded, char_id),
                 )
+
+    def _run_tag_encoding_migration(self, conn: sqlite3.Connection) -> None:
+        """Run the legacy tag-encoding migration once per database.
+
+        Gated on its own marker in ``schema_migrations`` instead of the
+        schema version: the old ``user_version < 1`` gate was unreachable
+        for every database that had ever had a version written to it, so
+        a legacy library kept its broken ``\\uXXXX`` tags forever. The
+        marker makes the (expensive) re-encode run exactly once, for
+        every legacy database, and never again.
+        """
+        name = 'tag_encoding'
+        if self._migration_applied(conn, name):
+            return
+        self._migrate_tag_encoding(conn)
+        self._mark_migration_applied(conn, name)
+        logger.info("Applied the legacy tag-encoding migration")
+
+    def _run_body_text_backfill(self, conn: sqlite3.Connection) -> None:
+        """Fill the searchable body of cards stored before the column existed.
+
+        The cards that predate the column carry no body, so the full-text
+        search could not find anything in them. The work is one-off and
+        bounded: it runs for at most :data:`_BODY_BACKFILL_SECONDS` per
+        launch (and remembers where it stopped), so a large library is
+        filled over a few starts instead of freezing the app on the first
+        one. Cards imported or edited later get their body written
+        directly.
+        """
+        if self._migration_applied(conn, 'body_text'):
+            return
+        if 'body_text' not in self._character_columns(conn):
+            return
+        cursor = self._migration_value(conn, 'body_text_cursor')
+        last_id = int(cursor) if cursor.isdigit() else 0
+        rows = conn.execute(
+            "SELECT id, source_path FROM characters "
+            "WHERE id > ? AND (body_text IS NULL OR body_text = '') ORDER BY id",
+            (last_id,),
+        ).fetchall()
+        deadline = time.monotonic() + _BODY_BACKFILL_SECONDS
+        examined = 0
+        for char_id, source_path in rows:
+            if examined >= _BODY_BACKFILL_BATCH or time.monotonic() > deadline:
+                # More to do: come back on the next launch.
+                self._mark_migration_applied(conn, 'body_text_cursor', str(last_id))
+                if examined:
+                    logger.info(
+                        "Filled the searchable body of %s card(s); the rest follows",
+                        examined,
+                    )
+                return
+            last_id = int(char_id)
+            examined += 1
+            if not source_path or not Path(source_path).exists():
+                continue
+            try:
+                raw = read_card_data(source_path)
+                if raw is None:
+                    continue
+                card = CharacterCard.from_spec_dict(raw, str(source_path))
+            except Exception:
+                logger.debug("Could not read card %s for the body backfill", char_id)
+                continue
+            body = _card_body_text(card)
+            if not body:
+                continue
+            conn.execute(
+                'UPDATE characters SET body_text = ? WHERE id = ?',
+                (body, char_id),
+            )
+        # Everything that could be read has been filled.
+        self._mark_migration_applied(conn, 'body_text_cursor', str(last_id))
+        self._mark_migration_applied(conn, 'body_text', '1')
+        if examined:
+            logger.info("Filled the searchable body of %s card(s)", examined)
+
+    @staticmethod
+    def _character_columns(conn: sqlite3.Connection) -> set[str]:
+        """Return the column names of the ``characters`` table."""
+        return {
+            row[1] for row in conn.execute('PRAGMA table_info(characters)').fetchall()
+        }
 
     def add_card(self, card: CharacterCard) -> int:
         source_path = Path(card.source_path).resolve()
@@ -535,13 +923,18 @@ class LibraryDatabase:
         thumb_dir = _get_thumbnail_dir()
         thumb_name = f"{dest_path.stem}_thumb.png"
         thumb_path = thumb_dir / thumb_name
+        # Declared before the try: an exception that is neither OSError nor
+        # VaultError used to escape the inner handler and then hit an
+        # UnboundLocalError here, which masked the real error and leaked the
+        # library copy that vault.import_external already made.
+        thumb_path_str = None
         try:
             if save_thumbnail(str(dest_path), str(thumb_path)):
                 thumb_path_str = str(thumb_path)
             else:
                 logger.warning("Failed to generate thumbnail for '%s'; storing null path", card.name)
                 thumb_path_str = None
-        except (OSError, vault.VaultError) as e:
+        except Exception as e:
             # A thumbnail is optional; an unwritable thumbnail directory
             # must not fail the whole import. VaultError matters too: an
             # encrypted-library failure here must not orphan the copy that
@@ -555,8 +948,8 @@ class LibraryDatabase:
                     INSERT INTO characters
                         (name, source_path, thumbnail_path, tags, creator,
                          description_preview, creator_notes, token_count, spec_version,
-                         is_favorite, create_date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         is_favorite, create_date, body_text)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     card.name,
                     str(dest_path),
@@ -572,6 +965,8 @@ class LibraryDatabase:
                     card.spec_version,
                     int(card.fav),
                     card.create_date,
+                    # The full body, for the optional full-text search.
+                    _card_body_text(card),
                 ))
                 char_id = cursor.lastrowid
             logger.info("Added card '%s' (ID: %s)", card.name, char_id)
@@ -601,13 +996,23 @@ class LibraryDatabase:
             return 'RANDOM()'
         return f'{sort_by} DESC, name COLLATE NOCASE'
 
-    def get_all(self, sort_by: str = 'name', favorites_only: bool = False) -> list[dict]:
+    def get_all(self, sort_by: str = 'name', favorites_only: bool = False,
+                light: bool = False) -> list[dict]:
+        """Every card, optionally without the searchable body.
+
+        *light* drops the ``body_text`` column, which holds the whole card
+        (description, prompt fields, creator notes and the character book).
+        Loading it for every card made a library-wide listing - the shared
+        sidebar, the statistics dashboard, the Doctor - pull megabytes of
+        text it never looked at.
+        """
         order = self._sort_order(sort_by)
         where = 'WHERE is_favorite = 1' if favorites_only else ''
+        columns = '*' if not light else _CARD_LIST_COLUMNS
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                f'SELECT * FROM characters {where} ORDER BY {order}',
+                f'SELECT {columns} FROM characters {where} ORDER BY {order}',
             ).fetchall()
             return [dict(r) for r in rows]
 
@@ -696,49 +1101,91 @@ class LibraryDatabase:
         favorites_only: bool = False,
         min_rating: int = 0,
         collection_id: Optional[int] = None,
+        full_text: bool = False,
+        fuzzy: bool = False,
     ) -> list[dict]:
-        clauses = []
-        params = []
-        if favorites_only:
-            clauses.append('is_favorite = 1')
-        if min_rating and min_rating > 0:
-            clauses.append('rating >= ?')
-            params.append(int(min_rating))
-        if collection_id is not None:
-            if collection_id < 0:
-                # Sentinel: cards that belong to no collection at all.
-                clauses.append(
-                    'id NOT IN (SELECT character_id FROM card_collections)'
-                )
-            else:
-                clauses.append(
-                    'id IN (SELECT character_id FROM card_collections '
-                    'WHERE collection_id = ?)'
-                )
-                params.append(int(collection_id))
-        if query:
-            # Escape LIKE metacharacters so a query of "%" doesn't match
-            # every row.
-            q = f"%{_escape_like(query)}%"
-            clauses.append(
-                "(name LIKE ? ESCAPE '\\' OR description_preview LIKE ? ESCAPE '\\' "
-                "OR tags LIKE ? ESCAPE '\\' OR creator LIKE ? ESCAPE '\\' "
-                "OR creator_notes LIKE ? ESCAPE '\\')"
-            )
-            params.extend([q, q, q, q, q])
-        if tags:
-            for tag in tags:
-                # Exact tag match: decode each card's tag list and compare
-                # values. Substring-matching the raw JSON blob cannot work for
-                # tags containing quotes/backslashes (the JSON escapes them),
-                # and SQLite's LIKE/lower only fold ASCII - so a tag like
-                # "École" would be listed but never match its own card.
-                clauses.append('st_has_tag(tags, ?) = 1')
-                params.append(tag)
-        where = ' AND '.join(clauses) if clauses else '1=1'
-        order = self._sort_order(sort_by)
+        """Search the library.
+
+        *query* is matched against the name, the description preview, the
+        tags, the creator and the creator notes.
+
+        *full_text* additionally matches the full body of the card (the
+        description, the prompt fields, the creator notes and the
+        character book) through the ``body_text`` column. It is off by
+        default, and the column is only used when the database actually
+        has it.
+
+        *fuzzy* additionally keeps the rows whose name, creator or one of
+        their tags matches every word of the query (see
+        :func:`fuzzy_match`), so the word order does not matter.
+
+        Both extra modes are one extra SQL clause - no query per row.
+        """
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
+            columns = self._character_columns(conn)
+            clauses = []
+            params = []
+            if favorites_only:
+                clauses.append('is_favorite = 1')
+            if min_rating and min_rating > 0:
+                clauses.append('rating >= ?')
+                params.append(int(min_rating))
+            if collection_id is not None:
+                if collection_id < 0:
+                    # Sentinel: cards that belong to no collection at all.
+                    clauses.append(
+                        'id NOT IN (SELECT character_id FROM card_collections)'
+                    )
+                else:
+                    clauses.append(
+                        'id IN (SELECT character_id FROM card_collections '
+                        'WHERE collection_id = ?)'
+                    )
+                    params.append(int(collection_id))
+            if query:
+                # Escape LIKE metacharacters so a query of "%" doesn't match
+                # every row.
+                q = f"%{_escape_like(query)}%"
+                text_clauses = [
+                    ("name LIKE ? ESCAPE '\\'", q),
+                    ("description_preview LIKE ? ESCAPE '\\'", q),
+                    # The tags are compared as decoded values, not as raw
+                    # JSON text: a tag containing a quote or a backslash is
+                    # stored escaped and could never match itself.
+                    ("st_tags_contain(tags, ?) = 1", query),
+                    ("creator LIKE ? ESCAPE '\\'", q),
+                    ("creator_notes LIKE ? ESCAPE '\\'", q),
+                ]
+                if full_text and 'body_text' in columns:
+                    # The full body of the card, not just its preview.
+                    text_clauses.append(("body_text LIKE ? ESCAPE '\\'", q))
+                if fuzzy:
+                    # Word-wise match: every word of the query has to
+                    # appear in the name, the creator or one of the tags.
+                    text_clauses.append((
+                        '(st_fuzzy_match(name, ?) = 1 '
+                        'OR st_fuzzy_match(creator, ?) = 1 '
+                        'OR st_fuzzy_tags(tags, ?) = 1)',
+                        (query, query, query),
+                    ))
+                clauses.append('(' + ' OR '.join(c for c, _p in text_clauses) + ')')
+                for _c, p in text_clauses:
+                    if isinstance(p, tuple):
+                        params.extend(p)
+                    else:
+                        params.append(p)
+            if tags:
+                for tag in tags:
+                    # Exact tag match: decode each card's tag list and compare
+                    # values. Substring-matching the raw JSON blob cannot work for
+                    # tags containing quotes/backslashes (the JSON escapes them),
+                    # and SQLite's LIKE/lower only fold ASCII - so a tag like
+                    # "École" would be listed but never match its own card.
+                    clauses.append('st_has_tag(tags, ?) = 1')
+                    params.append(tag)
+            where = ' AND '.join(clauses) if clauses else '1=1'
+            order = self._sort_order(sort_by)
             rows = conn.execute(
                 f'SELECT * FROM characters WHERE {where} ORDER BY {order}',
                 params,
@@ -874,6 +1321,13 @@ class LibraryDatabase:
             else:
                 logger.warning("Source file missing for card ID %s, skipping file write", char_id)
 
+        # The content update is committed *before* the files are renamed.
+        # The other order left the row pointing at the pre-rename file name
+        # whenever the UPDATE failed (a locked database, a full disk, a
+        # crash): the card's file was gone and the Doctor reported it as a
+        # ghost.
+        self._update_card_row(char_id, card)
+
         # Rename the backing files when the (editable) name changed.
         new_source = source
         new_thumb = entry.get('thumbnail_path')
@@ -901,6 +1355,18 @@ class LibraryDatabase:
                         "Thumbnail regeneration failed for ID %s: %s", char_id, e,
                     )
 
+        if renamed:
+            with self._conn() as conn:
+                conn.execute(
+                    'UPDATE characters SET source_path = ?, thumbnail_path = ? '
+                    'WHERE id = ?',
+                    (new_source, new_thumb, char_id),
+                )
+                conn.commit()
+        logger.info("Updated card ID %s ('%s')", char_id, card.name)
+
+    def _update_card_row(self, char_id: int, card: CharacterCard) -> None:
+        """Write the card's metadata into its database row."""
         with self._conn() as conn:
             sets = '''
                 UPDATE characters SET
@@ -908,6 +1374,7 @@ class LibraryDatabase:
                     description_preview = ?, creator_notes = ?,
                     token_count = ?,
                     spec_version = ?, is_favorite = ?,
+                    body_text = ?,
                     date_modified = CURRENT_TIMESTAMP
             '''
             params: list = [
@@ -919,15 +1386,87 @@ class LibraryDatabase:
                 card.token_count,
                 card.spec_version,
                 int(card.fav),
+                # The full body, for the optional full-text search.
+                _card_body_text(card),
             ]
-            if renamed:
-                sets += ', source_path = ?, thumbnail_path = ?'
-                params.extend([new_source, new_thumb])
             sets += ' WHERE id = ?'
             params.append(char_id)
             conn.execute(sets, params)
             conn.commit()
-        logger.info("Updated card ID %s ('%s')", char_id, card.name)
+
+    def update_card_fields(self, char_id: int, fields: dict) -> bool:
+        """Update a subset of a card's fields.
+
+        Used by the batch-edit tool: the card is read from its file, the
+        given fields are replaced, and the card is written back.  Reading the
+        file first is what makes fields that only exist in the PNG
+        (``system_prompt``, ``character_version``, ``description``, ...) work
+        the same way as the ones stored in the database row.
+
+        Args:
+            char_id: the card to update.
+            fields: a mapping of field name to new value.  ``tags`` takes a
+                list of strings; every other field takes a string.
+
+        Returns:
+            True when the card was updated, False when it could not be read
+            or the field is unknown.
+        """
+        if not fields:
+            return False
+        entry = self.get_by_id(char_id)
+        if entry is None:
+            return False
+        from src.card_models import CharacterCard
+        from src.card_parser import read_card_data
+
+        source = entry.get('source_path', '')
+        data = None
+        if source:
+            try:
+                data = read_card_data(source)
+            except Exception:
+                logger.exception("Could not read card %s for a field update", char_id)
+        card = CharacterCard()
+        if isinstance(data, dict):
+            inner = data.get('data') if isinstance(data.get('data'), dict) else data
+            for key, value in inner.items():
+                if hasattr(card, key):
+                    try:
+                        setattr(card, key, value)
+                    except Exception:
+                        pass
+        # Fall back to the database row for the fields it does hold.
+        card.name = card.name or entry.get('name', '')
+        card.creator = card.creator or entry.get('creator', '')
+        card.creator_notes = card.creator_notes or entry.get('creator_notes', '')
+        card.description = card.description or entry.get('description_preview', '')
+
+        changed = False
+        for key, value in fields.items():
+            if key == 'tags':
+                if isinstance(value, str):
+                    value = [t.strip() for t in value.split(',') if t.strip()]
+                if not isinstance(value, list):
+                    continue
+                card.tags = list(value)
+                changed = True
+                continue
+            if not hasattr(card, key):
+                logger.warning("Ignoring an unknown card field %r", key)
+                continue
+            if isinstance(value, (list, tuple)):
+                value = ', '.join(str(v) for v in value)
+            setattr(card, key, str(value))
+            changed = True
+        if not changed:
+            return False
+        try:
+            self.update_card(char_id, card, regen_thumbnail=False)
+        except Exception:
+            logger.exception("Could not update the fields of card %s", char_id)
+            return False
+        return True
 
     def remove_card(
         self,
@@ -935,7 +1474,16 @@ class LibraryDatabase:
         delete_files: bool = True,
         record_tombstone: bool = True,
         delete_sessions: Optional[bool] = None,
+        preserve_related: bool = False,
     ) -> None:
+        """Remove a card row (and, by default, its files and chat sessions).
+
+        *preserve_related* keeps the gallery metadata rows and the collection
+        memberships.  It exists for the Library Doctor: when a card's PNG has
+        disappeared, the row is a ghost, but the gallery images and the chat
+        history are independent assets that belong to the user and must not be
+        cascaded away with the row.
+        """
         entry = self.get_by_id(char_id)
         if entry is None:
             return
@@ -973,8 +1521,9 @@ class LibraryDatabase:
             # Delete the DB row FIRST: if file deletion then fails, we're left
             # with harmless orphan files (cleanable) instead of a ghost row
             # pointing at deleted files.
-            conn.execute('DELETE FROM card_collections WHERE character_id = ?', (char_id,))
-            conn.execute('DELETE FROM gallery_images WHERE character_id = ?', (char_id,))
+            if not preserve_related:
+                conn.execute('DELETE FROM card_collections WHERE character_id = ?', (char_id,))
+                conn.execute('DELETE FROM gallery_images WHERE character_id = ?', (char_id,))
             conn.execute('DELETE FROM characters WHERE id = ?', (char_id,))
         logger.info("Removed card ID %s", char_id)
         # Chat sessions live on disk under sessions/<char_id>/. They are
@@ -1042,6 +1591,11 @@ class LibraryDatabase:
         Returns the number of cards whose tag list actually changed.
         """
         conn.row_factory = sqlite3.Row
+        # The read has to be part of the write transaction: with the default
+        # isolation level, python's sqlite3 only opens a transaction on DML,
+        # so a card saved by another thread between the SELECT and the
+        # UPDATE would have its tags silently overwritten.
+        conn.execute('BEGIN IMMEDIATE')
         rows = conn.execute('SELECT id, tags FROM characters').fetchall()
         changed = 0
         for row in rows:
@@ -1050,18 +1604,23 @@ class LibraryDatabase:
             current: list[str] = []
             if tags_json:
                 try:
-                    parsed = json.loads(tags_json)
+                    parsed = safe_json.loads_safe(tags_json)
                     if isinstance(parsed, list):
                         current = [str(t) for t in parsed]
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError, ValueError, OverflowError):
                     current = []
             new_tags = transform(current)
-            if new_tags != current:
-                conn.execute(
-                    'UPDATE characters SET tags = ?, date_modified = CURRENT_TIMESTAMP WHERE id = ?',
-                    (json.dumps(new_tags, ensure_ascii=False), char_id),
-                )
-                changed += 1
+            # Compare the *normalised* sets: a transform that only changes
+            # the spelling (or the order) of the tags has not changed the
+            # card, and writing it back would touch every card in the
+            # library for nothing.
+            if _tag_set(new_tags) == _tag_set(current):
+                continue
+            conn.execute(
+                'UPDATE characters SET tags = ?, date_modified = CURRENT_TIMESTAMP WHERE id = ?',
+                (json.dumps(new_tags, ensure_ascii=False), char_id),
+            )
+            changed += 1
         return changed
 
     def rename_tag_all(self, old: str, new: str) -> int:
@@ -1315,11 +1874,36 @@ class LibraryDatabase:
     def set_gallery_order(self, char_id: int, ordered_ids: list[int]) -> None:
         """Persist a drag-reordered gallery sequence.
 
-        The UPDATE list is rewritten from *ordered_ids* wholesale so a
-        dropped item can't leave two rows sharing one sort_order.
+        The order is rewritten wholesale: the ids in *ordered_ids* come
+        first, in the given order, and every row the caller did not
+        mention follows them, keeping their previous relative order (by
+        their current ``sort_order``, then by id). The result is a total
+        order, so no two rows of a character can share a ``sort_order``.
         """
         with self._conn() as conn:
-            for position, image_id in enumerate(ordered_ids):
+            rows = conn.execute(
+                'SELECT id FROM gallery_images WHERE character_id = ? '
+                'ORDER BY sort_order, id',
+                (char_id,),
+            ).fetchall()
+            own = {int(row[0]) for row in rows}
+            ordered: list[int] = []
+            seen: set[int] = set()
+            for image_id in ordered_ids or []:
+                try:
+                    image_id = int(image_id)
+                except (TypeError, ValueError):
+                    continue
+                # Ids of other characters (or duplicates) must not
+                # consume a position: they would leave a gap in the
+                # order and shift every following row.
+                if image_id in own and image_id not in seen:
+                    seen.add(image_id)
+                    ordered.append(image_id)
+            # Rows the caller did not mention keep their relative order
+            # and are placed after the listed ones.
+            ordered.extend(int(row[0]) for row in rows if int(row[0]) not in seen)
+            for position, image_id in enumerate(ordered):
                 conn.execute(
                     'UPDATE gallery_images SET sort_order = ? '
                     'WHERE id = ? AND character_id = ?',
@@ -1367,11 +1951,60 @@ class LibraryDatabase:
         if old_id == new_id:
             return
         with self._conn() as conn:
+            # A row of the target card may already use the same file name;
+            # the UNIQUE(character_id, file_name) constraint would then make
+            # the bulk update fail and lose the whole gallery.  The
+            # conflicting rows are renamed first.
+            rows = conn.execute(
+                'SELECT id, file_name FROM gallery_images WHERE character_id = ?',
+                (new_id,),
+            ).fetchall()
+            taken = {r[1] for r in rows}
+            for row in conn.execute(
+                'SELECT id, file_name FROM gallery_images WHERE character_id = ?',
+                (old_id,),
+            ).fetchall():
+                if row[1] in taken:
+                    unique = _unique_gallery_name(row[1], taken)
+                    conn.execute(
+                        'UPDATE gallery_images SET file_name = ? WHERE id = ?',
+                        (unique, row[0]),
+                    )
+                    taken.add(unique)
             conn.execute(
                 'UPDATE gallery_images SET character_id = ? WHERE character_id = ?',
                 (new_id, old_id),
             )
             conn.commit()
+
+    def rename_gallery_files(self, char_id: int, renames: dict) -> int:
+        """Point the gallery rows at the renamed files.
+
+        The gallery files are renamed on disk when their name collides with
+        one already in the target folder; the rows that name them have to
+        follow, or the card shows the *other* card's image.
+        """
+        if not renames:
+            return 0
+        changed = 0
+        with self._conn() as conn:
+            for old_name, new_name in renames.items():
+                try:
+                    cursor = conn.execute(
+                        'UPDATE gallery_images SET file_name = ? '
+                        'WHERE character_id = ? AND file_name = ?',
+                        (new_name, char_id, old_name),
+                    )
+                    changed += cursor.rowcount or 0
+                except sqlite3.IntegrityError:
+                    # Another row already uses the new name: leave this one
+                    # alone rather than losing the row.
+                    logger.warning(
+                        "Could not rename the gallery file '%s' to '%s': the "
+                        "name is already taken", old_name, new_name,
+                    )
+            conn.commit()
+        return changed
 
     # ---- SillyTavern linking ----
 
@@ -1388,21 +2021,18 @@ class LibraryDatabase:
         )
 
     def _clear_deleted_st_card(self, conn: sqlite3.Connection, avatar_url: str) -> None:
-        """Delete a tombstone on an existing connection."""
-        wanted = os.path.normcase(avatar_url)
-        conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute(
-                'SELECT st_avatar_url FROM deleted_st_cards'
-            ).fetchall()
-        finally:
-            conn.row_factory = None
-        for row in rows:
-            if os.path.normcase(row['st_avatar_url']) == wanted:
-                conn.execute(
-                    'DELETE FROM deleted_st_cards WHERE st_avatar_url = ?',
-                    (row['st_avatar_url'],),
-                )
+        """Delete a tombstone on an existing connection.
+
+        The stored key is already case-normalised (see
+        :meth:`_record_deleted_st_card`), and normalising is idempotent,
+        so the row can be addressed directly through the primary key
+        index instead of scanning the whole table and comparing in
+        Python on every link/unlink.
+        """
+        conn.execute(
+            'DELETE FROM deleted_st_cards WHERE st_avatar_url = ?',
+            (os.path.normcase(avatar_url),),
+        )
 
     def migrate_chat_sessions(self, old_id: int, new_id: int) -> None:
         """Move ``sessions/<old_id>/`` to ``sessions/<new_id>/``.
@@ -1429,11 +2059,13 @@ class LibraryDatabase:
                 old_dir.rename(new_dir)
                 return
             from src.fs_utils import move_contents_into
-            notes = move_contents_into(old_dir, new_dir)
+            renames = move_contents_into(old_dir, new_dir)
             shutil.rmtree(old_dir, ignore_errors=True)
-            for note in notes:
-                logger.warning("Chat session %s during merge %s -> %s",
-                               note, old_dir, new_dir)
+            for old_name, new_name in renames:
+                logger.warning(
+                    "Chat session '%s' was merged as '%s' during the move %s -> %s",
+                    old_name, new_name, old_dir, new_dir,
+                )
         except OSError as e:
             logger.warning(
                 "Could not migrate chat sessions from %s to %s: %s",
@@ -1606,7 +2238,7 @@ class LibraryDatabase:
         or unreadable are skipped.  Returns groups with more than one entry.
         """
         rows = self.get_all(sort_by='date_added')
-        groups: list[tuple[str, list[dict]]] = []
+        hashed: list[tuple[str, dict]] = []
         for row in rows:
             source = row.get('source_path', '')
             if not source or not Path(source).exists():
@@ -1616,13 +2248,9 @@ class LibraryDatabase:
             except Exception as e:
                 logger.debug("Could not hash image for card %s: %s", row.get('id'), e)
                 continue
-            for rep, members in groups:
-                if hash_hamming_distance(h, rep) <= max_distance:
-                    members.append(row)
-                    break
-            else:
-                groups.append((h, [row]))
-        return [members for _, members in groups if len(members) > 1]
+            hashed.append((h, row))
+        groups = group_by_perceptual_hash(hashed, max_distance)
+        return [members for members in groups if len(members) > 1]
 
     def import_card(self, png_path: str | Path) -> Optional[int]:
         png_path = Path(png_path).resolve()
@@ -1663,6 +2291,16 @@ class LibraryDatabase:
                     continue
                 card = CharacterCard.from_spec_dict(raw, source_path=str(resolved))
                 card.token_count = count_card_tokens(card)
+                # The duplicate check the interactive import path uses: a
+                # repeated import must not create a second row *and* a
+                # second copy of the file.
+                dup = self.find_duplicate(card)
+                if dup is not None:
+                    results.append((
+                        str(path), None,
+                        f"Duplicate of '{dup.get('name', card.name)}'",
+                    ))
+                    continue
                 char_id = self.add_card(card)
                 results.append((str(path), char_id, None))
             except Exception as e:

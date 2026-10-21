@@ -7,19 +7,41 @@ from datetime import datetime
 from typing import Any, Optional
 
 from src.card_models import BookEntry, CharacterBook, CharacterCard, parse_character_book
+from src.context_templates import (
+    ContextTemplate,
+    default_template,
+    name_prefixes as _name_prefixes,
+    render_block,
+    render_jailbreak,
+    render_main,
+    render_post_history,
+)
 
 # SillyTavern macro substitution: {{user}} and {{char}} (case-insensitive).
-_USER_RE = re.compile(r'\{\{\s*user\s*\}\}', re.IGNORECASE)
-_CHAR_RE = re.compile(r'\{\{\s*char\s*\}\}', re.IGNORECASE)
+#
+# The lookarounds keep a *format-escaped* macro (``{{{{user}}}}``) out of the
+# substitution: the doubled braces are how a template asks ``str.format`` to
+# leave a literal ``{{user}}`` in the output - for instance the speaker
+# prefix an example dialogue is supposed to use.  Substituting it turned
+# the instruction into the user's name, and made the prompt preview show
+# something different from what the chat actually sends.
+_USER_RE = re.compile(r'(?<!\{)\{\{\s*user\s*\}\}(?!\})', re.IGNORECASE)
+_CHAR_RE = re.compile(r'(?<!\{)\{\{\s*char\s*\}\}(?!\})', re.IGNORECASE)
 
 # Dynamic SillyTavern macros evaluated per substitution pass.
-_DATE_RE = re.compile(r'\{\{\s*date\s*\}\}', re.IGNORECASE)
-_TIME_RE = re.compile(r'\{\{\s*time\s*\}\}', re.IGNORECASE)
-_DATETIME_RE = re.compile(r'\{\{\s*datetime\s*\}\}', re.IGNORECASE)
-_RANDOM_RE = re.compile(r'\{\{\s*(?:random|pick)\s*:\s*([^{}]*)\}\}', re.IGNORECASE)
-_ROLL_RE = re.compile(r'\{\{\s*roll\s*:\s*([^{}]*)\}\}', re.IGNORECASE)
+_DATE_RE = re.compile(r'(?<!\{)\{\{\s*date\s*\}\}(?!\})', re.IGNORECASE)
+_TIME_RE = re.compile(r'(?<!\{)\{\{\s*time\s*\}\}(?!\})', re.IGNORECASE)
+_DATETIME_RE = re.compile(r'(?<!\{)\{\{\s*datetime\s*\}\}(?!\})', re.IGNORECASE)
+_RANDOM_RE = re.compile(
+    r'(?<!\{)\{\{\s*(?:random|pick)\s*:\s*([^{}]*)\}\}(?!\})', re.IGNORECASE,
+)
+_ROLL_RE = re.compile(r'(?<!\{)\{\{\s*roll\s*:\s*([^{}]*)\}\}(?!\})', re.IGNORECASE)
 # ``NdM+K`` / ``d20`` / ``2d6-1`` dice notation for {{roll:...}}.
-_ROLL_SPEC_RE = re.compile(r'^\s*(\d*)\s*[dD]\s*(\d+)\s*(?:([+-])\s*(\d+))?\s*$')
+# The digit runs are bounded: an unbounded run (thousands of digits) made the
+# int() conversion raise ValueError on Python 3.11+.
+_ROLL_SPEC_RE = re.compile(
+    r'^\s*(\d{0,3})\s*[dD]\s*(\d{1,9})\s*(?:([+-])\s*(\d{1,9}))?\s*$'
+)
 
 # ``{{char}}`` / ``{{user}}`` line prefixes inside mes_example blocks.
 _EXAMPLE_SPEAKER_RE = re.compile(
@@ -28,6 +50,11 @@ _EXAMPLE_SPEAKER_RE = re.compile(
 
 # Lorebook defaults when the book doesn't specify them.
 DEFAULT_LOREBOOK_SCAN_DEPTH = 4
+# The token budget a lorebook gets when it does not define one.  The book's
+# own budget lives in the card's character book - i.e. it is controlled by
+# whoever made the card - so a book that omits it must not get an unbounded
+# injection.
+DEFAULT_LOREBOOK_TOKEN_BUDGET = 2000
 # Hard cap on recursive rescans so mutually-triggering entries can't loop.
 MAX_LOREBOOK_PASSES = 5
 
@@ -173,17 +200,30 @@ def _macro_options(payload: str) -> list[str]:
 
 
 def _roll_macro(payload: str, rng: random.Random) -> Optional[int]:
-    """Evaluate a ``{{roll: NdM±K}}`` dice expression (None when invalid)."""
+    """Evaluate a ``{{roll: NdM±K}}`` dice expression (None when invalid).
+
+    The digit runs are bounded in the pattern *and* the conversion is
+    guarded: an unbounded run (a card can put thousands of digits in a
+    ``{{roll:}}`` macro) made ``int()`` raise ``ValueError`` on Python 3.11+
+    ("Exceeds the limit (4300 digits) for integer string conversion"), which
+    escaped into the send path and aborted the app.
+    """
     match = _ROLL_SPEC_RE.match(payload or '')
     if not match:
         return None
-    count = int(match.group(1) or '1')
-    sides = int(match.group(2))
+    try:
+        count = int(match.group(1) or '1')
+        sides = int(match.group(2))
+    except (ValueError, OverflowError):
+        return None
     if sides < 1 or count < 1 or count > 100:
+        return None
+    try:
+        bonus = int(match.group(4)) if match.group(3) else 0
+    except (ValueError, OverflowError):
         return None
     total = sum(rng.randint(1, sides) for _ in range(count))
     if match.group(3):
-        bonus = int(match.group(4))
         total += bonus if match.group(3) == '+' else -bonus
     return total
 
@@ -201,13 +241,39 @@ def clean_generated_text(text: str, user_name: str = 'User', char_name: str = ''
     return _sub_literal(_CHAR_RE, char_name or '', out)
 
 
+def _untrusted(text: str) -> str:
+    """Neutralise the card-data delimiters inside third-party text.
+
+    A character card is a third-party download, and so is a lorebook entry.
+    Their text must never be able to close the ``<card_data>`` block that
+    separates the data from the instructions.
+    """
+    from src.ai_prompts import neutralize_card_data
+
+    return neutralize_card_data(text or '')
+
+
+def _as_card_data(body: str) -> str:
+    """Wrap third-party text in the ``<card_data>`` delimiters.
+
+    The text is neutralised first, so a card cannot forge the closing
+    delimiter and have the rest of its text read as an instruction.
+    """
+    from src.ai_prompts import CARD_DATA_CLOSE, CARD_DATA_OPEN
+
+    body = _untrusted(body or '').strip()
+    if not body:
+        return ''
+    return f'{CARD_DATA_OPEN}\n{body}\n{CARD_DATA_CLOSE}'
+
+
 def _card_fields(card: CharacterCard) -> dict[str, Any]:
     return {
-        'name': card.name or '',
-        'description': card.description or '',
-        'personality': card.personality or '',
-        'scenario': card.scenario or '',
-        'first_mes': card.first_mes or '',
+        'name': _untrusted(card.name or ''),
+        'description': _untrusted(card.description or ''),
+        'personality': _untrusted(card.personality or ''),
+        'scenario': _untrusted(card.scenario or ''),
+        'first_mes': _untrusted(card.first_mes or ''),
     }
 
 
@@ -248,9 +314,11 @@ def resolve_system_prompt(
         from src.ai_prompts import substitute
         parts.append(substitute(macroed, **_card_fields(card)).strip())
     if card.system_prompt and card.system_prompt.strip():
-        parts.append(substitute_macros(
+        # The card's own prompt is third-party text: it is quoted as data so
+        # it cannot pose as an instruction of the app's own system prompt.
+        parts.append(_as_card_data(substitute_macros(
             card.system_prompt, user_name, card.name, custom_macros,
-        ).strip())
+        ).strip()))
     return '\n\n'.join(p for p in parts if p)
 
 
@@ -318,6 +386,42 @@ def _split_example_blocks(mes_example: str) -> list[str]:
     return [b.strip('\n') for b in blocks if b and b.strip()]
 
 
+def _parse_example_turns(
+    mes_example: str,
+) -> list[list[tuple[Optional[str], str]]]:
+    """Split ``mes_example`` into per-``<START>`` blocks of speaker turns.
+
+    Each turn is ``(speaker, text)`` where *speaker* is ``'user'`` /
+    ``'assistant'`` or None for narration-only blocks (no recognised
+    ``{{user}}:`` / ``{{char}}:`` prefix anywhere in the block).  Macros are
+    NOT substituted here.  Pure function.
+    """
+    out: list[list[tuple[Optional[str], str]]] = []
+    for block in _split_example_blocks(mes_example or ''):
+        turns: list[tuple[Optional[str], str]] = []
+        speaker: Optional[str] = None
+        buffer: list[str] = []
+
+        def flush() -> None:
+            text = '\n'.join(buffer).strip()
+            if text:
+                turns.append((speaker, text))
+
+        for line in block.splitlines():
+            match = _EXAMPLE_SPEAKER_RE.match(line)
+            if match:
+                flush()
+                raw_speaker = match.group(1).lower()
+                speaker = 'user' if 'user' in raw_speaker else 'assistant'
+                buffer = [line[match.end():]]
+            else:
+                buffer.append(line)
+        flush()
+        if turns:
+            out.append(turns)
+    return out
+
+
 def parse_example_messages(
     mes_example: str,
     user_name: str,
@@ -335,39 +439,20 @@ def parse_example_messages(
     Pure function.
     """
     messages: list[dict[str, str]] = []
-    for block in _split_example_blocks(mes_example or ''):
-        speaker: str | None = None
-        buffer: list[str] = []
-
-        def flush() -> None:
-            text = '\n'.join(buffer).strip()
-            if text:
-                messages.append({
-                    'role': speaker or 'assistant',
-                    'content': text,
-                })
-
-        for line in block.splitlines():
-            match = _EXAMPLE_SPEAKER_RE.match(line)
-            if match:
-                flush()
-                raw_speaker = match.group(1).lower()
-                speaker = 'user' if 'user' in raw_speaker else 'assistant'
-                buffer = [line[match.end():]]
-            else:
-                buffer.append(line)
-        flush()
-
-    return [
-        {'role': m['role'], 'content': substitute_macros(
-            m['content'], user_name, char_name, custom_macros,
-        )}
-        for m in messages
-    ]
+    for turns in _parse_example_turns(mes_example or ''):
+        for speaker, text in turns:
+            messages.append({
+                'role': speaker or 'assistant',
+                'content': substitute_macros(
+                    text, user_name, char_name, custom_macros,
+                ),
+            })
+    return messages
 
 
 def _persona_block(persona: str, user_name: str = 'User') -> str:
-    return f"[User persona]\n{user_name or 'User'} is: {persona.strip()}"
+    """The user-persona body (label-free; the caller frames it)."""
+    return f"{user_name or 'User'} is: {persona.strip()}"
 
 
 def apply_persona(system: str, persona: str, user_name: str = 'User') -> str:
@@ -378,7 +463,7 @@ def apply_persona(system: str, persona: str, user_name: str = 'User') -> str:
     """
     if not persona or not persona.strip():
         return system or ''
-    block = _persona_block(persona, user_name)
+    block = f"[User persona]\n{_persona_block(persona, user_name)}"
     if system and system.strip():
         return f"{system}\n\n{block}"
     return block
@@ -390,20 +475,32 @@ def _attachment_text_block(attachment: dict) -> str:
     return f"[Attached file: {name}]\n{data}"
 
 
-def history_for_api(messages: list[dict]) -> list[dict]:
+def history_for_api(
+    messages: list[dict],
+    name_prefixes: dict[str, str] | None = None,
+) -> list[dict]:
     """Convert internal chat messages into API-ready message dicts.
 
     Internal fields (``attachments``, and any ``id``/``ts`` markers) are
     stripped.  Text attachments are prepended to the message as a labelled
     block; image attachments turn the message ``content`` into an
-    OpenAI-compatible multimodal list of text + ``image_url`` parts.  Pure
-    function so it can be unit-tested without Qt.
+    OpenAI-compatible multimodal list of text + ``image_url`` parts.  When
+    *name_prefixes* maps a role to a prefix (the context template's names
+    behavior), it is prepended to the message text - SillyTavern's "add
+    character/user names to messages".  Pure function so it can be
+    unit-tested without Qt.
     """
     result: list[dict] = []
     for m in messages or []:
         role = m.get('role', 'user')
         content = m.get('content', '') or ''
-        attachments = m.get('attachments') or []
+        # The attachments come from a session file on disk: a hand-edited
+        # one can hold anything, and ``a.get(...)`` on a string raised in the
+        # send path.
+        attachments = [
+            a for a in (m.get('attachments') or []) if isinstance(a, dict)
+        ]
+        prefix = (name_prefixes or {}).get(role, '') or ''
 
         text_blocks = [
             _attachment_text_block(a)
@@ -416,6 +513,8 @@ def history_for_api(messages: list[dict]) -> list[dict]:
             combined = content
             if text_blocks:
                 combined = '\n\n'.join(text_blocks + ([content] if content else []))
+            if prefix and combined:
+                combined = prefix + combined
             parts: list[dict] = []
             # Some OpenAI-compatible backends reject an empty text part;
             # omit it entirely for image-only messages.
@@ -431,9 +530,9 @@ def history_for_api(messages: list[dict]) -> list[dict]:
             result.append({'role': role, 'content': parts})
         elif text_blocks:
             combined = '\n\n'.join(text_blocks + ([content] if content else []))
-            result.append({'role': role, 'content': combined})
+            result.append({'role': role, 'content': prefix + combined})
         else:
-            result.append({'role': role, 'content': content})
+            result.append({'role': role, 'content': prefix + content})
     return result
 
 
@@ -496,7 +595,10 @@ def _merge_same_role(messages: list[dict]) -> list[dict]:
     return out
 
 
-def normalize_chat_roles(messages: list[dict]) -> list[dict]:
+def normalize_chat_roles(
+    messages: list[dict],
+    conversation_start_header: str = CONVERSATION_START_HEADER,
+) -> list[dict]:
     """Rewrite *messages* into the shape strict chat templates require.
 
     Llama 3.x / Gemma Jinja templates reject any request whose roles are not
@@ -544,7 +646,7 @@ def normalize_chat_roles(messages: list[dict]) -> list[dict]:
             if rest:
                 leftovers.append({'role': 'user', 'content': rest})
         if texts:
-            body = f"{CONVERSATION_START_HEADER}\n" + '\n\n'.join(texts)
+            body = f"{conversation_start_header}\n" + '\n\n'.join(texts)
             if lead is None:
                 lead = {'role': 'system', 'content': body}
             else:
@@ -571,16 +673,21 @@ def apply_memory(system: str, memory: str) -> str:
 
 
 def _memory_section(memories: list[dict], limit: int = 20) -> Optional[str]:
-    """Build the ``[Chat memory]`` block, or None when nothing to include."""
-    items = [
-        m for m in (memories or [])
-        if isinstance(m, dict) and (m.get('content') or '').strip()
-    ]
+    """The chat-memory body (bulleted lines), or None when nothing to include."""
+    items = []
+    for m in (memories or []):
+        if not isinstance(m, dict):
+            continue
+        content = m.get('content')
+        # A session file can hold anything: a non-string content made
+        # ``.strip()`` raise in the send path.
+        if not isinstance(content, str) or not content.strip():
+            continue
+        items.append(content)
     if not items:
         return None
     recent = items[-limit:]
-    blocks = [f"- {m['content'].strip()}" for m in recent]
-    return "[Chat memory]\n" + '\n'.join(blocks)
+    return '\n'.join(f"- {content.strip()}" for content in recent)
 
 
 def apply_memories(system: str, memories: list[dict], limit: int = 20) -> str:
@@ -593,13 +700,14 @@ def apply_memories(system: str, memories: list[dict], limit: int = 20) -> str:
     section = _memory_section(memories, limit)
     if section is None:
         return system or ''
+    block = f"[Chat memory]\n{section}"
     if system and system.strip():
-        return f"{system}\n\n{section}"
-    return section
+        return f"{system}\n\n{block}"
+    return block
 
 
 def _attributes_section(attributes: list[dict] | None) -> Optional[str]:
-    """Build the ``[Persistent attributes]`` block, or None when nothing to include."""
+    """The persistent-attribute body (``name: value`` lines) or None."""
     items = [
         a for a in (attributes or [])
         if isinstance(a, dict)
@@ -609,8 +717,9 @@ def _attributes_section(attributes: list[dict] | None) -> Optional[str]:
     ]
     if not items:
         return None
-    lines = [f"{a['name'].strip()}: {a['value'].strip()}" for a in items]
-    return "[Persistent attributes]\n" + '\n'.join(lines)
+    return '\n'.join(
+        f"{a['name'].strip()}: {a['value'].strip()}" for a in items
+    )
 
 
 def apply_attributes(system: str, attributes: list[dict] | None) -> str:
@@ -622,9 +731,10 @@ def apply_attributes(system: str, attributes: list[dict] | None) -> str:
     section = _attributes_section(attributes)
     if section is None:
         return system or ''
+    block = f"[Persistent attributes]\n{section}"
     if system and system.strip():
-        return f"{system}\n\n{section}"
-    return section
+        return f"{system}\n\n{block}"
+    return block
 
 
 # ---- Lorebook (world info) injection ----
@@ -731,17 +841,21 @@ def _activate_book_entries(
     ordered = sorted(activated.values(), key=lambda e: e.insertion_order)
 
     budget = book.token_budget or 0
-    if budget > 0:
-        # Drop lowest-priority (highest insertion-order) entries until the
-        # activated set fits the book's token budget.
-        costs = [token_fn(e.content or '') for e in ordered]
-        total = sum(costs)
-        count = len(ordered)
-        while count > 0 and total > budget:
-            count -= 1
-            total -= costs[count]
-        return ordered[:count]
-    return ordered
+    if budget <= 0:
+        # The book's own budget is attacker-controlled (it lives in the
+        # card's character book), so a book that simply omits it got *no*
+        # cap at all: a third-party book could inject an unbounded amount
+        # of text.  A default budget applies when the book asks for none.
+        budget = DEFAULT_LOREBOOK_TOKEN_BUDGET
+    # Drop lowest-priority (highest insertion-order) entries until the
+    # activated set fits the book's token budget.
+    costs = [token_fn(e.content or '') for e in ordered]
+    total = sum(costs)
+    count = len(ordered)
+    while count > 0 and total > budget:
+        count -= 1
+        total -= costs[count]
+    return ordered[:count]
 
 
 def collect_lorebook_entries(
@@ -771,8 +885,12 @@ def collect_lorebook_entries(
 
 
 def _world_info_section(entries: list[BookEntry]) -> str:
-    """Build the ``[World Info]`` block from activated entries."""
-    return '[World Info]\n' + '\n\n'.join(e.content.strip() for e in entries)
+    """The world-info body from activated entries (label-free).
+
+    Every entry is third-party text (the card's own book and the standalone
+    books), so the delimiters inside it are neutralised.
+    """
+    return '\n\n'.join(_untrusted(e.content).strip() for e in entries)
 
 
 def apply_lorebook(
@@ -791,7 +909,7 @@ def apply_lorebook(
     entries = collect_lorebook_entries(card, messages, token_fn=token_fn, extra_books=extra_books)
     if not entries:
         return system or ''
-    section = _world_info_section(entries)
+    section = f"[World Info]\n{_as_card_data(_world_info_section(entries))}"
     if system and system.strip():
         return f"{system}\n\n{section}"
     return section
@@ -842,23 +960,72 @@ def example_messages_for_card(
     )
 
 
+def _render_example_block(
+    mes_example: str,
+    user_name: str,
+    char_name: str,
+    custom_macros: dict[str, str] | None,
+    template: ContextTemplate,
+) -> str:
+    """Re-render the few-shot examples under a context template's rules.
+
+    Speaker prefixes and the block separator come from the template;
+    narration-only turns are kept unprefixed.  Macros in both the lines and
+    the prefixes are substituted.  Pure function.
+    """
+    user_prefix = substitute_macros(
+        template.example_user_prefix or '', user_name, char_name, custom_macros,
+    )
+    char_prefix = substitute_macros(
+        template.example_char_prefix or '', user_name, char_name, custom_macros,
+    )
+    separator = template.example_separator or '<START>'
+    rendered_blocks: list[str] = []
+    for turns in _parse_example_turns(mes_example):
+        lines: list[str] = []
+        for speaker, text in turns:
+            body = substitute_macros(text, user_name, char_name, custom_macros)
+            if speaker == 'user':
+                lines.append(user_prefix + body)
+            elif speaker == 'assistant':
+                lines.append(char_prefix + body)
+            else:
+                lines.append(body)
+        rendered_blocks.append(f'{separator}\n' + '\n'.join(lines))
+    return '\n'.join(rendered_blocks)
+
+
 def example_block_text(
     card: CharacterCard,
     user_name: str = 'User',
     custom_macros: dict[str, str] | None = None,
+    context_template: ContextTemplate | None = None,
 ) -> str:
-    """Few-shot examples rendered as one ``<START>``-separated text block.
+    """Few-shot examples rendered as one text block ('' = none).
 
-    SillyTavern sends example dialogue as a labelled text block (macros
-    substituted, ``<START>`` separators kept) rather than as real chat turns;
-    presenting examples as if they happened skews both the model's sense of
-    the conversation and any summarizer reading the history.  Pure function.
+    Without a *context_template* the card's ``mes_example`` is returned with
+    macros substituted and its ``<START>`` separators kept (the classic
+    output).  With one, the examples are re-rendered under the template's
+    speaker prefixes and block separator.  SillyTavern sends example
+    dialogue as a text block rather than as real chat turns; presenting
+    examples as if they happened skews both the model's sense of the
+    conversation and any summarizer reading the history.  Pure function.
+
+    The examples are third-party text and are quoted as data: the block is
+    sent as a trailing system message, the strongest position in the
+    request, so an example must not be able to pose as an instruction.
     """
     if not card or not (card.mes_example or '').strip():
         return ''
-    return substitute_macros(
-        card.mes_example.strip(), user_name, card.name or '', custom_macros,
-    )
+    if context_template is None:
+        body = substitute_macros(
+            card.mes_example.strip(), user_name, card.name or '', custom_macros,
+        )
+    else:
+        body = _render_example_block(
+            card.mes_example, user_name, card.name or '', custom_macros, context_template,
+        )
+    return _as_card_data(body)
 
 
 # ---- SillyTavern-style system prompt assembly ----
@@ -868,6 +1035,20 @@ _SYSTEM_BLOCK_TITLES = (
     ('Personality', 'personality'),
     ('Scenario', 'scenario'),
 )
+
+# Labels as they appear inside the framed block text (the inspector's titles
+# keep their prettier casing).  Framing comes from the context template.
+_SYSTEM_BLOCK_LABELS = {
+    'System Prompt': 'System Prompt',
+    'World Info': 'World Info',
+    'Description': 'Description',
+    'Personality': 'Personality',
+    'Scenario': 'Scenario',
+    'World Info (after character)': 'World Info',
+    'User Persona': 'User persona',
+    'Persistent Attributes': 'Persistent attributes',
+    'Chat Memory': 'Chat memory',
+}
 
 
 def _template_field_refs(template: str) -> set[str]:
@@ -904,10 +1085,12 @@ def character_def_blocks(
     card: CharacterCard,
     user_name: str = 'User',
     custom_macros: dict[str, str] | None = None,
+    context_template: ContextTemplate | None = None,
 ) -> list[tuple[str, str]]:
     """Labelled ``[Description]`` / ``[Personality]`` / ``[Scenario]`` blocks.
 
-    Macro-substituted; empty fields are skipped.  Pure function.
+    Macro-substituted; empty fields are skipped.  Block framing follows the
+    context template.  Pure function.
     """
     blocks: list[tuple[str, str]] = []
     for title, attr in _SYSTEM_BLOCK_TITLES:
@@ -915,7 +1098,10 @@ def character_def_blocks(
         if not raw.strip():
             continue
         body = substitute_macros(raw, user_name, card.name or '', custom_macros)
-        blocks.append((title, f'[{title}]\n{body.strip()}'))
+        blocks.append((title, render_block(
+            context_template, _SYSTEM_BLOCK_LABELS.get(title, title),
+            _as_card_data(body.strip()),
+        )))
     return blocks
 
 
@@ -930,6 +1116,7 @@ def system_prompt_blocks(
     extra_books: Optional[list[CharacterBook]] = None,
     token_fn=None,
     attributes: list[dict] | None = None,
+    context_template: ContextTemplate | None = None,
 ) -> list[tuple[str, str]]:
     """The system-side blocks of a chat request, in SillyTavern order.
 
@@ -945,17 +1132,28 @@ def system_prompt_blocks(
     (``{description}`` etc. in a custom template) is not duplicated.
     ``at_depth`` / Author's-Note-positioned world-info entries are
     message-level injections (see :func:`injections_for_chat`), not system
-    blocks.  Pure function (token counting injectable).
+    blocks.  Block framing follows the *context_template* (labels and
+    separators).  Pure function (token counting injectable).
     """
     if token_fn is None:
         from src.token_counter import count_tokens as token_fn
+
+    def framed(title: str, body: str) -> str:
+        return render_block(context_template, _SYSTEM_BLOCK_LABELS.get(title, title), body)
 
     blocks: list[tuple[str, str]] = []
     main = resolve_system_prompt(
         card, user_name, chat_template=chat_template, custom_macros=custom_macros,
     )
-    if main.strip():
-        blocks.append(('System Prompt', main.strip()))
+    # The untrusted-data rule travels with the request: the card's own text
+    # sits in the *system* message, so the model has to be told explicitly
+    # that the delimited blocks are data and not instructions.  It is always
+    # present - a "Blank" template still gets the card's description, world
+    # info and example dialogue.
+    from src.ai_prompts import CHAT_CARD_DATA_GUARD
+    body = main.strip()
+    body = f'{body}\n\n{CHAT_CARD_DATA_GUARD}' if body else CHAT_CARD_DATA_GUARD
+    blocks.append(('System Prompt', render_main(context_template, body)))
 
     entries = collect_lorebook_entries(
         card, messages, token_fn=token_fn, extra_books=extra_books,
@@ -963,9 +1161,9 @@ def system_prompt_blocks(
     before = [e for e in entries if _entry_position(e) == 'before_char']
     after = [e for e in entries if _entry_position(e) == 'after_char']
     if before:
-        blocks.append(('World Info', _world_info_section(
+        blocks.append(('World Info', framed('World Info', _as_card_data(_world_info_section(
             _substituted_entries(before, user_name, card.name or '', custom_macros),
-        )))
+        )))))
 
     # Structural inlining check: a custom template that references
     # ``{description}`` / ``{personality}`` / ``{scenario}`` already emits the
@@ -983,25 +1181,31 @@ def system_prompt_blocks(
             # The main prompt already inlines this field (custom template).
             continue
         body = substitute_macros(raw, user_name, card.name or '', custom_macros)
-        blocks.append((title, f'[{title}]\n{body.strip()}'))
+        blocks.append((title, framed(title, _as_card_data(body.strip()))))
 
     if after:
-        blocks.append(('World Info (after character)', _world_info_section(
-            _substituted_entries(after, user_name, card.name or '', custom_macros),
+        blocks.append(('World Info (after character)', framed(
+            'World Info (after character)',
+            _as_card_data(_world_info_section(
+                _substituted_entries(after, user_name, card.name or '', custom_macros),
+            )),
         )))
 
     if persona and persona.strip():
-        blocks.append(('User Persona', _persona_block(persona, user_name)))
+        blocks.append(('User Persona', framed(
+            'User Persona', _persona_block(persona, user_name),
+        )))
     attr_block = _attributes_section(attributes)
     if attr_block:
         # Attribute names may carry {{char}} / {{user}} macros (e.g.
         # "{{char}} mood"); resolve them like every other system block.
-        blocks.append(('Persistent Attributes', substitute_macros(
-            attr_block, user_name, card.name or '', custom_macros,
+        blocks.append(('Persistent Attributes', framed(
+            'Persistent Attributes',
+            substitute_macros(attr_block, user_name, card.name or '', custom_macros),
         )))
     mem_block = _memory_section(memories or [])
     if mem_block:
-        blocks.append(('Chat Memory', mem_block))
+        blocks.append(('Chat Memory', framed('Chat Memory', mem_block)))
     return blocks
 
 
@@ -1034,15 +1238,21 @@ def assemble_system(
     extra_books: Optional[list[CharacterBook]] = None,
     token_fn=None,
     attributes: list[dict] | None = None,
+    context_template: ContextTemplate | None = None,
 ) -> str:
-    """The system message text for a chat request (see :func:`system_prompt_blocks`)."""
+    """The system message text for a chat request (see :func:`system_prompt_blocks`).
+
+    Blocks are joined with the context template's block separator.
+    """
     blocks = system_prompt_blocks(
         card, messages,
         user_name=user_name, persona=persona, memories=memories,
         custom_macros=custom_macros, chat_template=chat_template,
         extra_books=extra_books, token_fn=token_fn, attributes=attributes,
+        context_template=context_template,
     )
-    return '\n\n'.join(text for _title, text in blocks)
+    separator = (context_template or default_template()).block_separator or '\n\n'
+    return separator.join(text for _title, text in blocks)
 
 
 # ---- Depth-based prompt injections (Author's Note / world info) ----
@@ -1093,6 +1303,18 @@ def _entry_role(entry: BookEntry) -> str:
     return _ROLE_FROM_INT.get(value, 'system')
 
 
+def _safe_depth(value, default: int) -> int:
+    """A non-negative depth from *value* (falls back to *default*).
+
+    The depth comes from a session file or a lorebook entry, so it can be
+    anything; ``int()`` on a non-numeric value raised in the send path.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def author_note_injection(
     text: str,
     depth: int = 4,
@@ -1107,7 +1329,7 @@ def author_note_injection(
     if role not in ('system', 'user', 'assistant'):
         role = 'system'
     return PromptInjection(
-        depth=max(0, int(depth)),
+        depth=max(0, _safe_depth(depth, 4)),
         role=role,
         content=substitute_macros(
             text.strip(), user_name, char_name, custom_macros,
@@ -1138,7 +1360,7 @@ def injections_for_chat(
         card, messages, token_fn=token_fn, extra_books=extra_books,
     )
     note = author_note or {}
-    an_depth = max(0, int(note.get('depth', 4) or 4))
+    an_depth = max(0, _safe_depth(note.get('depth', 4), 4))
     char_name = card.name if card else ''
 
     top: list[PromptInjection] = []
@@ -1161,7 +1383,7 @@ def injections_for_chat(
                 an_depth, 'system', content, f"{title} — bottom of Author's Note",
             ))
         elif pos == 'at_depth':
-            depth = max(0, int(getattr(e, 'depth', 0) or 0))
+            depth = max(0, _safe_depth(getattr(e, 'depth', 0), 0))
             at_depth.append(PromptInjection(
                 depth, _entry_role(e), content, f'{title} (depth {depth})',
             ))
@@ -1211,6 +1433,7 @@ def build_context_plan(
     jailbreak: str = '',
     template_post_history: str = '',
     attributes: list[dict] | None = None,
+    context_template: ContextTemplate | None = None,
 ) -> ContextPlan:
     """Build the exact context a chat turn will send, section by section.
 
@@ -1221,7 +1444,9 @@ def build_context_plan(
     legacy ``'history'`` turns), the message history with depth injections
     (Author's Note / ``at_depth`` world info) spliced in, the trailing
     post-history instructions, and the user *jailbreak* block after them.
-    Pure function (token counting injectable).
+    *context_template* drives block framing, names behavior, and example
+    rendering exactly as it does on the send path.  Pure function (token
+    counting injectable).
     """
     if token_fn is None:
         from src.token_counter import count_tokens as token_fn
@@ -1233,10 +1458,14 @@ def build_context_plan(
         user_name=user_name, persona=persona, memories=memories,
         custom_macros=custom_macros, chat_template=chat_template,
         extra_books=extra_books, token_fn=token_fn, attributes=attributes,
+        context_template=context_template,
     ):
         sections.append(ContextSection(title, text, token_fn(text)))
 
-    examples_text = example_block_text(card, user_name, custom_macros)
+    examples_text = example_block_text(
+        card, user_name, custom_macros, context_template=context_template,
+    )
+    prefixes = _name_prefixes(context_template, user_name, card.name or '')
     examples_as_turns: list[dict[str, str]] = []
     if example_placement == 'system' and examples_text:
         sections.append(ContextSection(
@@ -1247,8 +1476,9 @@ def build_context_plan(
 
     for i, ex in enumerate(examples_as_turns, 1):
         role = ex.get('role', 'assistant')
+        content = (prefixes or {}).get(role, '') + ex.get('content', '')
         sections.append(ContextSection(
-            f'Example {i} ({role})', ex.get('content', ''), token_fn(ex.get('content', '')),
+            f'Example {i} ({role})', content, token_fn(content),
         ))
 
     injections = injections_for_chat(
@@ -1281,6 +1511,7 @@ def build_context_plan(
             ]
             if text_blocks:
                 counted = '\n\n'.join(text_blocks + ([content] if content else []))
+        counted = (prefixes or {}).get(role, '') + counted
         sections.append(ContextSection(title, counted, token_fn(counted)))
 
     if example_placement == 'post_history' and examples_text:
@@ -1299,11 +1530,13 @@ def build_context_plan(
         ))
     phi = '\n\n'.join(p for p in phi_parts if p)
     if phi:
+        phi = render_post_history(context_template, phi)
         sections.append(ContextSection('Post-History Instructions', phi, token_fn(phi)))
 
     jb = (jailbreak or '').strip()
     if jb:
         jb_text = substitute_macros(jb, user_name, card.name or '', custom_macros)
+        jb_text = render_jailbreak(context_template, jb_text)
         sections.append(ContextSection('Jailbreak', jb_text, token_fn(jb_text)))
 
     return ContextPlan(

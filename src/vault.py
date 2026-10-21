@@ -32,18 +32,34 @@ import json
 import logging
 import os
 import sqlite3
+import struct
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
 from src.app_paths import data_dir
 from src.fs_utils import atomic_write_bytes
+from src import safe_json
 
 logger = logging.getLogger(__name__)
 
 MAGIC = b'STEV\x01'
+#: The current file magic.  A payload with this magic carries a random file
+#: id that is authenticated as additional data, so a sealed file cannot be
+#: swapped for another one.  ``MAGIC`` is the older format, without the id.
+MAGIC_V2 = b'STEV\x02'
+# Magic prefix of a password-encrypted backup blob (Scrypt KEK + AES-256-GCM).
+# Different from MAGIC on purpose: a blob is not a file of the library, and
+# the two are never interchangeable.
+PASSWORD_BLOB_MAGIC = b'STEBKP01'
+#: The current password-blob magic.  It carries the key-derivation
+#: parameters in its header, so the cost can be raised later without
+#: invalidating the backups that were already written.
+PASSWORD_BLOB_MAGIC_V2 = b'STEBKP02'
 NONCE_SIZE = 12
 KEY_SIZE = 32
+#: The random per-file id that binds a sealed payload to itself.
+FILE_ID_SIZE = 16
 
 VAULT_FILENAME = 'vault.json'
 
@@ -53,6 +69,9 @@ _SCRYPT_N = 2 ** 15
 _SCRYPT_R = 8
 _SCRYPT_P = 1
 _SCRYPT_SALT_SIZE = 16
+
+#: The vault envelope is a few hundred bytes; anything larger is not one.
+_MAX_META_BYTES = 64 * 1024
 
 # Recovery keys are 160 bits of entropy shown as base32 groups: 20 bytes
 # encode to 32 base32 characters, displayed as eight groups of four.
@@ -71,8 +90,19 @@ _SCRYPT_P_MAX = 16
 # (n = 2**15, r = 8) while keeping a hostile metadata file bounded.
 _SCRYPT_MEM_MAX = 2 ** 25
 
-_MIGRATION_DIRS = ('library', 'thumbnails', 'sessions', 'lorebooks', 'generated', 'gallery')
+_MIGRATION_DIRS = (
+    'library', 'thumbnails', 'sessions', 'lorebooks', 'generated', 'gallery',
+    # The scheduled backups and the pre-restore snapshot hold the whole
+    # library, so they are part of the "everything under the data dir is
+    # encrypted" invariant too.  Leaving them out meant a plaintext copy of
+    # the library sat in the data dir.
+    'backups', 'snapshots', 'st-explorer-pre-restore',
+)
 _MIGRATION_FILES = ('lorebook_sync_state.json',)
+
+#: Directory name prefixes that are covered as well (the restore staging
+#: area, which lives inside the data dir while a restore runs).
+_MIGRATION_DIR_PREFIXES = ('.st-explorer-restore-',)
 
 
 class VaultError(Exception):
@@ -97,17 +127,23 @@ class VaultAuthError(VaultError):
 
 
 def is_encrypted_blob(blob: bytes) -> bool:
-    """True when *blob* carries the vault file magic."""
-    return blob.startswith(MAGIC)
+    """True when *blob* carries a vault file magic."""
+    return blob.startswith(MAGIC) or blob.startswith(MAGIC_V2)
 
 
 def is_file_encrypted(path: str | Path) -> bool:
-    """True when the file's header carries the vault magic (reads 5 bytes)."""
+    """True when the file's header carries a vault magic (reads 5 bytes)."""
     try:
         with open(path, 'rb') as f:
-            return f.read(len(MAGIC)) == MAGIC
+            head = f.read(len(MAGIC_V2))
+        return head.startswith(MAGIC) or head.startswith(MAGIC_V2)
     except OSError:
         return False
+
+
+def is_password_blob(blob: bytes) -> bool:
+    """True when *blob* carries the password-encrypted backup magic."""
+    return blob.startswith(PASSWORD_BLOB_MAGIC) or blob.startswith(PASSWORD_BLOB_MAGIC_V2)
 
 
 def _b64e(raw: bytes) -> str:
@@ -118,15 +154,18 @@ def _b64d(text: str) -> bytes:
     return base64.b64decode(text.encode('ascii'))
 
 
-def _seal_raw(key: bytes, plaintext: bytes) -> bytes:
-    """Nonce + AES-256-GCM ciphertext (tag included by AESGCM)."""
+def _seal_raw(key: bytes, plaintext: bytes, aad: bytes | None = None) -> bytes:
+    """Nonce + AES-256-GCM ciphertext (tag included by AESGCM).
+
+    *aad* is authenticated but not encrypted.
+    """
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     nonce = os.urandom(NONCE_SIZE)
-    return nonce + AESGCM(key).encrypt(nonce, plaintext, None)
+    return nonce + AESGCM(key).encrypt(nonce, plaintext, aad)
 
 
-def _open_raw(key: bytes, blob: bytes) -> bytes:
+def _open_raw(key: bytes, blob: bytes, aad: bytes | None = None) -> bytes:
     from cryptography.exceptions import InvalidTag
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -134,8 +173,16 @@ def _open_raw(key: bytes, blob: bytes) -> bytes:
         raise VaultError('Encrypted payload is truncated.')
     nonce, ciphertext = blob[:NONCE_SIZE], blob[NONCE_SIZE:]
     try:
-        return AESGCM(key).decrypt(nonce, ciphertext, None)
+        return AESGCM(key).decrypt(nonce, ciphertext, aad)
     except InvalidTag as exc:
+        if aad is not None:
+            # A payload sealed before the file id was introduced carries no
+            # AAD.  Try that form before giving up, so an existing vault
+            # still opens.
+            try:
+                return AESGCM(key).decrypt(nonce, ciphertext, None)
+            except InvalidTag:
+                pass
         raise VaultError('Encrypted payload cannot be decrypted.') from exc
 
 
@@ -144,6 +191,58 @@ def _derive_kek(secret: str, salt: bytes, n: int, r: int, p: int) -> bytes:
 
     kdf = Scrypt(salt=salt, length=KEY_SIZE, n=n, r=r, p=p)
     return kdf.derive(secret.encode('utf-8'))
+
+
+# -- password-derived keys (exported backups) -----------------------------
+
+def encrypt_with_password(data: bytes, password: str) -> bytes:
+    """Seal *data* under a key derived from *password*.
+
+    The blob is self-describing - magic + version + KDF parameters + salt +
+    nonce + ciphertext - so the reader needs nothing but the password, and
+    the cost of the key derivation can be raised later without invalidating
+    the backups that were already written.  This is used for backups that
+    have to be stored outside the vault (an encrypted export on a USB stick,
+    a copy in a cloud folder): the master key of the vault is not involved.
+    """
+    if not password:
+        raise VaultError('Password must not be empty.')
+    salt = os.urandom(_SCRYPT_SALT_SIZE)
+    kek = _derive_kek(password, salt, _SCRYPT_N, _SCRYPT_R, _SCRYPT_P)
+    header = (
+        PASSWORD_BLOB_MAGIC_V2
+        + struct.pack('>III', _SCRYPT_N, _SCRYPT_R, _SCRYPT_P)
+    )
+    return header + salt + _seal_raw(kek, data)
+
+
+def decrypt_with_password(blob: bytes, password: str) -> bytes:
+    """Open a blob produced by :func:`encrypt_with_password`."""
+    if not is_password_blob(blob):
+        raise VaultError('This is not a password-encrypted backup.')
+    if not password:
+        raise VaultError('Password must not be empty.')
+    if blob.startswith(PASSWORD_BLOB_MAGIC_V2):
+        head = len(PASSWORD_BLOB_MAGIC_V2)
+        if len(blob) < head + 12 + _SCRYPT_SALT_SIZE + NONCE_SIZE + 16:
+            raise VaultError('Encrypted payload is truncated.')
+        n, r, p = struct.unpack('>III', blob[head:head + 12])
+        if not (_SCRYPT_N_MIN <= n <= _SCRYPT_N_MAX) \
+                or not (1 <= r <= _SCRYPT_R_MAX) \
+                or not (1 <= p <= _SCRYPT_P_MAX) \
+                or 128 * n * r > _SCRYPT_MEM_MAX:
+            raise VaultError('The backup asks for implausible key-derivation '
+                             'parameters and cannot be opened.')
+        salt = blob[head + 12:head + 12 + _SCRYPT_SALT_SIZE]
+        kek = _derive_kek(password, salt, n, r, p)
+        return _open_raw(kek, blob[head + 12 + _SCRYPT_SALT_SIZE:])
+    # The older format: the parameters were fixed in the code.
+    body = blob[len(PASSWORD_BLOB_MAGIC):]
+    if len(body) < _SCRYPT_SALT_SIZE + NONCE_SIZE + 16:
+        raise VaultError('Encrypted payload is truncated.')
+    salt = body[:_SCRYPT_SALT_SIZE]
+    kek = _derive_kek(password, salt, _SCRYPT_N, _SCRYPT_R, _SCRYPT_P)
+    return _open_raw(kek, body[_SCRYPT_SALT_SIZE:])
 
 
 def generate_recovery_key() -> str:
@@ -158,16 +257,54 @@ def normalize_recovery_key(key: str) -> str:
     return ''.join(ch for ch in (key or '') if ch.isalnum()).upper()
 
 
+#: The shortest password the vault accepts.  The key is derived from the
+#: password with scrypt, but a one-character password is still trivially
+#: brute-forced, so the policy sets a floor.
+MIN_PASSWORD_LENGTH = 8
+
+
+def check_password_policy(password: str) -> Optional[str]:
+    """Return the reason *password* is unacceptable, or ``None``.
+
+    The vault holds the whole library, and the password is the only thing
+    standing between an attacker and it, so a floor on its length is
+    enforced rather than merely suggested.
+    """
+    if not password:
+        return 'The password must not be empty.'
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return (
+            f'The password must be at least {MIN_PASSWORD_LENGTH} characters '
+            f'long.'
+        )
+    return None
+
+
 def encrypt_blob(data: bytes, key: bytes) -> bytes:
-    """Seal *data* under *key* with the file magic prefix."""
-    return MAGIC + _seal_raw(key, data)
+    """Seal *data* under *key* with the file magic prefix.
+
+    Each sealed payload carries a random *file id*, which is fed to AES-GCM
+    as additional authenticated data.  The id travels with the file, so the
+    file can be renamed or moved freely - but a sealed file cannot be
+    swapped for a different one: the id in the header would not match the
+    content, and the tag check fails.
+    """
+    file_id = os.urandom(FILE_ID_SIZE)
+    return MAGIC_V2 + file_id + _seal_raw(key, data, file_id)
 
 
 def decrypt_blob(blob: bytes, key: bytes) -> bytes:
     """Open a sealed blob; plaintext input passes through unchanged."""
-    if not is_encrypted_blob(blob):
-        return blob
-    return _open_raw(key, blob[len(MAGIC):])
+    if blob.startswith(MAGIC_V2):
+        head = len(MAGIC_V2)
+        file_id = blob[head:head + FILE_ID_SIZE]
+        if len(file_id) != FILE_ID_SIZE:
+            raise VaultError('Encrypted payload is truncated.')
+        return _open_raw(key, blob[head + FILE_ID_SIZE:], file_id)
+    if is_encrypted_blob(blob):
+        # A payload sealed before the file id was introduced.
+        return _open_raw(key, blob[len(MAGIC):])
+    return blob
 
 
 class Vault:
@@ -209,14 +346,35 @@ class Vault:
         return bool(meta and meta.get('recovery'))
 
     def lock(self) -> None:
-        """Drop the in-memory key."""
+        """Drop the in-memory key.
+
+        The key bytes are overwritten before the reference is dropped, so
+        they are not left lying around in the heap for the rest of the
+        process' life.
+        """
+        key = self._key
         self._key = None
+        if key:
+            try:
+                mutable = bytearray(key)
+                for index in range(len(mutable)):
+                    mutable[index] = 0
+            except Exception:
+                logger.debug('The vault key could not be zeroized', exc_info=True)
 
     # -- envelope ---------------------------------------------------------
 
     def _load_meta(self, required: bool = True) -> Optional[dict]:
         path = self.meta_path
         try:
+            # The metadata is read in full, so its size is capped: a huge
+            # (or hostile) file would be loaded into memory before it could
+            # be rejected.
+            size = path.stat().st_size
+            if size > _MAX_META_BYTES:
+                raise VaultError(
+                    f'Vault metadata {path} is too large to be valid.'
+                )
             raw = path.read_bytes()
         except OSError:
             if required:
@@ -225,8 +383,8 @@ class Vault:
                 ) from None
             return None
         try:
-            meta = json.loads(raw.decode('utf-8'))
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            meta = safe_json.loads_safe(raw.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
             raise VaultError(f'Vault metadata {path} is corrupt: {exc}') from exc
         if not isinstance(meta, dict):
             raise VaultError(f'Vault metadata {path} is corrupt.')
@@ -267,7 +425,13 @@ class Vault:
                 # is fine, the metadata is not.
                 raise ValueError('kdf parameters out of range')
             kek = _derive_kek(secret, salt, n, r, p)
-            return _open_raw(kek, _b64d(slot['wrapped_mek']))
+            wrapped = _b64d(slot['wrapped_mek'])
+            if len(wrapped) < NONCE_SIZE + 16:
+                # A truncated payload is corrupt metadata, not a wrong
+                # password: reporting it as the latter tells the user to
+                # keep typing a password that is perfectly fine.
+                raise ValueError('the wrapped key is truncated')
+            return _open_raw(kek, wrapped)
         except VaultError as exc:
             raise VaultAuthError('Incorrect password or recovery key.') from exc
         except (KeyError, TypeError, ValueError) as exc:
@@ -306,10 +470,16 @@ class Vault:
         """
         if self.enabled:
             raise VaultError('Encryption is already enabled.')
-        if not password:
-            raise VaultError('Password must not be empty.')
+        problem = check_password_policy(password)
+        if problem:
+            raise VaultError(problem)
         mek = os.urandom(KEY_SIZE)
         meta, recovery_key = self._build_meta(mek, password, with_recovery)
+        # The envelope is written *before* the files are sealed, so a crash
+        # in between would leave the vault enabled with half the library in
+        # plaintext and no marker that the migration is unfinished.  The
+        # flag is cleared by the seal pass (and re-checked at startup).
+        meta['migration_pending'] = True
         self._save_meta(meta)
         self._key = mek
         logger.info('Vault enabled (recovery key: %s)', 'yes' if recovery_key else 'no')
@@ -368,8 +538,9 @@ class Vault:
 
     def change_password(self, old_password: str, new_password: str) -> None:
         """Re-wrap the MEK under a new password (instant; no file re-encryption)."""
-        if not new_password:
-            raise VaultError('Password must not be empty.')
+        problem = check_password_policy(new_password)
+        if problem:
+            raise VaultError(problem)
         meta = self._load_meta()
         try:
             mek = self._unwrap_slot(self._password_slot(meta), old_password)
@@ -402,7 +573,7 @@ class Vault:
         if self._key is None:
             raise VaultLocked('Encountered encrypted data while the vault is locked.')
         try:
-            return _open_raw(self._key, blob[len(MAGIC):])
+            return decrypt_blob(blob, self._key)
         except VaultError as exc:
             raise VaultError('Encrypted data cannot be decrypted with the current key.') from exc
 
@@ -471,19 +642,51 @@ def write_plain_bytes(path: str | Path, data: bytes) -> None:
     atomic_write_bytes(Path(path), data)
 
 
+def write_sealed_if_active(path: str | Path, data: bytes) -> bool:
+    """Write *data* to *path*, sealing it when the vault is enabled+unlocked.
+
+    Unlike :func:`write_bytes` the decision is based on the vault *state*
+    rather than on the path being under the vault root: callers that stage
+    files in a directory of their own choosing (restore staging, database
+    snapshots) must still get an encrypted file.  Returns True when the data
+    was sealed.
+
+    Like :func:`write_bytes` this fails safe: with the vault enabled but
+    locked it raises :class:`VaultLocked` instead of dropping a plaintext
+    copy onto disk.
+    """
+    v = get_vault()
+    target = Path(path)
+    if not v.enabled:
+        atomic_write_bytes(target, data)
+        return False
+    if not v.unlocked:
+        raise VaultLocked('The vault is locked.')
+    atomic_write_bytes(target, v.encrypt(data))
+    return True
+
+
 def write_sealed_bytes(path: str | Path, data: bytes) -> None:
     """Write *data* encrypted regardless of policy (the seal pass)."""
     atomic_write_bytes(Path(path), get_vault().encrypt(data))
 
 
 def open_image(path: str | Path):
-    """Return a fully loaded PIL image for a data file (decrypted as needed)."""
-    from PIL import Image
+    """Return a fully loaded PIL image for a data file (decrypted as needed).
+
+    The pixel count is checked *before* the image is decoded: a small file can
+    expand into hundreds of megabytes of RAM (a 10 000 x 10 000 PNG is 380 KiB
+    on disk and 381 MiB decoded).
+    """
+    from src import image_safety
 
     data = read_bytes(path)
-    img = Image.open(io.BytesIO(data))
-    img.load()
-    return img
+    img = image_safety.open_checked(io.BytesIO(data))
+    try:
+        return image_safety.load_checked(img)
+    except Exception:
+        img.close()
+        raise
 
 
 def import_external(src: str | Path, dst: str | Path) -> None:
@@ -593,8 +796,16 @@ def iter_data_files(root: Optional[Path] = None) -> Iterator[Path]:
     envelope/keys/log/lock files that live directly in the root.
     """
     base = Path(root) if root is not None else get_vault().root
-    for name in _MIGRATION_DIRS:
-        directory = base / name
+    directories = [base / name for name in _MIGRATION_DIRS]
+    # The restore staging area is created with a random suffix, so it is
+    # found by prefix.
+    try:
+        for entry in base.iterdir():
+            if entry.is_dir() and entry.name.startswith(_MIGRATION_DIR_PREFIXES):
+                directories.append(entry)
+    except OSError:
+        pass
+    for directory in directories:
         if directory.is_dir():
             for path in sorted(directory.rglob('*')):
                 if path.is_file() and not path.name.endswith('.tmp'):
@@ -632,7 +843,11 @@ def seal_all_files(
     cancelled: Optional[Callable[[], bool]] = None,
 ) -> tuple[int, int]:
     """Seal every unencrypted data file; returns ``(changed, failed)``."""
-    return _transform_all_files(seal_file, root, progress, cancelled)
+    _check_seal_root(root)
+    changed, failed = _transform_all_files(seal_file, root, progress, cancelled)
+    if failed == 0:
+        _clear_migration_flag()
+    return changed, failed
 
 
 def unseal_all_files(
@@ -641,7 +856,63 @@ def unseal_all_files(
     cancelled: Optional[Callable[[], bool]] = None,
 ) -> tuple[int, int]:
     """Decrypt every sealed data file; returns ``(changed, failed)``."""
+    _check_seal_root(root)
     return _transform_all_files(unseal_file, root, progress, cancelled)
+
+
+def _check_seal_root(root: Optional[Path]) -> None:
+    """Warn when a directory other than the vault's own root is sealed.
+
+    The vault's key belongs to one data directory.  Sealing (or unsealing)
+    a *different* directory with it would write files the other library
+    could never open.  The call sites use the vault's own root, so this is
+    a guard rail rather than an error: a restore into a directory that is
+    not the vault root is a legitimate (if unusual) setup.
+    """
+    if root is None:
+        return
+    base = Path(root)
+    try:
+        expected = get_vault().root.resolve()
+        actual = base.resolve()
+    except OSError:
+        return
+    if os.path.normcase(str(actual)) != os.path.normcase(str(expected)):
+        logger.warning(
+            'Sealing a directory that is not the vault root (%s != %s); the '
+            'files will only be readable with this vault.',
+            actual, expected,
+        )
+
+
+def migration_pending() -> bool:
+    """True when a vault was enabled but the sealing pass never finished.
+
+    The envelope is written before the files are sealed, so a crash (or a
+    cancelled migration) in between leaves the library half in plaintext.
+    The flag makes that state visible instead of silent.
+    """
+    try:
+        meta = get_vault()._load_meta(required=False)
+    except VaultError:
+        return False
+    return bool(meta and meta.get('migration_pending'))
+
+
+def _clear_migration_flag() -> None:
+    """Record that the sealing pass finished."""
+    vault = get_vault()
+    try:
+        meta = vault._load_meta(required=False)
+    except VaultError:
+        return
+    if not meta or not meta.get('migration_pending'):
+        return
+    meta['migration_pending'] = False
+    try:
+        vault._save_meta(meta)
+    except OSError:
+        logger.warning('Could not clear the vault migration flag', exc_info=True)
 
 
 def _transform_all_files(

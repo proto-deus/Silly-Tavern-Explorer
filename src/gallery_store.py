@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -76,10 +77,18 @@ def content_hash(data: bytes) -> str:
 
 
 def sanitize_image_filename(name: str) -> str:
-    """Sanitize a source filename for storage in a gallery folder."""
+    """Sanitize a source filename for storage in a gallery folder.
+
+    The trailing dots/spaces are stripped *after* the truncation: Windows
+    silently drops them when creating the file, so a name truncated to end in
+    ``.`` would be stored in the database under a name that does not exist on
+    disk (and a second import would overwrite the first image).
+    """
     cleaned = re.sub(r'[<>:"/\\|?*]', '_', name or '')
     cleaned = cleaned.strip('. ')
     cleaned = cleaned[:100]
+    # Strip again: the truncation may have exposed a trailing dot or space.
+    cleaned = cleaned.strip('. ')
     return cleaned or 'image.png'
 
 
@@ -147,34 +156,42 @@ def delete_gallery_dir(char_id: int) -> None:
         logger.warning("Could not delete gallery folder %s: %s", directory, e)
 
 
-def migrate_gallery_files(old_id: int, new_id: int) -> None:
+def migrate_gallery_files(old_id: int, new_id: int) -> dict[str, str]:
     """Move ``gallery/<old_id>/`` to ``gallery/<new_id>/``.
 
     Mirrors ``migrate_chat_sessions``: when a card is superseded during
     sync and re-imported under a new row id, its gallery belongs to the
     character and must follow it.
+
+    Returns the renames as ``{old_name: new_name}``: a file whose name
+    collided with one already in the target folder is renamed on disk, and
+    the gallery row that points at it has to be updated as well - otherwise
+    the row shows the *other* card's image.
     """
     if old_id == new_id:
-        return
+        return {}
     base = _base_data_dir() / 'gallery'
     old_dir = base / str(old_id)
     new_dir = base / str(new_id)
     if not old_dir.is_dir():
-        return
+        return {}
     try:
         if not new_dir.exists():
             new_dir.parent.mkdir(parents=True, exist_ok=True)
             old_dir.rename(new_dir)
-            return
+            return {}
         from src.fs_utils import move_contents_into
-        notes = move_contents_into(old_dir, new_dir)
+        renames = move_contents_into(old_dir, new_dir)
         import shutil
         shutil.rmtree(old_dir, ignore_errors=True)
-        for note in notes:
-            logger.warning("Gallery file %s during merge %s -> %s",
-                           note, old_dir, new_dir)
+        mapping = {old_name: new_name for old_name, new_name in renames}
+        for old_name, new_name in mapping.items():
+            logger.warning("Gallery file '%s' was merged as '%s' during the move %s -> %s",
+                           old_name, new_name, old_dir, new_dir)
+        return mapping
     except OSError as e:
         logger.warning("Could not migrate gallery files from %s to %s: %s", old_dir, new_dir, e)
+        return {}
 
 
 def export_gallery_file(char_id: int, file_name: str, dest_path: str | Path) -> bool:
@@ -348,6 +365,24 @@ def asset_description(entry: dict) -> str:
     return f'{kind} — {label}' if label else kind
 
 
+def _within(base: Path, target: Path) -> bool:
+    """True when *target* resolves to a path inside *base*.
+
+    Used to keep a card-controlled relative path from escaping the folder it
+    is supposed to live in.  ``Path.resolve()`` collapses ``..`` and makes
+    absolute paths absolute, so both traversal and an injected drive letter
+    are caught.
+    """
+    try:
+        root = base.resolve()
+        resolved = target.resolve()
+    except OSError:
+        return False
+    if resolved == root:
+        return True
+    return str(resolved).startswith(str(root) + os.sep)
+
+
 def resolve_asset_path(
     entry: dict,
     card_dir: str | Path,
@@ -360,6 +395,11 @@ def resolve_asset_path(
     directory part) next to the card, then the named file inside the
     character's ST user-images folder.  Returns None when nothing matches -
     the caller shows a placeholder rather than guessing further.
+
+    The ``uri`` and ``name`` come from the imported card, so they are
+    untrusted: every candidate is checked to stay inside the folder it is
+    supposed to be in.  Without that check a card could point at
+    ``C:/Windows/win.ini`` and the gallery would happily display it.
     """
     if not isinstance(entry, dict):
         return None
@@ -368,22 +408,28 @@ def resolve_asset_path(
     ext = str(entry.get('ext') or '').lstrip('.')
     base = Path(card_dir)
 
-    candidates: list[Path] = []
+    candidates: list[tuple[Path, Path]] = []   # (candidate, folder it must stay in)
     if uri and uri != 'ccdefault':
         rel = Path(uri)
-        candidates.append(base / rel)
+        candidates.append((base / rel, base))
         if len(rel.parts) == 1:
-            candidates.append(base / 'assets' / rel)
+            candidates.append((base / 'assets' / rel, base))
     if name:
         file_name = f'{name}.{ext}' if ext else name
         if user_images_dir and char_stem:
             folder = expression_images_dir(user_images_dir, char_stem)
             if folder is not None:
-                candidates.append(folder / file_name)
-        candidates.append(base / file_name)
-        candidates.append(base / 'assets' / file_name)
+                candidates.append((folder / file_name, folder))
+        candidates.append((base / file_name, base))
+        candidates.append((base / 'assets' / file_name, base))
 
-    for candidate in candidates:
+    for candidate, allowed_root in candidates:
+        # Untrusted input: the candidate must stay inside its folder.
+        if not _within(allowed_root, candidate):
+            logger.warning(
+                "Refusing to resolve a V3 asset outside %s: %s", allowed_root, candidate
+            )
+            continue
         try:
             if candidate.is_file():
                 return candidate

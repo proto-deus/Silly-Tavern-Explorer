@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
@@ -64,6 +65,16 @@ def _fs_key(name: str) -> str:
     return (name or '').casefold()
 
 
+def _match_existing_filename(existing: set[str], key: str) -> Optional[str]:
+    """Return the existing filename whose case-folded form is *key*.
+
+    Deterministic: when several files differ only in case (possible on a
+    case-sensitive volume) the lexicographically first one wins.
+    """
+    matches = sorted(f for f in existing if _fs_key(f) == key)
+    return matches[0] if matches else None
+
+
 def resolve_st_filename(
     base_name: str,
     existing: set[str],
@@ -73,11 +84,16 @@ def resolve_st_filename(
 
     If *linked_name* is given (the card is already linked to a specific ST
     file), reuse it so pushes overwrite the same file - but only when nothing
-    else in the directory claims that name; otherwise the link is stale (a
-    case-only rename, or the file was replaced) and reusing it would clobber
-    that card.  Otherwise, if *base_name* collides with an *existing*
-    filename, append ``_1``, ``_2``, ... suffixes until unique, matching ST's
-    ``getPngName`` behavior.
+    else in the directory claims that name; otherwise the link is stale (the
+    file was replaced) and reusing it would clobber that card.  A *case-only*
+    difference is not a different file: the card was renamed on the ST side
+    (or the link was stored with a different case), so the file that is
+    really on disk is reused - spelled the way it is spelled there - and the
+    push updates it instead of creating a second copy next to it.
+
+    Otherwise, if *base_name* collides with an *existing* filename, append
+    ``_1``, ``_2``, ... suffixes until unique, matching ST's ``getPngName``
+    behavior.
     """
     existing_norm = {_fs_key(f) for f in existing}
     if linked_name:
@@ -94,10 +110,26 @@ def resolve_st_filename(
         elif base_link != linked_name:
             linked_name = sanitize_st_filename(base_link) or None
     if linked_name:
-        # The link names the file this card owns. Reuse it unless a
-        # *different* existing file would be overwritten.
-        if _fs_key(linked_name) not in existing_norm or linked_name in existing:
+        # The link names the file this card owns.
+        if linked_name in existing:
+            # Exact match: the file the link names is really there.
             return linked_name
+        link_key = _fs_key(linked_name)
+        if link_key not in existing_norm:
+            # Nothing in the directory claims that name: the link is free.
+            return linked_name
+        # A case-only difference is the *same* file (the pairing in
+        # ``compare_libraries`` folds case too). Reuse the file that is
+        # really on disk, with its own spelling: resolving a fresh name
+        # here left the original orphaned in SillyTavern and the next
+        # "pull all" imported it as a second Explorer card.
+        actual = _match_existing_filename(existing, link_key)
+        if actual is not None:
+            logger.info(
+                "ST link '%s' matches the existing file '%s' case-insensitively; "
+                "reusing it", linked_name, actual,
+            )
+            return actual
         logger.info(
             "ST link '%s' collides with an existing file; resolving a unique name",
             linked_name,
@@ -785,6 +817,13 @@ def pull_card_from_st(st_entry: StCardEntry, db) -> PullResult:
             existing = _find_by_st_avatar_url_nocase(db, st_entry.filename)
         if existing:
             char_id = existing['id']
+            # The Explorer-local favourite flag is not part of the card
+            # data the ST file carries: ``update_card`` would write the
+            # ST card's own flag (``int(card.fav)``, usually False) over
+            # the local one and silently un-favourite the card on every
+            # pull. Keep the local value, exactly like the rating, the
+            # private notes and the collections below.
+            card.fav = bool(existing.get('is_favorite'))
             source = existing.get('source_path', '')
             if source and Path(source).suffix.lower() == '.png' and Path(source).exists():
                 # Atomic vault-aware copy: never leaves a truncated PNG at the
@@ -807,6 +846,8 @@ def pull_card_from_st(st_entry: StCardEntry, db) -> PullResult:
                         db.set_rating(new_id, int(existing['rating']))
                     if existing.get('user_notes'):
                         db.set_user_notes(new_id, str(existing['user_notes']))
+                    if existing.get('is_favorite'):
+                        db.set_favorite(new_id, True)
                     collection_ids = db.get_card_collection_ids(char_id)
                     if collection_ids:
                         db.set_card_collections(new_id, collection_ids)
@@ -832,7 +873,14 @@ def pull_card_from_st(st_entry: StCardEntry, db) -> PullResult:
                     if migrate_rows is not None:
                         migrate_rows(char_id, new_id)
                     from src import gallery_store
-                    gallery_store.migrate_gallery_files(char_id, new_id)
+                    renames = gallery_store.migrate_gallery_files(char_id, new_id)
+                    # A file whose name collided was renamed on disk: the
+                    # row that points at it has to follow, or the card
+                    # would show the other card's image.
+                    if renames:
+                        rename_rows = getattr(db, 'rename_gallery_files', None)
+                        if rename_rows is not None:
+                            rename_rows(new_id, renames)
                 except Exception:
                     logger.warning(
                         "Could not migrate gallery images from superseded card %s", char_id,
@@ -869,11 +917,26 @@ def _find_by_st_avatar_url_nocase(db, filename: str):
     otherwise classify as a pull with no matching link.  ``_fs_key`` is used
     rather than ``os.path.normcase`` so this also works on macOS, whose default
     volume is case-insensitive.
+
+    Only the *linked* cards are looked at: loading the whole library for
+    every pulled card made a "pull all" quadratic.
     """
+    rows = None
     try:
-        rows = db.get_all()
+        with db._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = [
+                dict(row) for row in conn.execute(
+                    'SELECT * FROM characters WHERE st_avatar_url IS NOT NULL'
+                ).fetchall()
+            ]
     except AttributeError:
-        return None
+        rows = None
+    if rows is None:
+        try:
+            rows = db.get_all(light=True)
+        except AttributeError:
+            return None
     wanted = _fs_key(filename)
     for row in rows:
         url = row.get('st_avatar_url')
@@ -890,6 +953,23 @@ def link_pair(pair: SyncPair, db) -> bool:
     if pair.explorer.current_hash == pair.st.card_hash:
         db.mark_st_synced(pair.explorer.char_id, pair.st.card_hash)
     return True
+
+
+def notify_sync_completed(summary: SyncSummary) -> None:
+    """Announce a finished sync run to the plugin/event bus.
+
+    The event module is imported lazily - it is an optional cross-cutting
+    module and must not be pulled in at start-up - and every error is
+    swallowed: a failing user plugin must never break the sync.
+
+    Args:
+        summary: The :class:`SyncSummary` of the finished run.
+    """
+    try:
+        from src import app_events
+        app_events.sync_completed(summary)
+    except Exception:
+        logger.exception("Could not announce the finished sync")
 
 
 def _explorer_changed_since(entry: ExplorerSyncEntry) -> str:
@@ -1089,6 +1169,7 @@ def bulk_sync(
             except Exception as e:
                 summary.errors.append(f"{pair.st.filename}: delete failed: {e}")
 
+    notify_sync_completed(summary)
     return summary
 
 

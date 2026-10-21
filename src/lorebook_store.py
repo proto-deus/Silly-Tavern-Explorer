@@ -24,6 +24,7 @@ from typing import Any
 
 from src.card_models import BookEntry, CharacterBook
 from src import vault
+from src import safe_json
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +41,28 @@ def get_lorebooks_dir() -> Path:
     return d
 
 
+#: The fields an entry owns.  A book's ``extensions`` dict may not
+#: overwrite them: the data is third-party (a downloaded card), and an
+#: extension named ``content`` would replace the entry's text.
+_RESERVED_ENTRY_FIELDS = frozenset({
+    'content', 'key', 'keys', 'keysecondary', 'comment', 'name', 'position',
+    'depth', 'order', 'disable', 'uid', 'role', 'enabled', 'case_sensitive',
+    'match_whole_words', 'insert_order', 'insertion_order',
+})
+
+
 def sanitize_book_filename(name: str) -> str:
+    """A file-system safe name for a lorebook.
+
+    The trailing dot and space are stripped *after* the truncation: Windows
+    drops them from the file name it creates, so a book called
+    ``aaa...`` would be stored under a different name than the one recorded
+    and would vanish from the listing.
+    """
     name = re.sub(r'[<>:"/\\|?*]', '_', name or '')
     name = name.strip('. ')
-    return name[:80] if name else 'untitled'
+    name = name[:80].strip('. ') if name else ''
+    return name or 'untitled'
 
 
 def unique_filename(name: str) -> str:
@@ -68,10 +87,10 @@ def list_lorebooks() -> list[dict]:
     directory = get_lorebooks_dir()
     for path in sorted(directory.glob('*.json'), key=lambda p: p.name.lower()):
         try:
-            raw = json.loads(vault.read_text(path))
+            raw = safe_json.loads_safe(vault.read_text(path))
             book = parse_book_json(raw)
         except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError,
-                TypeError, vault.VaultError) as exc:
+                OverflowError, TypeError, vault.VaultError) as exc:
             logger.warning("Skipping unreadable lorebook %s: %s", path.name, exc)
             continue
         result.append({
@@ -91,10 +110,10 @@ def load_lorebook(filename: str) -> CharacterBook | None:
     if not path.exists():
         return None
     try:
-        raw = json.loads(vault.read_text(path))
+        raw = safe_json.loads_safe(vault.read_text(path))
         return parse_book_json(raw)
     except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError,
-            TypeError, vault.VaultError) as exc:
+            OverflowError, TypeError, vault.VaultError) as exc:
         logger.warning("Failed to load lorebook %s: %s", filename, exc)
         return None
 
@@ -418,6 +437,11 @@ def book_to_st_world_info(book: CharacterBook) -> dict:
             'group': '',
         }
         ext.pop('role', None)
+        # The extension fields must not overwrite the entry's own data: a
+        # card-controlled ``extensions`` dict carrying ``content`` or ``key``
+        # would silently replace the entry's text.
+        for reserved in _RESERVED_ENTRY_FIELDS:
+            ext.pop(reserved, None)
         out.update(ext)
         entries_out[str(uid)] = out
     data: dict = dict(book.extra_data)
@@ -541,7 +565,7 @@ def strip_code_fences(text: str) -> str:
 def _extract_json_object_or_array(text: str):
     cleaned = strip_code_fences(text)
     try:
-        obj = json.loads(cleaned)
+        obj = safe_json.loads_safe(cleaned)
         if isinstance(obj, (dict, list)):
             return obj
     except (json.JSONDecodeError, ValueError):
@@ -549,7 +573,7 @@ def _extract_json_object_or_array(text: str):
     match = re.search(r'[\{[].*[\}\]]', cleaned, re.DOTALL)
     if match:
         try:
-            obj = json.loads(match.group())
+            obj = safe_json.loads_safe(match.group())
             if isinstance(obj, (dict, list)):
                 return obj
         except (json.JSONDecodeError, ValueError):

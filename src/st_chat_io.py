@@ -1,8 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime
+from src import safe_json
+
+logger = logging.getLogger(__name__)
+
+#: Limits for an imported ``.jsonl`` chat.  The file is untrusted input.
+MAX_IMPORT_MESSAGES = 20000
+MAX_LINE_CHARS = 4 * 1024 * 1024
+MAX_MESSAGE_CHARS = 1024 * 1024
 
 # SillyTavern stamps send_date as ``YYYY-MM-DD @HHhMMm SSs MMMms``.
 _SEND_DATE_RE = re.compile(
@@ -85,9 +94,13 @@ def export_st_chat(
             continue
         role = m.get('role', 'user')
         is_user = role == 'user'
+        # A system message is not a character turn: SillyTavern marks it
+        # with ``is_system``, and writing it as an assistant turn would put
+        # the app's own prompt into the character's mouth.
+        is_system = role == 'system'
         entry: dict = {
             'is_user': is_user,
-            'is_system': False,
+            'is_system': is_system,
             'name': user_name if is_user else char_name,
             'send_date': _st_send_date(m.get('ts')),
             'mes': str(m.get('content', '') or ''),
@@ -110,15 +123,28 @@ def import_st_chat(text: str) -> list[dict]:
     the ``user`` / ``assistant`` role and multi-swipe messages keep their
     alternates in ``variants``.  Malformed lines are skipped rather than
     aborting the import.  Pure function.
+
+    The number of messages and the size of a single message are capped: the
+    file is untrusted input, and a chat with a million lines (or one with a
+    100 MB line) would otherwise be loaded into memory in full.
     """
     messages: list[dict] = []
     for line in (text or '').splitlines():
+        if len(messages) >= MAX_IMPORT_MESSAGES:
+            logger.warning(
+                "The chat file has more than %d messages; the rest was skipped.",
+                MAX_IMPORT_MESSAGES,
+            )
+            break
         line = line.strip()
         if not line:
             continue
+        if len(line) > MAX_LINE_CHARS:
+            logger.warning("A chat line is too long; it was skipped.")
+            continue
         try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
+            obj = safe_json.loads_safe(line)
+        except (json.JSONDecodeError, ValueError):
             continue
         if not isinstance(obj, dict):
             continue
@@ -132,7 +158,7 @@ def import_st_chat(text: str) -> list[dict]:
             continue
         msg: dict = {
             'role': 'user' if obj.get('is_user') else 'assistant',
-            'content': str(content or ''),
+            'content': str(content or '')[:MAX_MESSAGE_CHARS],
             'ts': _parse_send_date(obj.get('send_date')),
         }
         swipes = obj.get('swipes')

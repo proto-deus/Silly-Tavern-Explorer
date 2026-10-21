@@ -20,6 +20,7 @@ from pathlib import Path
 
 from src import vault
 from src.app_paths import data_dir
+from src import safe_json
 
 logger = logging.getLogger(__name__)
 
@@ -295,8 +296,8 @@ class SpellChecker:
             logger.warning('Failed to read %s: %s', path, exc)
             return
         try:
-            data = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            data = safe_json.loads_safe(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
             logger.warning('Corrupted spell-check word lists in %s: %s', path, exc)
             return
         if not isinstance(data, dict):

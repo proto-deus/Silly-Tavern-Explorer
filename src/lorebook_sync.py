@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -28,6 +29,7 @@ from src import vault
 from src.fs_utils import atomic_write_bytes
 from src import lorebook_store
 from src.sillytavern_sync import SyncAction, SyncSummary
+from src import safe_json
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +128,9 @@ def load_sync_state() -> dict[str, dict[str, str]]:
     """Load the baseline state: ``{_fs_key(filename): {'explorer': h, 'st': h}}``."""
     path = _state_path()
     try:
-        raw = json.loads(vault.read_text(path))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError, vault.VaultError):
+        raw = safe_json.loads_safe(vault.read_text(path))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError,
+            vault.VaultError):
         return {}
     if not isinstance(raw, dict):
         return {}
@@ -219,8 +222,9 @@ def _entry_from_file(path: Path) -> LorebookFileEntry | None:
         # the library is encrypted at rest.
         raw_bytes = vault.read_bytes(path)
         from src.fs_utils import decode_text
-        raw = json.loads(decode_text(raw_bytes))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError, vault.VaultError) as exc:
+        raw = safe_json.loads_safe(decode_text(raw_bytes))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError,
+            vault.VaultError) as exc:
         logger.warning("Skipping unreadable lorebook file %s: %s", path.name, exc)
         return None
     book = lorebook_store.parse_book_json(raw)
@@ -343,6 +347,72 @@ def summarize_lorebook_pairs(pairs: list[LorebookSyncPair]) -> dict[str, int]:
 # Push / Pull / bulk
 # ---------------------------------------------------------------------------
 
+def _find_existing_book(directory: Path, filename: str) -> str | None:
+    """Return the name of the JSON file in *directory* matching *filename*.
+
+    The match folds case, exactly like the pairing in
+    :func:`compare_lorebooks`: a book is the same book whichever side
+    spells its name differently.  When several files differ only in
+    case (possible on a case-sensitive volume) the lexicographically
+    first one wins, so the result is deterministic.
+    """
+    wanted = _fs_key(filename)
+    matches: list[str] = []
+    try:
+        for path in directory.iterdir():
+            if not path.is_file() or path.suffix.lower() != '.json':
+                continue
+            if _fs_key(path.name) == wanted:
+                matches.append(path.name)
+    except OSError:
+        return None
+    return min(matches) if matches else None
+
+
+def _explorer_book_name(st_filename: str) -> str:
+    """Return the Explorer library file name to use for an ST world file.
+
+    The ST file is the authority for a world's name (SillyTavern refers
+    to it by filename), so the Explorer copy carries the same spelling.
+    When the Explorer library already holds the book under a different
+    spelling, that file is renamed first: saving under the new spelling
+    next to the old one left two Explorer files for a single book (and
+    on a case-insensitive volume it overwrote the old file in place
+    instead, destroying a different book).
+    """
+    directory = lorebook_store.get_lorebooks_dir()
+    existing = _find_existing_book(directory, st_filename)
+    if existing is None or existing == st_filename:
+        return st_filename
+    old_path = directory / existing
+    new_path = directory / st_filename
+    if os.path.normcase(str(old_path)) == os.path.normcase(str(new_path)):
+        # The same file on a case-insensitive volume: the spelling
+        # differs, the file does not.
+        return st_filename
+    if new_path.exists():
+        # The library already holds the book under both spellings (a
+        # duplicate left by an older build). Renaming would destroy one
+        # of them, so the paired file keeps its name.
+        logger.warning(
+            "Lorebook '%s' already exists next to '%s'; keeping '%s'",
+            st_filename, existing, existing,
+        )
+        return existing
+    try:
+        os.replace(old_path, new_path)
+        logger.info(
+            "Renamed lorebook '%s' to '%s' to match the SillyTavern file",
+            existing, st_filename,
+        )
+    except OSError as exc:
+        logger.warning(
+            "Could not rename lorebook '%s' to '%s': %s", existing, st_filename, exc,
+        )
+        return existing
+    return st_filename
+
+
 def pull_lorebook(st_entry: LorebookFileEntry) -> str | None:
     """Pull an ST world-info file into the Explorer library.
 
@@ -351,10 +421,15 @@ def pull_lorebook(st_entry: LorebookFileEntry) -> str | None:
     """
     try:
         from src.fs_utils import decode_text
-        raw = json.loads(decode_text(Path(st_entry.path).read_bytes()))
+        # Vault-aware read: the ST file may be sealed, and the plain
+        # read_bytes() below failed on an encrypted library while the
+        # scan path (``_entry_from_file``) decrypted it fine.
+        raw_bytes = vault.read_bytes(Path(st_entry.path))
+        raw = json.loads(decode_text(raw_bytes))
         book = lorebook_store.parse_book_json(raw)
-        lorebook_store.save_lorebook(st_entry.filename, book)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        target_name = _explorer_book_name(st_entry.filename)
+        lorebook_store.save_lorebook(target_name, book)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, vault.VaultError) as exc:
         logger.warning("Lorebook pull failed for %s: %s", st_entry.filename, exc)
         return str(exc)
     sem = semantic_hash_of_book(book)
@@ -372,15 +447,23 @@ def pull_lorebook(st_entry: LorebookFileEntry) -> str | None:
 def push_lorebook(ex_entry: LorebookFileEntry, worlds_dir: str | Path) -> str | None:
     """Push an Explorer lorebook to the ST worlds directory (ST-native format).
 
-    Writes atomically into *worlds_dir* under the same filename.  Returns
-    ``None`` on success or an error string.
+    Writes atomically into *worlds_dir*.  When the worlds directory
+    already holds a file for this book (the pairing folds case, so
+    ``MyWorld.json`` in the library and ``myworld.json`` in ST are the
+    same book), that file is the one that is written: using the
+    Explorer's spelling instead created a second world file - or, on a
+    case-insensitive volume, silently overwrote a different book.
+    Returns ``None`` on success or an error string.
     """
     try:
         book = lorebook_store.load_lorebook(ex_entry.filename)
         if book is None:
             return f"Lorebook '{ex_entry.filename}' could not be loaded"
         data = lorebook_store.book_to_st_world_info(book)
-        target = Path(worlds_dir) / Path(ex_entry.filename).name
+        target_dir = Path(worlds_dir)
+        existing = _find_existing_book(target_dir, ex_entry.filename)
+        target_name = existing or Path(ex_entry.filename).name
+        target = target_dir / target_name
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8')
         atomic_write_bytes(target, payload)

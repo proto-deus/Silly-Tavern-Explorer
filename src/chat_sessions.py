@@ -9,6 +9,7 @@ from pathlib import Path
 
 from src.app_paths import data_dir
 from src import vault
+from src import safe_json
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,119 @@ FLAGS_VERSION = 2
 # Session ids are uuid hexes; anything else (e.g. an 'id' field read from a
 # crafted/corrupt session file) must never reach a filesystem path.
 _SAFE_SESSION_ID = re.compile(r'^[A-Za-z0-9_-]+$')
+
+# Spellings of a boolean flag as they appear in hand-edited session files.
+# ``bool("false")`` is True, so the string has to be read explicitly.
+_TRUE_STRINGS = frozenset({'true', '1', 'yes', 'on'})
+_FALSE_STRINGS = frozenset({'false', '0', 'no', 'off'})
+
+#: The top-level keys of a session file that carry its metadata.
+_SESSION_META_KEYS = ('id', 'title', 'created_at', 'updated_at')
+
+
+def _scan_session_metadata(path: Path) -> dict | None:
+    """The metadata of the session file *path*, without parsing it fully.
+
+    The session files are written by this module with a fixed layout (two
+    spaces of indentation, the keys in a known order), so the metadata can
+    be read with a line scan and the message array counted without
+    materialising every message.  ``None`` means "this file does not have
+    the expected layout" and the caller parses it normally.
+
+    Only files that were written by this module qualify: a hand-edited
+    session is parsed in full instead, so the listing can never report a
+    wrong count for it.
+    """
+    try:
+        raw = vault.read_bytes(path)
+    except (OSError, vault.VaultError):
+        return None
+    try:
+        text = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        return None
+    if not text.startswith('{\n'):
+        return None
+    lines = text.split('\n')
+    meta: dict = {}
+    counts: dict[str, int] = {}
+    current_array: str | None = None
+    for line in lines:
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip(' '))
+        if current_array is not None:
+            if indent <= 2 and stripped.startswith(']'):
+                current_array = None
+            elif indent == 4 and stripped.startswith('{'):
+                counts[current_array] = counts.get(current_array, 0) + 1
+            continue
+        if indent != 2 or not stripped.startswith('"'):
+            continue
+        key, _, rest = stripped.partition('":')
+        key = key.lstrip('"')
+        if key in ('messages', 'memories'):
+            value = rest.strip()
+            if value.startswith('[]'):
+                # An empty array is written on one line: nothing to count.
+                counts.setdefault(key, 0)
+                continue
+            if value.startswith('['):
+                current_array = key
+                counts.setdefault(key, 0)
+            continue
+        if key in _SESSION_META_KEYS:
+            value = rest.rstrip(',')
+            try:
+                meta[key] = json.loads(value)
+            except (ValueError, TypeError):
+                return None
+    if current_array is not None:
+        # The file was truncated: it does not have the expected layout.
+        return None
+    if 'id' not in meta or 'title' not in meta:
+        return None
+    meta['message_count'] = counts.get('messages', 0)
+    meta['memory_count'] = counts.get('memories', 0)
+    return meta
+
+
+def coerce_bool(value, default: bool = True) -> bool:
+    """Coerce a stored value to a bool, understanding the string spellings.
+
+    Session files are on-disk data that may have been hand-edited or written
+    by another tool, and ``"enabled": "false"`` is a common way to store a
+    disabled flag.  ``bool("false")`` is True (the string is truthy), which
+    silently re-enabled every flag the user had turned off.
+
+    Booleans and numbers are used as they are; ``'false'``/``'0'``/``'no'``/
+    ``'off'`` are False, ``'true'``/``'1'``/``'yes'``/``'on'`` are True, and
+    anything unrecognised falls back to *default*.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().casefold()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+        return default
+    return default
+
+
+def _memory_source(value) -> str:
+    """Return the source label of a memory entry (``'manual'`` when unset).
+
+    ``str(None)`` is the literal string ``'None'``, so a missing source used
+    to be stored as the source name "None" instead of the default.
+    """
+    if value is None:
+        return 'manual'
+    return str(value)
 
 
 def _safe_session_id(session_id: str) -> str:
@@ -105,7 +219,7 @@ class ChatSessionStore:
             # and NOT an OSError, so read_text's OSError guard would not catch
             # it.  The vault helper transparently decrypts sealed sessions.
             from src.fs_utils import decode_text
-            data = json.loads(decode_text(vault.read_bytes(path)))
+            data = safe_json.loads_safe(decode_text(vault.read_bytes(path)))
             if isinstance(data, dict):
                 return data
             logger.warning("Session file %s is not a JSON object", path)
@@ -114,31 +228,55 @@ class ChatSessionStore:
         return None
 
     def list_sessions(self, char_id: int) -> list[dict]:
-        """Return metadata for every saved session of *char_id*, newest first."""
+        """Return metadata for every saved session of *char_id*, newest first.
+
+        Only the metadata is needed here, so the session files are *scanned*
+        rather than parsed: a character with a long chat history has
+        sessions of megabytes each, and loading all of them to list their
+        titles is what made the Chats window slow.
+        """
         results: list[dict] = []
         for path in sorted(self._char_dir(char_id).glob('*.json')):
-            data = self._read(path)
-            if not data:
-                continue
             try:
                 mtime = path.stat().st_mtime
             except OSError:
                 mtime = 0.0
-            messages = data.get('messages')
+            meta = self._read_metadata(path)
+            if meta is None:
+                continue
             results.append({
-                'id': data.get('id', path.stem),
+                'id': meta.get('id') or path.stem,
                 'char_id': char_id,
-                'title': data.get('title', ''),
-                'message_count': len(messages) if isinstance(messages, list) else 0,
-                'memory_count': len(_normalize_memories_raw(data)),
-                'created_at': data.get('created_at', ''),
-                'updated_at': data.get('updated_at', ''),
+                'title': meta.get('title', ''),
+                'message_count': meta.get('message_count', 0),
+                'memory_count': meta.get('memory_count', 0),
+                'created_at': meta.get('created_at', ''),
+                'updated_at': meta.get('updated_at', ''),
                 '_sort_key': (mtime, path.name),
             })
         results.sort(key=lambda r: r['_sort_key'], reverse=True)
         for r in results:
             r.pop('_sort_key', None)
         return results
+
+    def _read_metadata(self, path: Path) -> dict | None:
+        """The metadata of the session file *path* (None when unreadable)."""
+        scanned = _scan_session_metadata(path)
+        if scanned is not None:
+            return scanned
+        # The file does not have the expected layout: parse it normally.
+        data = self._read(path)
+        if not data:
+            return None
+        messages = data.get('messages')
+        return {
+            'id': data.get('id', path.stem),
+            'title': data.get('title', ''),
+            'message_count': len(messages) if isinstance(messages, list) else 0,
+            'memory_count': len(_normalize_memories_raw(data)),
+            'created_at': data.get('created_at', ''),
+            'updated_at': data.get('updated_at', ''),
+        }
 
     def save_session(
         self,
@@ -153,6 +291,7 @@ class ChatSessionStore:
         jailbreak: str | None = None,
         persona_id: str | None = None,
         system_template: str | None = None,
+        context_template: str | None = None,
         attributes: list[dict] | None = None,
         auto_update_attributes: bool | None = None,
     ) -> None:
@@ -162,10 +301,10 @@ class ChatSessionStore:
         legacy ``memory`` string migrated to the list form); ``auto_summarize``
         follows the same convention so the flag can be turned off explicitly
         without also wiping the memory list.  ``author_note`` / ``jailbreak`` /
-        ``persona_id`` / ``system_template`` / ``attributes`` /
-        ``auto_update_attributes`` are likewise kept unchanged when ``None``,
-        so callers that don't manage them (import paths, older code) can't
-        wipe them.
+        ``persona_id`` / ``system_template`` / ``context_template`` /
+        ``attributes`` / ``auto_update_attributes`` are likewise kept
+        unchanged when ``None``, so callers that don't manage them (import
+        paths, older code) can't wipe them.
         """
         path = self._path(char_id, session_id)
         created_at = None
@@ -192,6 +331,9 @@ class ChatSessionStore:
             if system_template is None:
                 stored_tpl = existing.get('system_template')
                 system_template = stored_tpl if isinstance(stored_tpl, str) else ''
+            if context_template is None:
+                stored_ctx = existing.get('context_template')
+                context_template = stored_ctx if isinstance(stored_ctx, str) else ''
             if attributes is None:
                 attributes = normalize_attributes(existing)
         now = datetime.now().isoformat(timespec='seconds')
@@ -214,6 +356,7 @@ class ChatSessionStore:
             'jailbreak': jailbreak or '',
             'persona_id': persona_id or '',
             'system_template': system_template or '',
+            'context_template': context_template or '',
             'created_at': created_at or now,
             'updated_at': now,
         }
@@ -350,7 +493,7 @@ def _normalize_memories_raw(data: dict | None) -> list[dict]:
                 entry = {
                     'id': m.get('id') or uuid.uuid4().hex,
                     'content': str(m.get('content', '')),
-                    'source': str(m.get('source', 'manual')),
+                    'source': _memory_source(m.get('source')),
                     'created_at': str(m.get('created_at', '')),
                 }
                 if _coerce_end_index(m.get('end_index')) is not None:
@@ -370,7 +513,7 @@ def _clean_memory(m) -> dict | None:
     cleaned = {
         'id': m.get('id', uuid.uuid4().hex),
         'content': str(m.get('content', '')),
-        'source': str(m.get('source', 'manual')),
+        'source': _memory_source(m.get('source')),
         'created_at': str(m.get('created_at', '')),
     }
     end = _coerce_end_index(m.get('end_index'))
@@ -448,7 +591,7 @@ def new_attribute_entry(
         'name': str(name or '').strip(),
         'value': str(value or ''),
         'description': str(description or ''),
-        'enabled': bool(enabled),
+        'enabled': coerce_bool(enabled, True),
         'updated_at': '',
     }
 
@@ -495,7 +638,7 @@ def _clean_attribute(a) -> dict | None:
         'name': name,
         'value': str(a.get('value', '') or ''),
         'description': str(a.get('description', '') or ''),
-        'enabled': bool(a.get('enabled', True)),
+        'enabled': coerce_bool(a.get('enabled'), True),
         'updated_at': str(a.get('updated_at', '') or ''),
     }
 
