@@ -1600,7 +1600,10 @@ class MainWindow(QMainWindow):
 
     def _on_card_selected(self, char_id: int) -> None:
         """Sync a Library-grid selection to the shared sidebar and the tabs."""
-        self._sidebar.set_selected_id(char_id)
+        # select_card (not set_selected_id): the sidebar holds every card in
+        # the library, so it can follow the selection even when the card sits
+        # on a later page of the grid.
+        self._sidebar.select_card(char_id)
         self._ai_tab.select_card(char_id)
         self._edit_tab.set_selected_id(char_id)
         self._gallery_tab.set_selected_card(char_id)
