@@ -82,7 +82,12 @@ class TagWidget(QWidget):
         while self._layout.count():
             item = self._layout.takeAt(0)
             if item and item.widget():
-                item.widget().deleteLater()
+                # Detach the widget from its parent before deleting it:
+                # otherwise the chip keeps being painted (a "ghost" chip)
+                # until the event loop processes the deferred delete.
+                chip = item.widget()
+                chip.setParent(None)
+                chip.deleteLater()
         for tag in self._tags:
             chip = TagChip(tag, removable=self._editable)
             if self._editable:

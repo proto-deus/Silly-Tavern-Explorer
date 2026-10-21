@@ -23,6 +23,24 @@ from src.database import LibraryDatabase
 logger = logging.getLogger(__name__)
 
 
+def notify_card_deleted(char_id: int, name: str) -> None:
+    """Announce a deleted card to the plugin/event bus.
+
+    The event module is imported lazily - it is an optional cross-cutting
+    module and must not be pulled in at start-up - and every error is
+    swallowed: a failing user plugin must never break the deletion.
+
+    Args:
+        char_id: The database id of the deleted card.
+        name: The name of the deleted card.
+    """
+    try:
+        from src import app_events
+        app_events.card_deleted(char_id, name)
+    except Exception:
+        logger.exception("Could not announce the deleted card")
+
+
 class _DuplicateScanWorker(QThread):
     """Run one duplicate scan off the UI thread.
 
@@ -386,6 +404,7 @@ class DuplicateScannerDialog(QDialog):
             return
         try:
             self.db.remove_card(char_id, delete_files=True)
+            notify_card_deleted(char_id, row.get('name', ''))
             self._status.setText(f"Deleted card ID {char_id}.")
             logger.info("Duplicate scanner deleted card %s", char_id)
         except Exception as e:
@@ -423,6 +442,7 @@ class DuplicateScannerDialog(QDialog):
                 continue
             try:
                 self.db.remove_card(cid, delete_files=True)
+                notify_card_deleted(cid, r.get('name', ''))
                 deleted += 1
             except Exception:
                 logger.exception("Failed to delete card %s in bulk dedupe", cid)

@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.chat_formatting import extract_image_urls, format_chat_message
+from src.ui.styles import ui_font_px
 from src.ui.widgets.chat_image_loader import (
     cached_url_pixmap,
     make_url_image_label,
@@ -69,13 +70,17 @@ class MessageBubble(QFrame):
         self._role = role
         self._name = name
         self._text = text or ''
+        # The plain (escaped) HTML of the text rendered so far.  A streamed
+        # chunk only has to escape its own fragment and append it here, so
+        # the accumulated reply is never re-escaped from scratch.
+        self._stream_html = _plain_html(self._text)
         self._show_timestamp = show_timestamp
         self._timestamp = timestamp
         self._dialogue_color = dialogue_color
         self._action_color = action_color
         self._emphasis_color = emphasis_color
         self._font_size = font_size
-        self._small_px = max(8, font_size - 3)
+        self._small_px = ui_font_px(-3)
 
         self.setObjectName('chat_bubble')
 
@@ -291,9 +296,21 @@ class MessageBubble(QFrame):
         self._images_container.setVisible(bool(urls))
 
     def append_stream(self, text: str) -> None:
-        """Append a streamed chunk (plain rendering; no colored formatting)."""
+        """Append a streamed chunk (plain rendering; no colored formatting).
+
+        Only the *new* fragment is escaped and appended to the HTML that is
+        already rendered.  Re-escaping (and re-parsing) the whole
+        accumulated reply on every SSE chunk was O(n^2) on the GUI thread:
+        a 16k-token answer meant ~800 full re-renders of a growing 64 KB
+        document - the classic "typing lag".
+
+        The result is identical to a full re-render: escaping is a
+        per-character mapping, so ``_plain_html(a + b)`` equals
+        ``_plain_html(a) + _plain_html(b)``.
+        """
         self._text += text
-        self._content_label.setText(_plain_html(self._text))
+        self._stream_html += _plain_html(text)
+        self._content_label.setText(self._stream_html)
 
     def set_controls_enabled(self, enabled: bool) -> None:
         """Enable/disable the footer action buttons (edit/copy/delete/regen)."""
@@ -312,6 +329,9 @@ class MessageBubble(QFrame):
     def set_content(self, text: str) -> None:
         """Replace the message text and re-render with colored formatting."""
         self._text = text or ''
+        # Keep the streamed-HTML buffer in step with the new text so a
+        # later append_stream() continues from it.
+        self._stream_html = _plain_html(self._text)
         self._render_content()
 
     @property

@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src import vault
+from src.ui.styles import ui_font_px
 
 
 class UnlockDialog(QDialog):
@@ -32,7 +33,7 @@ class UnlockDialog(QDialog):
         layout = QVBoxLayout(self)
 
         title = QLabel('This library is encrypted.')
-        title.setStyleSheet('font-weight: bold; font-size: 14px;')
+        title.setStyleSheet(f'font-weight: bold; font-size: {ui_font_px(1)}px;')
         layout.addWidget(title)
 
         hint = QLabel('Enter your password to unlock it.')

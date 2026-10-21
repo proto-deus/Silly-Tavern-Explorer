@@ -171,7 +171,7 @@ class StatsDialog(QDialog):
 
         # --- Token distribution (per-card) ---
         token_section = _Section('Token Count Distribution')
-        all_cards = self.db.get_all(sort_by='token_count')
+        all_cards = self.db.get_all(sort_by='token_count', light=True)
         if all_cards:
             # Bucket counts into ranges for a histogram-like view.
             buckets = _bucket_tokens(all_cards)

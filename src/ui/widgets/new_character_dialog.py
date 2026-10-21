@@ -22,6 +22,7 @@ from src.app_paths import data_dir
 from src.card_models import CharacterCard
 from src.card_parser import write_chara_card_dual
 from src.database import LibraryDatabase, sanitize_filename
+from src import image_safety
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +126,9 @@ class NewCharacterDialog(QDialog):
             from PIL import Image
             from src import vault
             if self._image_path and Path(self._image_path).exists():
-                img = Image.open(self._image_path).convert('RGBA')
+                img = image_safety.load_checked(
+                    image_safety.open_checked(self._image_path),
+                ).convert('RGBA')
             else:
                 img = Image.new('RGBA', (400, 600), (40, 40, 60, 255))
             buf = io.BytesIO()

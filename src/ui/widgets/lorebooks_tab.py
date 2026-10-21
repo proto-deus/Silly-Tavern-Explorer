@@ -38,6 +38,7 @@ from src.settings_manager import (
 )
 from src.token_counter import count_tokens
 from src.ui.widgets.character_book_editor import _BookEntryEditDialog
+from src import safe_json
 
 logger = logging.getLogger(__name__)
 
@@ -661,11 +662,16 @@ class LorebooksTab(QWidget):
         for p in paths:
             path = Path(p)
             try:
-                raw = json.loads(path.read_text(encoding='utf-8'))
-            except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+                raw = safe_json.loads_safe(path.read_text(encoding='utf-8'))
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError,
+                    ValueError, OverflowError) as e:
                 skipped.append(f'{path.name}: {e}')
                 continue
-            book = lorebook_store.parse_book_json(raw)
+            try:
+                book = lorebook_store.parse_book_json(raw)
+            except (ValueError, TypeError, OverflowError, RecursionError) as e:
+                skipped.append(f'{path.name}: {e}')
+                continue
             if not book.entries:
                 skipped.append(f'{path.name}: no usable entries found')
                 continue

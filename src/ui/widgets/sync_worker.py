@@ -6,6 +6,7 @@ import os
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from src.sillytavern_sync import (
+    SyncCategory,
     build_explorer_entries,
     bulk_sync,
     compare_libraries,
@@ -13,6 +14,38 @@ from src.sillytavern_sync import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: The pair categories whose two sides can be compared field by field.
+#:
+#: ``ST_CHANGED`` would be pulled and ``EXPLORER_CHANGED`` would be pushed;
+#: ``BOTH_CHANGED`` (a conflict) and ``UNLINKED_MATCH`` are skipped by the
+#: bulk plans, but they are exactly the cases where the user needs to see
+#: what differs before deciding what to do.
+DIFFABLE_CATEGORIES = frozenset({
+    SyncCategory.ST_CHANGED,
+    SyncCategory.EXPLORER_CHANGED,
+    SyncCategory.BOTH_CHANGED,
+    SyncCategory.UNLINKED_MATCH,
+})
+
+
+def diffable_pairs(pairs) -> list:
+    """The pairs whose Explorer and SillyTavern copies should be compared.
+
+    Only pairs that exist on *both* sides can be compared: a card that is
+    only in the Explorer (or only in SillyTavern) has no counterpart to
+    diff against.  Cards that are in sync are skipped - they have no
+    differences to show.
+
+    Pure function so the selection is unit-testable without Qt.
+    """
+    out = []
+    for pair in pairs or ():
+        if pair.explorer is None or pair.st is None:
+            continue
+        if pair.category in DIFFABLE_CATEGORIES:
+            out.append(pair)
+    return out
 
 
 def _get_deleted_entries(db) -> list:
@@ -84,7 +117,7 @@ def _scan_pairs(db, characters_dir: str) -> list:
     Tombstones mark cards deleted on purpose in ST Explorer so their ST
     copies classify as ``DELETED_IN_EXPLORER`` instead of ``ONLY_ST``.
     """
-    rows = db.get_all()
+    rows = db.get_all(light=True)
     explorer_entries = build_explorer_entries(rows)
     deleted_entries = _get_deleted_entries(db)
     st_entries = list_st_characters(characters_dir)
@@ -181,6 +214,64 @@ class ScanWorker(QThread):
         except Exception as e:
             logger.exception("Sync scan failed")
             self.failed.emit(str(e))
+
+
+class DiffWorker(QThread):
+    """Compare the Explorer and SillyTavern copies of the given pairs.
+
+    Reading and parsing a card file on both sides is far too slow for the
+    UI thread (a library with hundreds of cards would freeze the window),
+    so the field-level diff is computed in the background.
+
+    Signals:
+        completed(diffs) — ``list[CardDiff]`` on success.
+        failed(message)  — error message string on failure.
+    """
+
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, pairs, parent=None):
+        super().__init__(parent)
+        self.pairs = list(pairs or ())
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        from src.card_models import CharacterCard
+        from src.card_parser import read_card_data
+        from src.sync_diff import diff_cards
+
+        diffs = []
+        try:
+            for pair in self.pairs:
+                if self._cancel:
+                    return
+                explorer = pair.explorer
+                st = pair.st
+                if explorer is None or st is None:
+                    continue
+                local_raw = read_card_data(explorer.source_path)
+                remote_raw = read_card_data(st.path)
+                if local_raw is None or remote_raw is None:
+                    logger.warning(
+                        "Could not read both copies of %s; skipping the diff",
+                        explorer.name or st.filename,
+                    )
+                    continue
+                local = CharacterCard.from_spec_dict(local_raw, explorer.source_path)
+                diff = diff_cards(local, remote_raw)
+                # The card object carries no database id, so the id of the
+                # Explorer card is filled in from the sync pair.
+                diff.card_id = explorer.char_id
+                diffs.append(diff)
+        except Exception as e:
+            logger.exception("DiffWorker crashed while comparing the cards")
+            self.failed.emit(str(e))
+            return
+        self.completed.emit(diffs)
 
 
 class PushPullWorker(QThread):

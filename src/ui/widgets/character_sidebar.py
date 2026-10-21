@@ -22,6 +22,11 @@ from src.ui.widgets.card_thumbnail import CardThumbnail
 # the Library grid's loads leaves the sidebar's alone (and vice versa).
 SIDEBAR_LOADER_OWNER = 'sidebar'
 
+#: How many cards the sidebar shows at most.  It is a quick picker, not the
+#: full library: building a thumbnail widget (and queueing a PNG decode) for
+#: every card of a large library froze the window on every refresh.
+MAX_SIDEBAR_CARDS = 300
+
 
 class CharacterSidebar(QWidget):
     """Shared character-card list for the Edit / Generate / Test tabs.
@@ -32,11 +37,20 @@ class CharacterSidebar(QWidget):
 
     card_selected = pyqtSignal(int)
     card_double_clicked = pyqtSignal(int)
+    # Emitted when the user edits the search box; the Library tab mirrors it.
+    search_changed = pyqtSignal(str)
+    # The favorites filter and the sort order are shared with the Library
+    # tab: they used to be independent, so "View > Favorites" left the
+    # sidebar listing non-favourites and the two lists could disagree about
+    # the order.
+    favorites_filter_changed = pyqtSignal(bool)
+    sort_changed = pyqtSignal(str)
 
     def __init__(self, db: LibraryDatabase, parent: QWidget | None = None):
         super().__init__(parent)
         self.db = db
         self._thumb_widgets: list[CardThumbnail] = []
+        self._search_blobs: dict[int, str] = {}
         self._current_id: int | None = None
         self._favorites_only: bool = False
         self._sort_by: str = 'name'
@@ -52,7 +66,7 @@ class CharacterSidebar(QWidget):
         self._search_box = QLineEdit()
         self._search_box.setPlaceholderText('Search characters...')
         self._search_box.setClearButtonEnabled(True)
-        self._search_box.textChanged.connect(self._filter_thumbnails)
+        self._search_box.textChanged.connect(self._on_search_text)
         layout.addWidget(self._search_box)
 
         # Same sort-by dropdown the Library tab uses (shared label->key map).
@@ -85,6 +99,17 @@ class CharacterSidebar(QWidget):
         self._favorites_check.toggled.connect(self._on_favorites_toggled)
         layout.addWidget(self._favorites_check)
 
+        # The sidebar is a quick picker, not the full library: it shows at
+        # most this many cards and says how many are hidden.  Without the
+        # cap a library of a few thousand cards built a thumbnail widget
+        # (and queued a PNG decode) for every one of them, on every import,
+        # favourite toggle, sync and save.
+        self._more_label = QLabel('')
+        self._more_label.setWordWrap(True)
+        self._more_label.setStyleSheet('color: #ccc; font-size: 11px;')
+        self._more_label.setVisible(False)
+        layout.addWidget(self._more_label)
+
     # ---- loading / filtering ----
 
     def load_cards(self) -> None:
@@ -98,8 +123,9 @@ class CharacterSidebar(QWidget):
             w.setParent(None)
             w.deleteLater()
         self._thumb_widgets.clear()
+        self._search_blobs.clear()
 
-        entries = self.db.get_all(
+        entries = self.db.get_all(light=True,
             sort_by=self._sort_by, favorites_only=self._favorites_only,
         )
 
@@ -110,7 +136,7 @@ class CharacterSidebar(QWidget):
         if self._current_id is not None and self._current_id not in ids:
             self._current_id = None
 
-        for entry in entries:
+        for entry in entries[:MAX_SIDEBAR_CARDS]:
             thumb = CardThumbnail(
                 char_id=entry['id'],
                 name=entry['name'],
@@ -123,22 +149,82 @@ class CharacterSidebar(QWidget):
             thumb.double_clicked.connect(self._on_thumb_double_clicked)
             self._thumb_layout.insertWidget(self._thumb_layout.count() - 1, thumb)
             self._thumb_widgets.append(thumb)
-        self._filter_thumbnails(self._search_box.text())
+            self._search_blobs[entry['id']] = ' '.join(
+                str(entry.get(key) or '')
+                for key in (
+                    'name', 'description_preview', 'tags',
+                    'creator', 'creator_notes',
+                )
+            ).lower()
+        hidden = len(entries) - len(self._thumb_widgets)
+        if hidden > 0:
+            self._more_label.setText(
+                f'{hidden} more card(s) not shown - narrow the search to see them.'
+            )
+            self._more_label.setVisible(True)
+        else:
+            self._more_label.setVisible(False)
+        self._apply_search_filter(self._search_box.text())
         self._apply_selection_highlight()
 
     def _on_favorites_toggled(self, checked: bool) -> None:
         self._favorites_only = checked
         self.load_cards()
+        self.favorites_filter_changed.emit(checked)
 
     def _on_sort_changed(self, label: str) -> None:
         self._sort_by = SORT_LABELS.get(label, 'name')
         self.load_cards()
+        self.sort_changed.emit(label)
 
-    def _filter_thumbnails(self, text: str) -> None:
+    def set_favorites_only(self, checked: bool) -> None:
+        """Mirror the Library tab's "Favorites only" filter (no echo back)."""
+        if self._favorites_only == checked:
+            return
+        self._favorites_only = checked
+        self._favorites_check.blockSignals(True)
+        self._favorites_check.setChecked(checked)
+        self._favorites_check.blockSignals(False)
+        self.load_cards()
+
+    def set_sort_by_label(self, label: str) -> None:
+        """Mirror the Library tab's sort order (no echo back)."""
+        key = SORT_LABELS.get(label, 'name')
+        if self._sort_by == key:
+            return
+        self._sort_by = key
+        index = self._sort_combo.findText(label)
+        if index < 0:
+            index = self._sort_combo.findText('Name')
+        if index >= 0:
+            self._sort_combo.blockSignals(True)
+            self._sort_combo.setCurrentIndex(index)
+            self._sort_combo.blockSignals(False)
+        self.load_cards()
+
+    def _apply_search_filter(self, text: str) -> None:
+        """Show only the cards matching *text* (same fields as the Library tab).
+
+        Matches name, description, tags, creator, and creator notes, so the
+        sidebar and the Library grid agree on the results for a given query.
+        """
         query = text.strip().lower()
         for thumb in self._thumb_widgets:
-            name = thumb._name_label.text().lower()
-            thumb.setVisible(not query or query in name)
+            blob = self._search_blobs.get(thumb.char_id, '')
+            thumb.setVisible(not query or query in blob)
+
+    def _on_search_text(self, text: str) -> None:
+        self._apply_search_filter(text)
+        self.search_changed.emit(text)
+
+    def set_search_text(self, text: str) -> None:
+        """Mirror the Library tab's search box (no echo back to it)."""
+        if self._search_box.text() == text:
+            return
+        self._search_box.blockSignals(True)
+        self._search_box.setText(text)
+        self._search_box.blockSignals(False)
+        self._apply_search_filter(text)
 
     # ---- selection ----
 

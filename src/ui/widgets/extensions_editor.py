@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from src import safe_json
 
 # Keys that have dedicated controls in the edit form and should not appear
 # in the generic extensions table.
@@ -81,8 +82,8 @@ def parse_value(text: str, type_hint: str) -> tuple[Any, str | None]:
         return None, f"Cannot parse '{text}' as bool"
     if type_hint in ('number', 'object', 'array'):
         try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as e:
+            parsed = safe_json.loads_safe(text)
+        except (json.JSONDecodeError, ValueError) as e:
             return None, f"Invalid JSON: {e}"
         expected = {'number': (int, float), 'object': dict, 'array': list}
         if not isinstance(parsed, expected[type_hint]) or isinstance(parsed, bool):

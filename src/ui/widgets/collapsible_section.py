@@ -25,7 +25,7 @@ class CollapsibleSection(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._header = QPushButton(f'\u25bc {title} (0 Tokens)')
+        self._header = QPushButton()
         self._header.setStyleSheet(
             'QPushButton { text-align: left; font-weight: bold;'
             ' color: #ccc; background-color: transparent; border: none;'
@@ -33,6 +33,7 @@ class CollapsibleSection(QWidget):
             ' QPushButton:hover { color: #5b9bd5; }'
         )
         self._header.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._header.setAccessibleName(title)
         self._header.clicked.connect(self.toggle)
         layout.addWidget(self._header)
 
@@ -41,6 +42,11 @@ class CollapsibleSection(QWidget):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.addWidget(content_widget)
         layout.addWidget(self._content_container)
+
+        # Build the header text here instead of hard-coding it, so a
+        # section without a token counter does not start out with a
+        # misleading "(0 Tokens)".
+        self._refresh_header()
 
     def toggle(self) -> None:
         self.set_expanded(not self._expanded)

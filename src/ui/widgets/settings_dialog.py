@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -22,6 +23,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStackedWidget,
     QTabWidget,
@@ -33,6 +35,10 @@ from PyQt6.QtWidgets import (
 
 from src import ai_prompts
 from src.ai_client import PRESETS, preset_from_saved
+from src.provider_capabilities import (
+    rejects_unknown_parameters,
+    unsupported_settings,
+)
 from src.settings_manager import (
     load_active_persona_id,
     load_active_provider,
@@ -55,6 +61,75 @@ from src.settings_manager import (
 
 logger = logging.getLogger(__name__)
 
+#: Display names of the settings whose support depends on the provider.
+_SETTING_NAMES: dict[str, str] = {
+    'top_p': 'Top P',
+    'top_k': 'Top K',
+    'min_p': 'Min P',
+    'typical_p': 'Typical P',
+    'min_tokens_to_keep': 'Min tokens to keep',
+    'frequency_penalty': 'Frequency Penalty',
+    'presence_penalty': 'Presence Penalty',
+    'repeat_penalty': 'Repetition penalty',
+    'mirostat': 'Mirostat mode',
+    'mirostat_tau': 'Mirostat tau',
+    'mirostat_eta': 'Mirostat eta',
+    'dry_multiplier': 'DRY multiplier',
+    'dry_base': 'DRY base',
+    'dry_allowed_length': 'DRY allowed length',
+    'dry_penalty_range': 'DRY penalty range',
+    'xtc_threshold': 'XTC threshold',
+    'xtc_probability': 'XTC probability',
+    'dynatemp_range': 'Dynatemp range',
+    'dynatemp_exponent': 'Dynatemp exponent',
+    'smoothing_factor': 'Smoothing factor',
+    'seed': 'Seed',
+    'stop': 'Stop sequences',
+}
+
+#: The optional settings grouped by the feature they belong to, so the
+#: summary can name "DRY" instead of four separate rows.
+_SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ('Top K', ('top_k',)),
+    ('Min P', ('min_p',)),
+    ('Typical P', ('typical_p',)),
+    ('Min tokens to keep', ('min_tokens_to_keep',)),
+    ('Repetition penalty', ('repeat_penalty',)),
+    ('DRY', (
+        'dry_multiplier', 'dry_base', 'dry_allowed_length', 'dry_penalty_range',
+    )),
+    ('Mirostat', ('mirostat', 'mirostat_tau', 'mirostat_eta')),
+    ('XTC', ('xtc_threshold', 'xtc_probability')),
+    ('Dynamic temperature', ('dynatemp_range', 'dynatemp_exponent')),
+    ('Smoothing factor', ('smoothing_factor',)),
+    ('Frequency Penalty', ('frequency_penalty',)),
+    ('Presence Penalty', ('presence_penalty',)),
+    ('Seed', ('seed',)),
+    ('Stop sequences', ('stop',)),
+)
+
+
+def _unsupported_summary(unsupported: set[str]) -> list[str]:
+    """Name the unsupported settings, grouped by the feature they belong to.
+
+    A provider that misses a whole feature is named by it ("DRY"); one that
+    misses only part of it gets the individual settings.
+    """
+    names: list[str] = []
+    covered: set[str] = set()
+    for name, members in _SETTING_GROUPS:
+        hit = [m for m in members if m in unsupported]
+        if not hit:
+            continue
+        covered.update(hit)
+        if len(hit) == len(members):
+            names.append(name)
+        else:
+            names.extend(_SETTING_NAMES.get(m, m) for m in hit)
+    for setting in sorted(unsupported - covered):
+        names.append(_SETTING_NAMES.get(setting, setting))
+    return names
+
 
 class _FetchCancelled(Exception):
     """Internal: the user cancelled an in-flight model fetch."""
@@ -64,6 +139,10 @@ class _FetchCancelled(Exception):
 # the C++ QThread) cannot be garbage-collected while run() is executing —
 # even if the settings dialog is destroyed first.
 _LIVE_FETCH_WORKERS: list[_FetchModelsWorker] = []
+
+#: The model list is read into memory in full, so its size is capped: the
+#: endpoint is user-configured, and a broken one could stream gigabytes.
+_MAX_MODELS_BODY_BYTES = 16 * 1024 * 1024
 
 
 class _FetchModelsWorker(QThread):
@@ -121,6 +200,15 @@ class _FetchModelsWorker(QThread):
                 for chunk in resp.iter_content(chunk_size=65536):
                     self._check_cancel()
                     payload.extend(chunk)
+                    # The body is unbounded as far as the server is
+                    # concerned: a hostile or broken endpoint could stream
+                    # gigabytes into the worker's memory.
+                    if len(payload) > _MAX_MODELS_BODY_BYTES:
+                        raise ValueError(
+                            'The model list is too large to read; the endpoint '
+                            'returned more than '
+                            f'{_MAX_MODELS_BODY_BYTES // (1024 * 1024)} MiB.',
+                        )
             finally:
                 resp.close()
             data = json.loads(payload.decode('utf-8', errors='replace'))
@@ -267,15 +355,25 @@ class _APIPanel(QWidget):
         """Warn when the API key would travel over cleartext http."""
         from src.ai_client import is_cleartext_remote
         base_url = self._url_edit.text().strip()
-        if base_url and self._key_edit.text().strip() and is_cleartext_remote(base_url):
+        if not base_url or not is_cleartext_remote(base_url):
+            self._url_warning.setVisible(False)
+            return
+        if self._key_edit.text().strip():
             self._url_warning.setText(
                 'This base URL is plain http:// to a remote host: the API key '
                 'would be sent unencrypted. Prefer https:// for non-local '
                 'servers.'
             )
-            self._url_warning.setVisible(True)
         else:
-            self._url_warning.setVisible(False)
+            # Even without a key the card description, the chat history and
+            # the persona travel over the same connection - that is often the
+            # more sensitive payload, so it must not be sent silently.
+            self._url_warning.setText(
+                'This base URL is plain http:// to a remote host: your prompts '
+                'and chat history would be sent unencrypted. Prefer https:// '
+                'for non-local servers.'
+            )
+        self._url_warning.setVisible(True)
 
     @staticmethod
     def _fetch_worker_is_alive(worker) -> bool:
@@ -388,47 +486,62 @@ class _LLMPanel(QWidget):
 
     def __init__(self, config: dict, parent: QWidget | None = None):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        group = QGroupBox('Sampling Parameters')
-        form = QFormLayout(group)
 
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+
+        # The settings the selected provider does not implement, so the user
+        # is not left wondering why a slider does no effect.
+        self._rows: dict[str, tuple[QLabel, QWidget, str, str]] = {}
+        self._provider = ''
+        self._grey_unsupported = QCheckBox(
+            'Grey out settings this provider does not support'
+        )
+        self._grey_unsupported.setChecked(True)
+        self._grey_unsupported.setToolTip(
+            'The backends do not agree on which parameters they implement. '
+            'Unsupported settings are left out of the request either way; '
+            'tick this off to keep editing them (for instance to prepare a '
+            'profile for another provider).'
+        )
+        self._grey_unsupported.toggled.connect(self._apply_row_states)
+        layout.addWidget(self._grey_unsupported)
+        self._provider_note = QLabel('')
+        self._provider_note.setWordWrap(True)
+        self._provider_note.setStyleSheet('color: #e0a030;')
+        self._provider_note.setVisible(False)
+        layout.addWidget(self._provider_note)
+
+        # Sampler widget definitions.  The optional ones are sent only when
+        # set to a non-neutral value, and only when the active provider
+        # implements them at all - the llama.cpp-family samplers below only
+        # work on the local servers. The layout is assembled further down,
+        # with every sampler in one section grouped by type.
         self._temp = self._double(config.get('temperature', 0.8), 0.0, 2.0, 0.1)
-        form.addRow('Temperature:', self._temp)
 
         self._top_p = self._double(config.get('top_p', 1.0), 0.0, 1.0, 0.05)
-        form.addRow('Top P:', self._top_p)
-
         self._top_k = QSpinBox()
         self._top_k.setRange(0, 200)
         self._top_k.setValue(config.get('top_k', 0))
-        form.addRow('Top K (0 = off):', self._top_k)
-
         self._min_p = self._double(config.get('min_p', 0.0), 0.0, 1.0, 0.05)
-        form.addRow('Min P (0 = off):', self._min_p)
-
         self._context_size = QSpinBox()
         self._context_size.setRange(512, 200000)
         self._context_size.setSingleStep(256)
         self._context_size.setValue(config.get('context_size', 8192))
-        form.addRow('Context Size (tokens):', self._context_size)
-
         self._max_tokens = QSpinBox()
         self._max_tokens.setRange(1, 32768)
         self._max_tokens.setSingleStep(256)
         self._max_tokens.setValue(config.get('max_tokens', 2048))
-        form.addRow('Output Length (max tokens):', self._max_tokens)
-
         self._freq_pen = self._double(config.get('frequency_penalty', 0.0), -2.0, 2.0, 0.1)
-        form.addRow('Frequency Penalty:', self._freq_pen)
-
         self._pres_pen = self._double(config.get('presence_penalty', 0.0), -2.0, 2.0, 0.1)
-        form.addRow('Presence Penalty:', self._pres_pen)
-
         self._seed = QSpinBox()
         self._seed.setRange(-1, 2147483647)
         self._seed.setValue(config.get('seed', -1))
-        form.addRow('Seed (-1 = random):', self._seed)
-
         self._retries = QSpinBox()
         self._retries.setRange(0, 5)
         self._retries.setValue(config.get('retry_attempts', 2))
@@ -436,8 +549,6 @@ class _LLMPanel(QWidget):
             'Automatic retries for failed API requests (connection errors, '
             'timeouts, rate limits, server errors) with exponential backoff.'
         )
-        form.addRow('Retries on failure:', self._retries)
-
         self._stop = QLineEdit()
         stop_value = config.get('stop', [])
         if isinstance(stop_value, (list, tuple)):
@@ -448,8 +559,6 @@ class _LLMPanel(QWidget):
             'Custom stopping strings (comma-separated): generation stops as '
             'soon as one of them is produced, and the text up to it is kept.'
         )
-        form.addRow('Stop sequences:', self._stop)
-
         self._strict_template = QCheckBox(
             'Enforce alternating user/assistant roles (Llama 3.x templates)'
         )
@@ -463,10 +572,243 @@ class _LLMPanel(QWidget):
             'Without it, such requests are still repaired automatically after '
             'the server rejects them; enable this to skip the failed attempt.'
         )
-        form.addRow('Chat template:', self._strict_template)
 
-        layout.addWidget(group)
+        # llama.cpp-spelled repetition penalty.
+        self._repeat_pen = self._double(
+            config.get('repeat_penalty', 1.0), 1.0, 3.0, 0.05,
+        )
+        self._repeat_pen.setToolTip(
+            'Penalty on tokens that already appeared in the prompt/reply '
+            '(1.0 = off). Around 1.1 curbs loops; high values cause gibberish.\n'
+            'Sent as "repeat_penalty" to the llama.cpp family and as '
+            '"repetition_penalty" to the services that use that spelling.'
+        )
+        # The advanced samplers.  They only work on the local llama.cpp-family
+        # servers; every other provider leaves them out of the request.
+        self._mirostat = QSpinBox()
+        self._mirostat.setRange(0, 2)
+        self._mirostat.setValue(config.get('mirostat', 0))
+        self._mirostat.setToolTip(
+            'Mirostat sampling: 0 = off, 1 = Mirostat v1, 2 = Mirostat v2.\n'
+            'Controls output perplexity toward a target (tau).'
+        )
+        self._mirostat_tau = self._double(
+            config.get('mirostat_tau', 5.0), 0.0, 10.0, 0.5,
+        )
+        self._mirostat_tau.setToolTip(
+            'Target entropy for Mirostat (tau). Lower = tighter, more '
+            'predictable output. Only sent when Mirostat is enabled.'
+        )
+        self._mirostat_eta = self._double(
+            config.get('mirostat_eta', 0.1), 0.0, 1.0, 0.01,
+        )
+        self._mirostat_eta.setToolTip(
+            'Mirostat learning rate (eta). Higher = faster correction toward '
+            'the target entropy. Only sent when Mirostat is enabled.'
+        )
+        self._dry_multiplier = self._double(
+            config.get('dry_multiplier', 0.0), 0.0, 10.0, 0.05,
+        )
+        self._dry_multiplier.setToolTip(
+            'DRY ("Don\'t Repeat Yourself") multiplier; 0 = off.\n'
+            'Penalizes tokens that would continue a repeated sequence.'
+        )
+        self._dry_base = self._double(config.get('dry_base', 1.75), 1.0, 10.0, 0.05)
+        self._dry_base.setToolTip(
+            'DRY base for the exponential penalty growth per repeated token. '
+            'Only sent when the DRY multiplier is enabled.'
+        )
+        self._dry_allowed_length = QSpinBox()
+        self._dry_allowed_length.setRange(0, 100)
+        self._dry_allowed_length.setValue(config.get('dry_allowed_length', 2))
+        self._dry_allowed_length.setToolTip(
+            'How many tokens may repeat before the DRY penalty kicks in. '
+            'Only sent when the DRY multiplier is enabled.'
+        )
+        self._dry_penalty_range = QSpinBox()
+        self._dry_penalty_range.setRange(0, 10000)
+        self._dry_penalty_range.setValue(config.get('dry_penalty_range', 0))
+        self._dry_penalty_range.setToolTip(
+            'How far back (in tokens) DRY looks for repeats; 0 = the whole '
+            'context. The llama.cpp servers count the tokens they scan back '
+            'instead, so 0 becomes their own default of 320.\n'
+            'Only sent when the DRY multiplier is enabled.'
+        )
+        self._xtc_threshold = self._double(
+            config.get('xtc_threshold', 0.1), 0.0, 1.0, 0.01,
+        )
+        self._xtc_threshold.setToolTip(
+            'XTC cuts all tokens above this probability before sampling. '
+            'Only sent when XTC probability is enabled.'
+        )
+        self._xtc_probability = self._double(
+            config.get('xtc_probability', 0.0), 0.0, 1.0, 0.05,
+        )
+        self._xtc_probability.setToolTip(
+            'Chance (0-1) of applying XTC ("Exclude Top Choices") on each '
+            'step; 0 = off. Pushes output away from the safest tokens.'
+        )
+        self._typical_p = self._double(config.get('typical_p', 1.0), 0.0, 1.0, 0.05)
+        self._typical_p.setToolTip(
+            'Typical P sampling (1.0 = off): keeps tokens whose information '
+            'content is close to the expected value.'
+        )
+        self._dynatemp_range = self._double(
+            config.get('dynatemp_range', 0.0), 0.0, 5.0, 0.05,
+        )
+        self._dynatemp_range.setToolTip(
+            'Dynamic temperature range; 0 = off.\n'
+            'Scales temperature to the entropy of each step: confident steps '
+            'cool down, uncertain ones heat up.'
+        )
+        self._dynatemp_exponent = self._double(
+            config.get('dynatemp_exponent', 1.0), 0.0, 10.0, 0.1,
+        )
+        self._dynatemp_exponent.setToolTip(
+            'Shape of the dynamic temperature curve. Only sent when the '
+            'dynatemp range is enabled.'
+        )
+        self._smoothing_factor = self._double(
+            config.get('smoothing_factor', 0.0), 0.0, 10.0, 0.05,
+        )
+        self._smoothing_factor.setToolTip(
+            'Quadratic smoothing of the logits (0 = off): flattens the '
+            'distribution before sampling for more varied output.'
+        )
+        self._min_tokens_to_keep = QSpinBox()
+        self._min_tokens_to_keep.setRange(1, 100)
+        self._min_tokens_to_keep.setValue(config.get('min_tokens_to_keep', 1))
+        self._min_tokens_to_keep.setToolTip(
+            'Minimum tokens kept when a sampler truncates the distribution, '
+            'so generation can never get completely stuck.'
+        )
+        # Every sampler in one section, grouped by type.
+        sampling = QGroupBox('Sampling Parameters')
+        sampling_layout = QVBoxLayout(sampling)
+        sampling_layout.addWidget(self._group('Temperature shaping', [
+            ('temperature', 'Temperature:', self._temp),
+            ('dynatemp_range', 'Dynatemp range (0 = off):', self._dynatemp_range),
+            ('dynatemp_exponent', 'Dynatemp exponent:', self._dynatemp_exponent),
+            ('smoothing_factor', 'Smoothing factor (0 = off):', self._smoothing_factor),
+        ]))
+        sampling_layout.addWidget(self._group('Token selection', [
+            ('top_p', 'Top P:', self._top_p),
+            ('top_k', 'Top K (0 = off):', self._top_k),
+            ('min_p', 'Min P (0 = off):', self._min_p),
+            ('typical_p', 'Typical P (1.0 = off):', self._typical_p),
+            ('min_tokens_to_keep', 'Min tokens to keep:', self._min_tokens_to_keep),
+        ]))
+        sampling_layout.addWidget(self._group('Repetition', [
+            ('frequency_penalty', 'Frequency Penalty:', self._freq_pen),
+            ('presence_penalty', 'Presence Penalty:', self._pres_pen),
+            ('repeat_penalty', 'Repetition penalty (1.0 = off):', self._repeat_pen),
+            ('dry_multiplier', 'DRY multiplier (0 = off):', self._dry_multiplier),
+            ('dry_base', 'DRY base:', self._dry_base),
+            ('dry_allowed_length', 'DRY allowed length:', self._dry_allowed_length),
+            ('dry_penalty_range', 'DRY penalty range (0 = auto):', self._dry_penalty_range),
+        ]))
+        sampling_layout.addWidget(self._group('Adaptive sampling (Mirostat / XTC)', [
+            ('mirostat', 'Mirostat mode (0 = off):', self._mirostat),
+            ('mirostat_tau', 'Mirostat tau:', self._mirostat_tau),
+            ('mirostat_eta', 'Mirostat eta:', self._mirostat_eta),
+            ('xtc_threshold', 'XTC threshold:', self._xtc_threshold),
+            ('xtc_probability', 'XTC probability (0 = off):', self._xtc_probability),
+        ]))
+        sampling_layout.addWidget(self._group('Determinism', [
+            ('seed', 'Seed (-1 = random):', self._seed),
+        ]))
+        layout.addWidget(sampling)
+
+        request = QGroupBox('Output & Request')
+        request_form = QFormLayout(request)
+        request_form.addRow('Context Size (tokens):', self._context_size)
+        request_form.addRow('Output Length (max tokens):', self._max_tokens)
+        request_form.addRow(
+            self._register_row('stop', 'Stop sequences:', self._stop), self._stop,
+        )
+        request_form.addRow('Retries on failure:', self._retries)
+        request_form.addRow('Chat template:', self._strict_template)
+        layout.addWidget(request)
+
         layout.addStretch()
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
+
+    def _register_row(self, key: str, text: str, widget: QWidget) -> QLabel:
+        """Create the label of a setting row and remember it for flagging."""
+        label = QLabel(text)
+        label.setStyleSheet('color: #ccc;')
+        self._rows[key] = (label, widget, text, widget.toolTip())
+        return label
+
+    def _group(self, title: str, rows: list[tuple[str, str, QWidget]]) -> QGroupBox:
+        """Build one labelled group of settings.
+
+        Each row is (setting key, label text, widget).  The key indexes the
+        provider capability table, so the row can be flagged when the
+        selected provider does not honour the setting.
+        """
+        form = QFormLayout()
+        form.setContentsMargins(8, 4, 8, 4)
+        for key, text, widget in rows:
+            form.addRow(self._register_row(key, text, widget), widget)
+        group = QGroupBox(title)
+        group.setLayout(form)
+        return group
+
+    def set_provider(self, provider: str) -> None:
+        """Flag the settings the selected provider does not honour.
+
+        The request body is the same for every provider, but the backends do
+        not agree on which parameters they implement: OpenAI and Mistral
+        reject unknown keys, several hosted services ignore them, and the
+        llama.cpp family has extras the hosted APIs lack.  Marking the rows
+        saves the user from wondering why a slider does nothing.
+        """
+        self._provider = provider
+        self._apply_row_states()
+
+    def _apply_row_states(self) -> None:
+        """Re-apply the warnings (and the grey-out) for the current provider."""
+        provider = self._provider
+        unsupported = unsupported_settings(provider)
+        strict = rejects_unknown_parameters(provider)
+        grey = self._grey_unsupported.isChecked()
+        for key, (label, widget, text, tooltip) in self._rows.items():
+            if key in unsupported:
+                effect = (
+                    'the request will be rejected'
+                    if strict else 'the server will ignore it'
+                )
+                label.setText(f'{text} (not supported by {provider})')
+                label.setStyleSheet('color: #e0a030;')
+                widget.setToolTip(
+                    f'{provider} does not implement this setting: {effect}.'
+                )
+                widget.setEnabled(not grey)
+            else:
+                label.setText(text)
+                label.setStyleSheet('color: #ccc;')
+                widget.setToolTip(tooltip)
+                widget.setEnabled(True)
+        self._refresh_provider_note(provider, unsupported)
+
+    def _refresh_provider_note(self, provider: str, unsupported: set[str]) -> None:
+        if not unsupported:
+            self._provider_note.setText('')
+            self._provider_note.setVisible(False)
+            return
+        names = ', '.join(_unsupported_summary(unsupported))
+        tail = (
+            'They are greyed out and left out of the request, so they have '
+            'no effect.'
+            if self._grey_unsupported.isChecked()
+            else 'They are left out of the request, so they have no effect.'
+        )
+        self._provider_note.setText(
+            f'{provider} does not implement: {names}. {tail}'
+        )
+        self._provider_note.setVisible(True)
 
     @staticmethod
     def _double(value: float, lo: float, hi: float, step: float) -> QDoubleSpinBox:
@@ -491,6 +833,21 @@ class _LLMPanel(QWidget):
             'retry_attempts': self._retries.value(),
             'stop': self._stop_text_list(),
             'strict_chat_template': self._strict_template.isChecked(),
+            'repeat_penalty': self._repeat_pen.value(),
+            'mirostat': self._mirostat.value(),
+            'mirostat_tau': self._mirostat_tau.value(),
+            'mirostat_eta': self._mirostat_eta.value(),
+            'dry_multiplier': self._dry_multiplier.value(),
+            'dry_base': self._dry_base.value(),
+            'dry_allowed_length': self._dry_allowed_length.value(),
+            'dry_penalty_range': self._dry_penalty_range.value(),
+            'xtc_threshold': self._xtc_threshold.value(),
+            'xtc_probability': self._xtc_probability.value(),
+            'typical_p': self._typical_p.value(),
+            'dynatemp_range': self._dynatemp_range.value(),
+            'dynatemp_exponent': self._dynatemp_exponent.value(),
+            'smoothing_factor': self._smoothing_factor.value(),
+            'min_tokens_to_keep': self._min_tokens_to_keep.value(),
         }
 
     def _stop_text_list(self) -> list[str]:
@@ -508,6 +865,21 @@ class _LLMPanel(QWidget):
         self._seed.setValue(config.get('seed', -1))
         self._retries.setValue(config.get('retry_attempts', 2))
         self._strict_template.setChecked(bool(config.get('strict_chat_template', False)))
+        self._repeat_pen.setValue(config.get('repeat_penalty', 1.0))
+        self._mirostat.setValue(config.get('mirostat', 0))
+        self._mirostat_tau.setValue(config.get('mirostat_tau', 5.0))
+        self._mirostat_eta.setValue(config.get('mirostat_eta', 0.1))
+        self._dry_multiplier.setValue(config.get('dry_multiplier', 0.0))
+        self._dry_base.setValue(config.get('dry_base', 1.75))
+        self._dry_allowed_length.setValue(config.get('dry_allowed_length', 2))
+        self._dry_penalty_range.setValue(config.get('dry_penalty_range', 0))
+        self._xtc_threshold.setValue(config.get('xtc_threshold', 0.1))
+        self._xtc_probability.setValue(config.get('xtc_probability', 0.0))
+        self._typical_p.setValue(config.get('typical_p', 1.0))
+        self._dynatemp_range.setValue(config.get('dynatemp_range', 0.0))
+        self._dynatemp_exponent.setValue(config.get('dynatemp_exponent', 1.0))
+        self._smoothing_factor.setValue(config.get('smoothing_factor', 0.0))
+        self._min_tokens_to_keep.setValue(config.get('min_tokens_to_keep', 1))
         stop_value = config.get('stop', [])
         if isinstance(stop_value, (list, tuple)):
             stop_value = ', '.join(str(s) for s in stop_value)
@@ -601,20 +973,20 @@ class _PromptsPanel(QWidget):
         layout = QVBoxLayout(self)
 
         template_row = QHBoxLayout()
-        template_row.addWidget(QLabel('System prompt template:'))
+        template_row.addWidget(QLabel('System prompt:'))
         self._template_combo = QComboBox()
         self._template_combo.setMinimumWidth(180)
         self._template_combo.setToolTip(
-            "Main prompt used for Test chats: the selected template is the "
-            "first system block, and the character's own system prompt is "
+            "Main prompt used for Test chats: the selected system prompt is "
+            "the first system block, and the character's own system prompt is "
             "appended after it.\n"
             'The "Custom" entry is the editable Chat prompt below.'
         )
         self._refresh_template_combo()
         template_row.addWidget(self._template_combo)
-        manage_btn = QPushButton('Manage Templates...')
+        manage_btn = QPushButton('Manage System Prompts...')
         manage_btn.setToolTip(
-            'Create, edit, or delete named system prompt templates\n'
+            'Create, edit, or delete named system prompts\n'
             '(Natural Chat, Simple Roleplay, ...) and their post-history '
             'instructions.'
         )
@@ -622,6 +994,28 @@ class _PromptsPanel(QWidget):
         template_row.addWidget(manage_btn)
         template_row.addStretch()
         layout.addLayout(template_row)
+
+        context_row = QHBoxLayout()
+        context_row.addWidget(QLabel('Context template:'))
+        self._context_combo = QComboBox()
+        self._context_combo.setMinimumWidth(180)
+        self._context_combo.setToolTip(
+            'How Test-chat contexts are framed and named: system block '
+            'labels, speaker names on messages, example-dialogue formatting.\n'
+            'The "Default" entry keeps the classic output.'
+        )
+        self._refresh_context_combo()
+        context_row.addWidget(self._context_combo)
+        manage_ctx_btn = QPushButton('Manage Context Templates...')
+        manage_ctx_btn.setToolTip(
+            'Create, edit, or delete context templates (Default, Alpaca-'
+            'Style, Roleplay, ...) controlling block framing, names, and '
+            'example formatting.'
+        )
+        manage_ctx_btn.clicked.connect(self._on_manage_context_templates)
+        context_row.addWidget(manage_ctx_btn)
+        context_row.addStretch()
+        layout.addLayout(context_row)
 
         selector_row = QHBoxLayout()
         selector_row.addWidget(QLabel('Edit prompt:'))
@@ -640,6 +1034,8 @@ class _PromptsPanel(QWidget):
             ('Fill Fields', ['fill_system', 'fill_user']),
             ('Wizard', ['wizard_system', 'wizard_user']),
             ('Chat', ['chat_system']),
+            ('Character', ['character_system', 'character_user']),
+            ('Impersonate', ['impersonate_user', 'continue_user']),
             ('Memory', ['memory_summary_system', 'memory_summary_user']),
             ('Attributes', ['attribute_update_system', 'attribute_update_user']),
             ('Lorebook', ['lorebook_system', 'lorebook_user']),
@@ -671,6 +1067,29 @@ class _PromptsPanel(QWidget):
         dlg.deleteLater()
         self._refresh_template_combo()
 
+    def _refresh_context_combo(self) -> None:
+        from src.context_templates import (
+            active_context_template_id,
+            all_templates,
+        )
+
+        self._context_combo.blockSignals(True)
+        self._context_combo.clear()
+        active = active_context_template_id()
+        for tpl in all_templates():
+            self._context_combo.addItem(tpl.name, tpl.id)
+        idx = self._context_combo.findData(active)
+        self._context_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._context_combo.blockSignals(False)
+
+    def _on_manage_context_templates(self) -> None:
+        from src.ui.widgets.context_template_dialog import ContextTemplateDialog
+
+        dlg = ContextTemplateDialog(self)
+        dlg.exec()
+        dlg.deleteLater()
+        self._refresh_context_combo()
+
     def save(self) -> None:
         for index in range(self._stack.count()):
             tab = self._stack.widget(index)
@@ -678,6 +1097,8 @@ class _PromptsPanel(QWidget):
                 ai_prompts.save_prompt(key, value)
         from src.prompt_templates import save_active_template_id
         save_active_template_id(self._template_combo.currentData() or 'custom')
+        from src.context_templates import save_active_context_template_id
+        save_active_context_template_id(self._context_combo.currentData() or 'default')
 
 
 class _EditorPanel(QWidget):
@@ -1031,6 +1452,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
 
         self._api_panel.provider_changed.connect(self._on_provider_changed)
+        self._llm_panel.set_provider(active)
 
     def _on_provider_changed(self, new_name: str) -> None:
         if not new_name:
@@ -1042,6 +1464,9 @@ class SettingsDialog(QDialog):
         cfg = self._configs.get(new_name, {})
         self._api_panel.load_connection(cfg)
         self._llm_panel.load_values(cfg)
+        # The backends disagree on which parameters they implement, so the
+        # LLM panel has to be re-flagged for the new provider.
+        self._llm_panel.set_provider(new_name)
 
     def _collect_current(self) -> dict:
         cfg = self._api_panel.connection_values()

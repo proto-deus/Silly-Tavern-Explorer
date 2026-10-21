@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from src.lorebook_sync import (
     LorebookPlanItem,
+    LorebookSyncCategory,
     LorebookSyncPair,
     bulk_lorebook_sync,
     compare_lorebooks,
@@ -16,6 +18,28 @@ from src.lorebook_sync import (
 from src.sillytavern_sync import SyncSummary
 
 logger = logging.getLogger(__name__)
+
+#: The pair categories whose two sides can be compared entry by entry.
+DIFFABLE_CATEGORIES = frozenset({
+    LorebookSyncCategory.ST_CHANGED,
+    LorebookSyncCategory.EXPLORER_CHANGED,
+    LorebookSyncCategory.BOTH_CHANGED,
+})
+
+
+def diffable_pairs(pairs) -> list:
+    """The lorebook pairs whose two copies should be compared.
+
+    Only pairs that exist on both sides and are not in sync can show a
+    difference.  Pure function so the selection is unit-testable without Qt.
+    """
+    out = []
+    for pair in pairs or ():
+        if pair.explorer is None or pair.st is None:
+            continue
+        if pair.category in DIFFABLE_CATEGORIES:
+            out.append(pair)
+    return out
 
 
 class LorebookScanWorker(QThread):
@@ -52,6 +76,65 @@ class LorebookScanWorker(QThread):
         except Exception as e:
             logger.exception("Lorebook sync scan failed")
             self.failed.emit(str(e))
+
+
+class LorebookDiffWorker(QThread):
+    """Compare the Explorer and SillyTavern copies of the given lorebooks.
+
+    Reading and parsing both copies of every book is too slow for the UI
+    thread, so the field-level diff is computed in the background.
+
+    Signals:
+        completed(diffs) — ``list[CardDiff]`` on success.
+        failed(message)  — error message string on failure.
+    """
+
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, pairs, parent=None):
+        super().__init__(parent)
+        self.pairs = list(pairs or ())
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        from src.lorebook_store import parse_book_json
+        from src.safe_json import loads_safe
+        from src.sync_diff import diff_lorebooks
+        from src.fs_utils import decode_text
+        from src import vault
+
+        def _read_book(path: str):
+            """Parse the lorebook stored at *path* (vault-aware)."""
+            try:
+                raw_bytes = vault.read_bytes(Path(path))
+                return parse_book_json(loads_safe(decode_text(raw_bytes)))
+            except (OSError, ValueError, vault.VaultError) as exc:
+                logger.warning("Could not read the lorebook %s: %s", path, exc)
+                return None
+
+        diffs = []
+        try:
+            for pair in self.pairs:
+                if self._cancel:
+                    return
+                explorer = pair.explorer
+                st = pair.st
+                if explorer is None or st is None:
+                    continue
+                local = _read_book(explorer.path)
+                remote = _read_book(st.path)
+                if local is None or remote is None:
+                    continue
+                diffs.append(diff_lorebooks(local, remote))
+        except Exception as e:
+            logger.exception("LorebookDiffWorker crashed while comparing the books")
+            self.failed.emit(str(e))
+            return
+        self.completed.emit(diffs)
 
 
 class LorebookActionWorker(QThread):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json as _json
+from src import safe_json as _json
 import logging
 from pathlib import Path
 
@@ -32,7 +32,7 @@ def _entry_has_tags(entry: dict) -> bool:
     if not tags_str:
         return False
     try:
-        tags = _json.loads(tags_str)
+        tags = _json.loads_safe(tags_str)
         return isinstance(tags, list) and len(tags) > 0
     except (_json.JSONDecodeError, TypeError):
         return False
@@ -96,7 +96,7 @@ class _BatchWorker(QThread):
             self.error.emit(str(e))
 
     def _run(self):
-        entries = self.db.get_all()
+        entries = self.db.get_all(light=True)
         to_process = []
         for entry in entries:
             needs_tags = self.do_tags and not _entry_has_tags(entry)

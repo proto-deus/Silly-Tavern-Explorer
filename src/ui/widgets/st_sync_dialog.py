@@ -72,6 +72,8 @@ class STSyncDialog(QDialog):
         self._pairs: list[SyncPair] = []
         self._sync_worker = None
         self._scan_worker = None
+        self._diff_worker = None
+        self._diff_dialog = None
         self._scan_gen = 0
         self._progress: QProgressDialog | None = None
 
@@ -141,6 +143,15 @@ class STSyncDialog(QDialog):
         self._delete_st_btn.setEnabled(False)
         self._delete_st_btn.clicked.connect(self._on_delete_st)
         btn_row.addWidget(self._delete_st_btn)
+
+        self._diff_btn = QPushButton('Show changes')
+        self._diff_btn.setToolTip(
+            'Show which fields differ between the ST Explorer and the '
+            'SillyTavern copy of every card that would be pushed or pulled.'
+        )
+        self._diff_btn.setEnabled(False)
+        self._diff_btn.clicked.connect(self._on_show_changes)
+        btn_row.addWidget(self._diff_btn)
 
         btn_row.addStretch()
 
@@ -258,14 +269,23 @@ class STSyncDialog(QDialog):
             self._link_btn.setEnabled(False)
             self._unlink_btn.setEnabled(False)
             self._delete_st_btn.setEnabled(False)
+            self._diff_btn.setEnabled(False)
         else:
             # Re-evaluate link/unlink button states from the current selection.
             self._on_selection_changed()
+            self._update_diff_button()
+
+    def _update_diff_button(self) -> None:
+        """Enable the diff button only when there is something to compare."""
+        from src.ui.widgets.sync_worker import diffable_pairs
+
+        self._diff_btn.setEnabled(bool(diffable_pairs(self._pairs)))
 
     def _refresh_tree(self) -> None:
         self._tree.clear()
         if not self._pairs:
             self._status_label.setText('No cards to compare.')
+            self._update_diff_button()
             return
 
         groups: dict[SyncCategory, list[SyncPair]] = {}
@@ -298,6 +318,7 @@ class STSyncDialog(QDialog):
         counts = summarize_pairs(self._pairs)
         summary_parts = [f"{v} {category_label(SyncCategory(k))}" for k, v in counts.items()]
         self._status_label.setText('  |  '.join(summary_parts))
+        self._update_diff_button()
 
     # ---- detail pane + button enable/disable ----
 
@@ -355,6 +376,68 @@ class STSyncDialog(QDialog):
             parts.append(f"Creator: {pair.st.creator}")
             parts.append(f"Hash: {pair.st.card_hash[:12]}")
         self._detail_text.setPlainText('\n'.join(parts))
+
+    # ---- diff view ----
+
+    def _on_show_changes(self) -> None:
+        """Show which fields differ between the two copies of a card.
+
+        The comparison reads and parses the card files on both sides, so it
+        runs in a background thread (see :class:`DiffWorker`); the UI thread
+        must never walk the SillyTavern directory.
+        """
+        from src.ui.widgets.sync_worker import DiffWorker, diffable_pairs
+
+        pairs = diffable_pairs(self._pairs)
+        if not pairs:
+            self._status_label.setText('No differing cards to compare.')
+            return
+        if self._worker_is_alive(self._diff_worker):
+            self._status_label.setText('A comparison is already running.')
+            return
+        self._diff_btn.setEnabled(False)
+        self._status_label.setText('Comparing cards...')
+        worker = DiffWorker(pairs)
+        self._diff_worker = worker
+        _LIVE_WORKERS.append(worker)
+        # Bound-method slots run on the GUI thread (queued connection);
+        # lambdas would execute on the worker thread.
+        worker.completed.connect(self._on_diff_finished)
+        worker.failed.connect(self._on_diff_failed)
+        worker.finished.connect(self._on_diff_worker_finished)
+        # Cleanup on the built-in signal for every outcome (success included).
+        worker.finished.connect(self._release_worker)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_diff_worker_finished(self) -> None:
+        self._diff_worker = None
+        self._update_diff_button()
+
+    def _on_diff_finished(self, diffs) -> None:
+        from src.sync_diff import summarize_diffs
+        from src.ui.widgets.sync_diff_dialog import SyncDiffDialog
+
+        summary = summarize_diffs(diffs)
+        self._status_label.setText(summary)
+        if not diffs:
+            return
+        existing = self._diff_dialog
+        if existing is not None:
+            try:
+                existing.close()
+            except RuntimeError:
+                pass   # the C++ object is already gone
+        dlg = SyncDiffDialog(diffs, 'SillyTavern - Changes', self)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        # A strong reference: without one the wrapper could be collected and
+        # the dialog would disappear while it is on screen.
+        self._diff_dialog = dlg
+        dlg.show()
+
+    def _on_diff_failed(self, message: str) -> None:
+        self._status_label.setText(f'Comparison failed: {message}')
+        self._update_diff_button()
 
     # ---- per-card actions ----
 
@@ -476,7 +559,7 @@ class STSyncDialog(QDialog):
         live QThread aborts the process.
         """
         ok = True
-        for worker in (self._scan_worker, self._sync_worker):
+        for worker in (self._scan_worker, self._sync_worker, self._diff_worker):
             if not self._worker_is_alive(worker):
                 continue
             try:

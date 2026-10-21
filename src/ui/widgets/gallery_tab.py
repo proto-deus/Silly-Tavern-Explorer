@@ -16,6 +16,7 @@ import logging
 from pathlib import Path
 
 from src import gallery_store
+from src.ui.styles import ui_font_px
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +167,7 @@ if QWidget is not None:
 
             header = QHBoxLayout()
             self._title_label = QLabel('No character selected')
-            self._title_label.setStyleSheet('font-weight: bold; font-size: 14px;')
+            self._title_label.setStyleSheet(f'font-weight: bold; font-size: {ui_font_px(1)}px;')
             header.addWidget(self._title_label)
             self._count_label = QLabel('')
             self._count_label.setStyleSheet('color: #888;')

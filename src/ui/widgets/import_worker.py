@@ -13,6 +13,24 @@ from src.token_counter import count_card_tokens
 logger = logging.getLogger(__name__)
 
 
+def notify_card_imported(card_id: int, name: str) -> None:
+    """Announce an imported card to the plugin/event bus.
+
+    The event module is imported lazily - it is an optional cross-cutting
+    module and must not be pulled in at start-up - and every error is
+    swallowed: a failing user plugin must never break the import.
+
+    Args:
+        card_id: The database id of the imported card.
+        name: The name of the imported card.
+    """
+    try:
+        from src import app_events
+        app_events.card_imported(card_id, name)
+    except Exception:
+        logger.exception("Could not announce the imported card")
+
+
 @dataclass
 class FileImportResult:
     """Outcome of importing a single file.
@@ -106,6 +124,7 @@ def import_single_file(
                 )
         char_id = db.add_card(card)
         if char_id:
+            notify_card_imported(char_id, card.name)
             return FileImportResult(path=path, char_id=char_id)
         return FileImportResult(path=path, error='Import failed')
     except Exception as e:

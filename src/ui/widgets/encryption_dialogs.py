@@ -141,9 +141,15 @@ class EnableEncryptionDialog(QDialog):
         self._strength.setText(f'Strength: {_password_strength(text)}')
 
     def _validate(self) -> None:
+        from src import vault
+
         password = self._password.text()
         if not password:
             QMessageBox.warning(self, 'Enable Encryption', 'Please enter a password.')
+            return
+        problem = vault.check_password_policy(password)
+        if problem:
+            QMessageBox.warning(self, 'Enable Encryption', problem)
             return
         if password != self._confirm.text():
             QMessageBox.warning(self, 'Enable Encryption', 'The passwords do not match.')

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src import image_safety
 
 
 def clamp(value: float, lo: float, hi: float) -> float:
@@ -121,9 +122,10 @@ if QAction is not None:
                 # Fall back to Pillow for formats Qt can't read directly.
                 try:
                     import io
-                    from PIL import Image
                     from PIL.ImageQt import ImageQt
-                    img = Image.open(io.BytesIO(data)).convert('RGBA')
+                    img = image_safety.load_checked(
+                        image_safety.open_checked(io.BytesIO(data)),
+                    ).convert('RGBA')
                     pixmap = QPixmap.fromImage(ImageQt(img))
                 except Exception:
                     pass

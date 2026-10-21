@@ -38,7 +38,7 @@ class SystemTemplateDialog(QDialog):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setWindowTitle('System Prompt Templates')
+        self.setWindowTitle('System Prompts')
         self.setMinimumSize(720, 460)
 
         self._templates: list[SystemPromptTemplate] = all_templates()
@@ -46,10 +46,11 @@ class SystemTemplateDialog(QDialog):
 
         layout = QVBoxLayout(self)
         hint = QLabel(
-            'The selected template is the chat\'s main prompt (first system '
-            'block). The character\'s own system prompt is appended after it; '
-            'the template\'s post-history instructions follow the card\'s. '
-            'Macros like {{user}} / {{char}} are substituted at send time.'
+            'The selected system prompt is the chat\'s main prompt (first '
+            'system block). The character\'s own system prompt is appended '
+            'after it; this prompt\'s post-history instructions follow the '
+            'card\'s. Macros like {{user}} / {{char}} are substituted at '
+            'send time.'
         )
         hint.setWordWrap(True)
         hint.setStyleSheet('color: #aaa;')
@@ -82,7 +83,7 @@ class SystemTemplateDialog(QDialog):
         self._name = QLineEdit()
         self._name.textEdited.connect(self._sync_current)
         right.addWidget(self._name)
-        right.addWidget(QLabel('System prompt template:'))
+        right.addWidget(QLabel('System prompt:'))
         self._content = SpellCheckPlainTextEdit()
         self._content.setPlaceholderText(
             "e.g. You're {{char}} in this fictional roleplay with {{user}}."
@@ -147,13 +148,13 @@ class SystemTemplateDialog(QDialog):
         self._delete_btn.setEnabled(editable)
         if tpl.id == CUSTOM_TEMPLATE_ID:
             self._note.setText(
-                'The "Custom" template is edited in Settings > Prompts '
+                'The "Custom" system prompt is edited in Settings > Prompts '
                 '("Chat"), shared with the other AI prompts.'
             )
         elif tpl.builtin:
             self._note.setText(
-                'Built-in templates are read-only. Use Duplicate to create '
-                'an editable copy.'
+                'Built-in system prompts are read-only. Use Duplicate to '
+                'create an editable copy.'
             )
         else:
             self._note.setText('')

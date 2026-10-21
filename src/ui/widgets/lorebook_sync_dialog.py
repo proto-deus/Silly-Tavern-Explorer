@@ -76,6 +76,8 @@ class LorebookSyncDialog(QDialog):
         self._pairs: list[LorebookSyncPair] = []
         self._scan_worker = None
         self._action_worker = None
+        self._diff_worker = None
+        self._diff_dialog = None
         self._scan_gen = 0
         self._progress: QProgressDialog | None = None
 
@@ -137,6 +139,15 @@ class LorebookSyncDialog(QDialog):
         self._push_btn.setEnabled(False)
         self._push_btn.clicked.connect(self._on_push_selected)
         btn_row.addWidget(self._push_btn)
+
+        self._diff_btn = QPushButton('Show changes')
+        self._diff_btn.setToolTip(
+            'Show which entries differ between the ST Explorer and the '
+            'SillyTavern copy of every book that would be pushed or pulled.'
+        )
+        self._diff_btn.setEnabled(False)
+        self._diff_btn.clicked.connect(self._on_show_changes)
+        btn_row.addWidget(self._diff_btn)
 
         btn_row.addStretch()
 
@@ -240,13 +251,22 @@ class LorebookSyncDialog(QDialog):
         if busy:
             self._pull_btn.setEnabled(False)
             self._push_btn.setEnabled(False)
+            self._diff_btn.setEnabled(False)
         else:
             self._on_selection_changed()
+            self._update_diff_button()
+
+    def _update_diff_button(self) -> None:
+        """Enable the diff button only when there is something to compare."""
+        from src.ui.widgets.lorebook_sync_worker import diffable_pairs
+
+        self._diff_btn.setEnabled(bool(diffable_pairs(self._pairs)))
 
     def _refresh_tree(self) -> None:
         self._tree.clear()
         if not self._pairs:
             self._status_label.setText('No lorebooks to compare.')
+            self._update_diff_button()
             return
 
         groups: dict[LorebookSyncCategory, list[LorebookSyncPair]] = {}
@@ -282,6 +302,7 @@ class LorebookSyncDialog(QDialog):
             for k, v in counts.items()
         ]
         self._status_label.setText('  |  '.join(summary_parts))
+        self._update_diff_button()
 
     # ---- detail pane + button enable/disable ----
 
@@ -316,6 +337,67 @@ class LorebookSyncDialog(QDialog):
             parts.append(f"Name: {pair.st.name}")
             parts.append(f"Entries: {pair.st.entry_count}")
         self._detail_text.setPlainText('\n'.join(parts))
+
+    # ---- diff view ----
+
+    def _on_show_changes(self) -> None:
+        """Show which entries differ between the two copies of a lorebook.
+
+        The comparison reads and parses the book files on both sides, so it
+        runs in a background thread (see :class:`LorebookDiffWorker`).
+        """
+        from src.ui.widgets.lorebook_sync_worker import LorebookDiffWorker, diffable_pairs
+
+        pairs = diffable_pairs(self._pairs)
+        if not pairs:
+            self._status_label.setText('No differing lorebooks to compare.')
+            return
+        if self._worker_is_alive(self._diff_worker):
+            self._status_label.setText('A comparison is already running.')
+            return
+        self._diff_btn.setEnabled(False)
+        self._status_label.setText('Comparing lorebooks...')
+        worker = LorebookDiffWorker(pairs)
+        self._diff_worker = worker
+        _LIVE_WORKERS.append(worker)
+        # Bound-method slots run on the GUI thread (queued connection);
+        # lambdas would execute on the worker thread.
+        worker.completed.connect(self._on_diff_finished)
+        worker.failed.connect(self._on_diff_failed)
+        worker.finished.connect(self._on_diff_worker_finished)
+        # Cleanup on the built-in signal for every outcome (success included).
+        worker.finished.connect(self._release_worker)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_diff_worker_finished(self) -> None:
+        self._diff_worker = None
+        self._update_diff_button()
+
+    def _on_diff_finished(self, diffs) -> None:
+        from src.sync_diff import summarize_diffs
+        from src.ui.widgets.sync_diff_dialog import SyncDiffDialog
+
+        summary = summarize_diffs(diffs)
+        self._status_label.setText(summary)
+        if not diffs:
+            return
+        existing = self._diff_dialog
+        if existing is not None:
+            try:
+                existing.close()
+            except RuntimeError:
+                pass   # the C++ object is already gone
+        dlg = SyncDiffDialog(diffs, 'Lorebook - Changes', self)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        # A strong reference: without one the wrapper could be collected and
+        # the dialog would disappear while it is on screen.
+        self._diff_dialog = dlg
+        dlg.show()
+
+    def _on_diff_failed(self, message: str) -> None:
+        self._status_label.setText(f'Comparison failed: {message}')
+        self._update_diff_button()
 
     # ---- actions ----
 
@@ -398,7 +480,7 @@ class LorebookSyncDialog(QDialog):
         live QThread aborts the process.
         """
         ok = True
-        for worker in (self._scan_worker, self._action_worker):
+        for worker in (self._scan_worker, self._action_worker, self._diff_worker):
             if not self._worker_is_alive(worker):
                 continue
             try:

@@ -3,11 +3,21 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QWidget
 
+from src.ui.styles import ui_font_px
+
 _FILLED = '★'
 _EMPTY = '☆'
 _COLOR_FILLED = '#f5c542'
 _COLOR_EMPTY = '#666'
-_FONT_SIZE = 16
+
+#: The stars are drawn larger than the surrounding text.  The size tracks
+#: the View > Font Size setting instead of being a fixed pixel value.
+_STAR_SIZE_DELTA = 3
+
+
+def star_font_size() -> int:
+    """The pixel size of the rating stars."""
+    return ui_font_px(_STAR_SIZE_DELTA)
 
 
 def clamp_rating(value: int) -> int:
@@ -42,7 +52,16 @@ class _StarLabel(QLabel):
         self._on_hover_cb = on_hover
         self._on_click_cb = on_click
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet(f'font-size: {_FONT_SIZE}px; color: {_COLOR_EMPTY};')
+        self.setAccessibleName(f'Star {index}')
+        self.setStyleSheet(
+            f'font-size: {star_font_size()}px; color: {_COLOR_EMPTY};',
+        )
+
+    def refresh_font_size(self) -> None:
+        """Re-apply the font size after the app font size changed."""
+        self.setStyleSheet(
+            f'font-size: {star_font_size()}px; color: {_COLOR_EMPTY};',
+        )
 
     def mousePressEvent(self, event) -> None:
         self._on_click_cb(self._index)
@@ -82,13 +101,18 @@ class RatingWidget(QWidget):
 
     def _apply_stars(self) -> None:
         filled = filled_star_count(self._rating, self._hover)
+        size = star_font_size()
         for i, star in enumerate(self._stars, start=1):
             if i <= filled:
                 star.setText(_FILLED)
-                star.setStyleSheet(f'font-size: {_FONT_SIZE}px; color: {_COLOR_FILLED};')
+                star.setStyleSheet(f'font-size: {size}px; color: {_COLOR_FILLED};')
             else:
                 star.setText(_EMPTY)
-                star.setStyleSheet(f'font-size: {_FONT_SIZE}px; color: {_COLOR_EMPTY};')
+                star.setStyleSheet(f'font-size: {size}px; color: {_COLOR_EMPTY};')
+
+    def refresh_font_size(self) -> None:
+        """Re-apply the star size after the app font size changed."""
+        self._apply_stars()
 
     def _on_hover(self, index: int) -> None:
         self._hover = index
