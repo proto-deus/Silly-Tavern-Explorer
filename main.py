@@ -67,6 +67,44 @@ def _show_missing_dep_error(missing: list[str]) -> None:
     QMessageBox.critical(None, 'ST Explorer - Missing Dependencies', message)
 
 
+def _start_auto_backup() -> None:
+    """Run the automatic library backup in the background, if enabled.
+
+    The portable config controls it::
+
+        [backup]
+        auto_backup = true
+        keep = 5
+
+    The backup runs on a daemon thread so the window appears immediately; a
+    failure is logged and never surfaces to the user (a scheduled backup must
+    not interrupt anything).
+    """
+    try:
+        from src.portable_config import get
+        if not bool(get('backup.auto_backup', False)):
+            return
+        keep = max(1, min(50, int(get('backup.keep', 5))))
+    except Exception:
+        return
+
+    import threading
+
+    def _run() -> None:
+        try:
+            from src.library_backup import run_scheduled_backup
+            result = run_scheduled_backup(keep=keep)
+            if result:
+                logging.getLogger(__name__).info(
+                    "Automatic backup written to %s", result.get('path', '?'),
+                )
+        except Exception:
+            logging.getLogger(__name__).exception("The automatic backup failed")
+
+    thread = threading.Thread(target=_run, name='auto-backup', daemon=True)
+    thread.start()
+
+
 def main():
     # Point tiktoken at the vocab files bundled by build.spec so token
     # counting works offline in the frozen executable (must be set before
@@ -94,11 +132,36 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName('ST Explorer')
     app.setOrganizationName('STExplorer')
-    apply_theme(app, load_font_size())
+    from src.settings_manager import load_theme
+    apply_theme(app, load_font_size(), load_theme())
+    # Cap the size of any image the app is willing to decode.  Pillow's own
+    # default is high enough that a 380 KiB PNG can expand to 381 MiB of RAM.
+    try:
+        from src import image_safety
+        image_safety.apply_limits()
+    except Exception:
+        logging.getLogger(__name__).exception("Could not apply the image size limit")
 
     lock = SingleInstance()
     try:
-        if not lock.acquire():
+        # A restart (File > Restore Library) launches the new instance while
+        # this one is still shutting down and therefore still holds the
+        # lock.  Give it a short grace period instead of failing with
+        # "already running".
+        def _on_wait(seconds: float) -> None:
+            # Without this the window appears to hang for the whole grace
+            # period, with no sign of what it is waiting for.
+            logger.info(
+                "Waiting for the other instance to close (%.0f s)", seconds,
+            )
+            try:
+                from PyQt6.QtCore import Qt
+                from PyQt6.QtWidgets import QApplication
+                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            except Exception:
+                pass
+
+        if not lock.acquire(wait_seconds=15.0, on_wait=_on_wait):
             QMessageBox.warning(
                 None, 'ST Explorer',
                 'ST Explorer is already running.',
@@ -124,9 +187,31 @@ def main():
                     'See the log for details: ~/.st-explorer/app.log',
                 )
                 sys.exit(1)
+            if vault.migration_pending():
+                # The vault was enabled but the sealing pass never finished
+                # (a crash or a cancelled migration).  Half the library is
+                # still in plaintext - say so instead of letting it pass
+                # unnoticed.
+                logging.getLogger(__name__).warning(
+                    "The encryption migration did not finish; re-sealing the library.",
+                )
+                try:
+                    vault.seal_all_files()
+                    vault.seal_database()
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Could not finish the encryption migration",
+                    )
+                else:
+                    QMessageBox.information(
+                        None, 'ST Explorer',
+                        'The encryption of your library had not finished and '
+                        'has now been completed.',
+                    )
 
         db = LibraryDatabase()
         window = MainWindow(db)
+        _start_auto_backup()
     except Exception:
         logging.getLogger(__name__).exception("Startup failed")
         QMessageBox.critical(
@@ -151,7 +236,19 @@ def main():
     app.aboutToQuit.connect(_seal_on_exit)
 
     logger.info("ST Explorer started")
-    sys.exit(app.exec())
+    try:
+        sys.exit(app.exec())
+    finally:
+        # The OS lock is released when the process dies anyway, but an
+        # explicit release means the lock is gone before the interpreter
+        # starts tearing down - so a restart (File > Restore Library) does
+        # not have to wait for it.
+        try:
+            lock.release()
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "The single-instance lock could not be released", exc_info=True,
+            )
 
 
 if __name__ == '__main__':
