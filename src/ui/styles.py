@@ -566,6 +566,21 @@ QFrame[frameShape="4"] {
     background-color: $accent;
 }
 
+/* --- Library filter chips and dividers -------------------------------- */
+
+QLabel#filterChip, QCheckBox#filterChip {
+    background-color: $hover;
+    border: 1px solid $muted;
+    border-radius: 4px;
+    padding: 4px 10px;
+    color: $fg;
+    font-weight: bold;
+}
+
+QWidget#gridSeparator {
+    background-color: $border_dim;
+}
+
 /* --- Focus and disabled states ---------------------------------------- */
 
 QPushButton:focus {

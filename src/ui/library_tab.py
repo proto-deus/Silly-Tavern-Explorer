@@ -312,6 +312,30 @@ class SelectionModel:
         self._anchor = None
 
 
+def _detail_pane_initial_height(line_h: int) -> int:
+    """Initial height of the detail pane below the card grid.
+
+    200px plus one text line for each of the pane's three display sections
+    (tags, summary, description), so every one of them gains a line.
+    """
+    return 200 + 3 * line_h
+
+
+def _summary_max_height(pane_height: int, line_h: int) -> int:
+    """Cap the summary at ~1/3 of the pane, never less than two text lines."""
+    return max(48 + line_h, int(pane_height / 3))
+
+
+def _filter_bar_height(rows_h: int, cap: int) -> int:
+    """Height of the tag-filter bar: its wrapped rows, clamped.
+
+    Never shorter than one row and never taller than *cap*, so the bar hugs
+    its chips instead of reserving a fixed block of empty space when no
+    tag is selected.
+    """
+    return min(max(32, int(rows_h)), max(32, int(cap)))
+
+
 class _DetailContainer(QWidget):
     """Detail pane that caps the summary's height to ~1/3 of its own height."""
 
@@ -321,7 +345,12 @@ class _DetailContainer(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._summary_scroll.setMaximumHeight(max(48, int(self.height() / 3)))
+        # One extra text line over the old floor so the summary gets the
+        # same "one more line" as the tags and description sections.
+        line_h = max(16, self.fontMetrics().lineSpacing())
+        self._summary_scroll.setMaximumHeight(
+            _summary_max_height(self.height(), line_h),
+        )
 
 
 class LibraryTab(QWidget):
@@ -392,24 +421,43 @@ class LibraryTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        # Row 1: search + primary actions.
+        # Row 1: search + search modes + primary actions.
         toolbar = QHBoxLayout()
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText('Search characters...')
         self._search_edit.textChanged.connect(self._on_search)
         toolbar.addWidget(self._search_edit, 1)
 
-        import_btn = QPushButton('Import Card')
+        self._full_text_cb = QCheckBox('Full text')
+        self._full_text_cb.setObjectName('filterChip')
+        self._full_text_cb.setToolTip(
+            'Also search the whole card: the description, the other prompt '
+            'fields, the creator notes and the character book.'
+        )
+        self._full_text_cb.toggled.connect(self._apply_filters)
+        toolbar.addWidget(self._full_text_cb)
+
+        self._fuzzy_cb = QCheckBox('Fuzzy')
+        self._fuzzy_cb.setObjectName('filterChip')
+        self._fuzzy_cb.setToolTip(
+            'Also match cards whose name, creator or tags contain every word '
+            'of the search, in any order.'
+        )
+        self._fuzzy_cb.toggled.connect(self._apply_filters)
+        toolbar.addWidget(self._fuzzy_cb)
+
+        import_btn = QPushButton('Import')
+        import_btn.setToolTip('Import a character card (PNG or JSON)')
         import_btn.clicked.connect(self._import_card)
         toolbar.addWidget(import_btn)
-
-        refresh_btn = QPushButton('Refresh')
-        refresh_btn.clicked.connect(self.load_cards)
-        toolbar.addWidget(refresh_btn)
 
         dup_btn = QPushButton('Find Duplicates')
         dup_btn.clicked.connect(self.find_duplicates)
         toolbar.addWidget(dup_btn)
+
+        refresh_btn = QPushButton('Refresh')
+        refresh_btn.clicked.connect(self.load_cards)
+        toolbar.addWidget(refresh_btn)
 
         settings_btn = QPushButton('Settings')
         settings_btn.clicked.connect(self._on_settings_requested)
@@ -421,7 +469,7 @@ class LibraryTab(QWidget):
         # squashed when the window is narrow).
         filter_row = QHBoxLayout()
         sort_label = QLabel('Sort:')
-        sort_label.setStyleSheet('color: #ccc;')
+        sort_label.setObjectName('filterChip')
         filter_row.addWidget(sort_label)
         self._sort_combo = QComboBox()
         for label in self._SORT_LABELS:
@@ -429,40 +477,21 @@ class LibraryTab(QWidget):
         self._sort_combo.currentTextChanged.connect(self._on_sort_changed)
         filter_row.addWidget(self._sort_combo)
 
-        self._favorites_only_cb = QCheckBox('Favorites only')
-        self._favorites_only_cb.setStyleSheet('color: #ccc;')
-        self._favorites_only_cb.toggled.connect(self._on_favorites_toggled)
-        filter_row.addWidget(self._favorites_only_cb)
-
-        self._full_text_cb = QCheckBox('Full text')
-        self._full_text_cb.setToolTip(
-            'Also search the whole card: the description, the other prompt '
-            'fields, the creator notes and the character book.'
-        )
-        self._full_text_cb.toggled.connect(self._apply_filters)
-        filter_row.addWidget(self._full_text_cb)
-
-        self._fuzzy_cb = QCheckBox('Fuzzy')
-        self._fuzzy_cb.setToolTip(
-            'Also match cards whose name, creator or tags contain every word '
-            'of the search, in any order.'
-        )
-        self._fuzzy_cb.toggled.connect(self._apply_filters)
-        filter_row.addWidget(self._fuzzy_cb)
-
+        collection_label = QLabel('Collection:')
+        collection_label.setObjectName('filterChip')
+        filter_row.addWidget(collection_label)
         self._collection_combo = QComboBox()
         self._collection_combo.setToolTip('Filter by collection')
         self._collection_combo.currentIndexChanged.connect(self._apply_filters)
         filter_row.addWidget(self._collection_combo)
 
-        self._manage_cols_btn = QPushButton('Manage...')
-        self._manage_cols_btn.setToolTip('Create, rename, or delete collections')
-        self._manage_cols_btn.clicked.connect(self._on_manage_collections)
-        filter_row.addWidget(self._manage_cols_btn)
-
         self._build_page_size_combo(filter_row)
 
         filter_row.addStretch()
+        self._favorites_only_cb = QCheckBox('Favorites only')
+        self._favorites_only_cb.setObjectName('filterChip')
+        self._favorites_only_cb.toggled.connect(self._on_favorites_toggled)
+        filter_row.addWidget(self._favorites_only_cb)
         layout.addLayout(filter_row)
 
         filter_container = QWidget()
@@ -474,7 +503,6 @@ class LibraryTab(QWidget):
         # opens the tag-selection popup, the clear button, and the currently
         # selected tags (shown as removable chips) all flow together.
         self._filter_bar_scroll = QScrollArea()
-        self._filter_bar_scroll.setMaximumHeight(max(106, load_font_size() * 9))
         self._filter_bar_scroll.setWidgetResizable(True)
         self._filter_bar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._filter_bar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -483,7 +511,7 @@ class LibraryTab(QWidget):
         self._filter_bar_scroll.setWidget(self._filter_bar_widget)
 
         filter_label = QLabel('Filter by tags:')
-        filter_label.setStyleSheet('font-weight: bold; color: #ccc;')
+        filter_label.setObjectName('filterChip')
         self._filter_bar_layout.addWidget(filter_label)
 
         self._tag_filter_btn = QPushButton('Select Tags...')
@@ -500,8 +528,20 @@ class LibraryTab(QWidget):
         self._filter_header_count = 3
 
         filter_layout.addWidget(self._filter_bar_scroll)
-        filter_container.setMaximumHeight(max(160, load_font_size() * 9 + 40))
+        self._filter_container = filter_container
         layout.addWidget(filter_container)
+
+        # Divider between the tag filter bar and the card grid, mirroring
+        # the splitter handle line below the grid (both use $border_dim).
+        grid_separator = QWidget()
+        grid_separator.setObjectName('gridSeparator')
+        grid_separator.setFixedHeight(2)
+        layout.addWidget(grid_separator)
+
+        # One line of text at the configured font size.  The detail-pane
+        # sections grow with it so each one shows about one more line of
+        # content at any window height.
+        line_h = max(16, self.fontMetrics().lineSpacing())
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
@@ -569,7 +609,9 @@ class LibraryTab(QWidget):
         tags_scroll.setFrameShape(QFrame.Shape.NoFrame)
         tags_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         tags_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        tags_scroll.setMaximumHeight(60)
+        # One extra line over the old 60px: roughly one more row of tags,
+        # scaled with the configured font size.
+        tags_scroll.setMaximumHeight(60 + line_h)
         tags_scroll.setWidget(self._detail_tags)
         detail_layout.addWidget(tags_scroll)
 
@@ -585,7 +627,9 @@ class LibraryTab(QWidget):
 
         self._detail_text = QTextEdit()
         self._detail_text.setReadOnly(True)
-        self._detail_text.setMaximumHeight(220)
+        # One extra line over the old 220px cap so the description shows
+        # roughly one more line of text.
+        self._detail_text.setMaximumHeight(220 + line_h)
         detail_layout.addWidget(self._detail_text)
 
         btn_row = QHBoxLayout()
@@ -595,15 +639,19 @@ class LibraryTab(QWidget):
         self._fav_btn.clicked.connect(self._on_toggle_favorite)
         btn_row.addWidget(self._fav_btn)
 
-        self._edit_btn = QPushButton('Edit')
-        self._edit_btn.setEnabled(False)
-        self._edit_btn.clicked.connect(self._on_edit)
-        btn_row.addWidget(self._edit_btn)
+        self._add_to_collection_btn = QPushButton('Add to collection')
+        self._add_to_collection_btn.setEnabled(False)
+        self._add_to_collection_btn.setToolTip(
+            "Add the selected card to a new or existing collection"
+        )
+        self._add_to_collection_btn.clicked.connect(self._on_assign_collections)
+        btn_row.addWidget(self._add_to_collection_btn)
 
         self._collections_btn = QPushButton('Collections')
-        self._collections_btn.setEnabled(False)
-        self._collections_btn.setToolTip("Choose which collections this card belongs to")
-        self._collections_btn.clicked.connect(self._on_assign_collections)
+        self._collections_btn.setToolTip(
+            "Create, rename, or delete collections"
+        )
+        self._collections_btn.clicked.connect(self._on_manage_collections)
         btn_row.addWidget(self._collections_btn)
 
         self._delete_btn = QPushButton('Delete')
@@ -652,8 +700,7 @@ class LibraryTab(QWidget):
         btn_row.addWidget(self._bulk_export_json_btn)
 
         self._single_btns = [
-            self._fav_btn, self._edit_btn, self._collections_btn,
-            self._delete_btn,
+            self._fav_btn, self._add_to_collection_btn, self._delete_btn,
             self._export_png_btn, self._export_json_btn,
             self._open_folder_btn,
         ]
@@ -669,10 +716,15 @@ class LibraryTab(QWidget):
         splitter.addWidget(detail_container)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([600, 200])
+        # The detail pane starts three text lines taller than before (one
+        # extra line for each of its display sections: tags, summary and
+        # description).  QSplitter keeps this offset at any window height
+        # because free space is handed out by the stretch factors above.
+        splitter.setSizes([600, _detail_pane_initial_height(line_h)])
         layout.addWidget(splitter, 1)
 
         self._refresh_collection_combo()
+        self._sync_filter_bar_height()
 
     def load_cards(self) -> None:
         self._refresh_collection_combo()
@@ -689,7 +741,7 @@ class LibraryTab(QWidget):
         configuration.
         """
         label = QLabel('Cards per page:')
-        label.setStyleSheet('color: #ccc;')
+        label.setObjectName('filterChip')
         row.addWidget(label)
 
         combo = QComboBox()
@@ -775,6 +827,29 @@ class LibraryTab(QWidget):
             chip.removed.connect(self._remove_selected_tag)
             self._filter_bar_layout.addWidget(chip)
         self._clear_tags_btn.setEnabled(bool(self._selected_filter_tags))
+        self._sync_filter_bar_height()
+
+    def _sync_filter_bar_height(self) -> None:
+        """Size the tag-filter bar to its wrapped rows.
+
+        With no tag selected the bar is a single row tall instead of a fixed
+        block of empty space; chips make it grow as they wrap, up to a cap
+        (a little shorter than before) where the scroll area takes over.
+        """
+        width = self._filter_bar_scroll.viewport().width()
+        if width <= 0:
+            width = max(240, self.width() - 24)
+        rows_h = self._filter_bar_layout.heightForWidth(width)
+        bar_h = _filter_bar_height(rows_h, max(90, load_font_size() * 7))
+        self._filter_bar_scroll.setMinimumHeight(bar_h)
+        self._filter_bar_scroll.setMaximumHeight(bar_h)
+        self._filter_container.setFixedHeight(bar_h + 8)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # The chips re-wrap as the window narrows, so the bar has to
+        # re-measure its rows.
+        self._sync_filter_bar_height()
 
     def _open_tag_filter_dialog(self) -> None:
         from src.ui.widgets.tag_filter_dialog import TagFilterDialog
@@ -1136,13 +1211,12 @@ class LibraryTab(QWidget):
             desc = entry.get('description_preview', '')
             self._detail_text.setPlainText(desc if desc else 'No details available.')
 
-        self._edit_btn.setEnabled(True)
         self._delete_btn.setEnabled(True)
         self._export_png_btn.setEnabled(True)
         self._export_json_btn.setEnabled(True)
         self._open_folder_btn.setEnabled(True)
         self._fav_btn.setEnabled(True)
-        self._collections_btn.setEnabled(True)
+        self._add_to_collection_btn.setEnabled(True)
         self._fav_btn.setChecked(bool(entry.get('is_favorite')))
         self._detail_rating.setEnabled(True)
         try:
@@ -1216,11 +1290,7 @@ class LibraryTab(QWidget):
 
     def refresh_font_size(self) -> None:
         """Recompute baked font-dependent heights after a theme change."""
-        size = load_font_size()
-        self._filter_bar_scroll.setMaximumHeight(max(106, size * 9))
-        filter_container = self._filter_bar_scroll.parentWidget()
-        if filter_container is not None:
-            filter_container.setMaximumHeight(max(160, size * 9 + 40))
+        self._sync_filter_bar_height()
         # The rating stars carry their own pixel size, so they have to be
         # told about the new one.
         self._detail_rating.refresh_font_size()
