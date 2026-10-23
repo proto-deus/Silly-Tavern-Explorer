@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -61,6 +62,7 @@ class _GenerateWorker(QThread):
                     card,
                     extra=self.params.get('extra', ''),
                     length=self.params.get('length', ''),
+                    style=self.params.get('style', 'Standard'),
                 )
                 full = self._stream_generate(system, user)
                 if not self._cancel and full is not None:
@@ -73,6 +75,7 @@ class _GenerateWorker(QThread):
                     card,
                     extra=self.params.get('extra', ''),
                     length=self.params.get('length', ''),
+                    style=self.params.get('style', 'Standard'),
                 )
                 full = self._stream_generate(system, user)
                 if not self._cancel and full is not None:
@@ -85,6 +88,7 @@ class _GenerateWorker(QThread):
                     card,
                     extra=self.params.get('extra', ''),
                     length=self.params.get('length', ''),
+                    style=self.params.get('style', 'Standard'),
                 )
                 full = self._stream_generate(system, user)
                 if not self._cancel and full is not None:
@@ -96,6 +100,7 @@ class _GenerateWorker(QThread):
                     card,
                     extra=self.params.get('extra', ''),
                     length=self.params.get('length', ''),
+                    style=self.params.get('style', 'Standard'),
                 )
                 full = self._stream_generate(system, user)
                 if not self._cancel and full is not None:
@@ -108,6 +113,7 @@ class _GenerateWorker(QThread):
                     card, fields,
                     extra=self.params.get('extra', ''),
                     field_lengths=self.params.get('field_lengths', None),
+                    style=self.params.get('style', 'Standard'),
                 )
                 full = self._stream_generate(system, user)
                 if not self._cancel and full is not None:
@@ -201,6 +207,19 @@ class AITab(QWidget):
         settings_btn.clicked.connect(self._on_settings_requested)
         header_row.addWidget(settings_btn)
         main_layout.addLayout(header_row)
+
+        # --- Writing style (shared by all generation sections) ---
+        style_row = QHBoxLayout()
+        style_row.addWidget(QLabel('Writing style:'))
+        self._style_combo = QComboBox()
+        for label in ai_prompts.WRITING_STYLES:
+            self._style_combo.addItem(label)
+        self._style_combo.setToolTip(
+            'Sets the writing style used for all generations on this tab.'
+        )
+        style_row.addWidget(self._style_combo)
+        style_row.addStretch()
+        main_layout.addLayout(style_row)
 
         # --- Generate Tags section ---
         tags_group = QGroupBox('Generate Tags')
@@ -533,6 +552,7 @@ class AITab(QWidget):
             'card': card,
             'extra': self._tags_extra_edit.text().strip(),
             'length': self._tags_length.text().strip(),
+            'style': self._style_combo.currentText(),
         })
 
     def _on_generate_missing_tags(self) -> None:
@@ -545,6 +565,7 @@ class AITab(QWidget):
             'card': card,
             'extra': self._tags_extra_edit.text().strip(),
             'length': self._tags_length.text().strip(),
+            'style': self._style_combo.currentText(),
         })
 
     def _on_generate_summary(self) -> None:
@@ -556,6 +577,7 @@ class AITab(QWidget):
             'card': card,
             'extra': self._summary_extra_edit.text().strip(),
             'length': self._summary_length.text().strip(),
+            'style': self._style_combo.currentText(),
         })
 
     def _on_generate_alt_greeting(self) -> None:
@@ -567,6 +589,7 @@ class AITab(QWidget):
             'card': card,
             'extra': self._alt_greet_prompt.text().strip(),
             'length': self._alt_greet_length.text().strip(),
+            'style': self._style_combo.currentText(),
         })
 
     def _on_generate_fill(self) -> None:
@@ -588,6 +611,7 @@ class AITab(QWidget):
             'fields': selected_fields,
             'extra': self._fill_extra_edit.text().strip(),
             'field_lengths': field_lengths,
+            'style': self._style_combo.currentText(),
         })
 
     def _on_batch(self) -> None:
