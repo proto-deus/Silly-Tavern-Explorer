@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -72,6 +73,10 @@ class CharacterSidebar(QWidget):
         self._current_id: int | None = None
         self._favorites_only: bool = False
         self._sort_by: str = 'name'
+        # Selected collection filter: None = every card, -1 = cards in no
+        # collection, otherwise the collection's id (mirrors the Library
+        # tab's collection combo).
+        self._collection_id: int | None = None
         self._full_image_dlg: QWidget | None = None
         # Every card in the library (light rows), plus the state of the
         # batch-wise build that turns them into thumbnails.
@@ -114,6 +119,26 @@ class CharacterSidebar(QWidget):
         self._sort_combo.currentTextChanged.connect(self._on_sort_changed)
         sort_row.addWidget(self._sort_combo, 1)
         layout.addLayout(sort_row)
+
+        cat_row = QHBoxLayout()
+        cat_label = QLabel('Coll:')
+        cat_label.setStyleSheet('color: #ccc;')
+        cat_row.addWidget(cat_label)
+        self._collection_combo = QComboBox()
+        # Long collection names must not widen the sidebar: the scroll area
+        # is fixed at 180px, but a combo's size hint grows to fit its longest
+        # item, which would stretch this whole column and leave a gap next to
+        # the tab widget.  The width policy drops it from the size hint.
+        self._collection_combo.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
+        self._collection_combo.addItem('All', None)
+        self._collection_combo.addItem('No Collection', -1)
+        self._collection_combo.currentIndexChanged.connect(
+            self._on_collection_changed
+        )
+        cat_row.addWidget(self._collection_combo, 1)
+        layout.addLayout(cat_row)
 
         self._thumb_scroll = QScrollArea()
         self._thumb_scroll.setWidgetResizable(True)
@@ -169,6 +194,21 @@ class CharacterSidebar(QWidget):
             sort_by=self._sort_by,
             favorites_only=self._favorites_only,
         )
+        if self._collection_id is not None:
+            membership = self.db.get_collection_membership()
+            if self._collection_id == -1:
+                # Sentinel: cards that belong to no collection at all.
+                any_collection = {cid for cid, cols in membership.items() if cols}
+                self._entries = [
+                    e for e in self._entries if e['id'] not in any_collection
+                ]
+            else:
+                members = {
+                    cid for cid, cols in membership.items()
+                    if self._collection_id in cols
+                }
+                self._entries = [e for e in self._entries if e['id'] in members]
+        self._refresh_collection_combo()
 
         # Drop a selection that no longer exists (or is filtered out of view).
         # Keeping it left the sidebar highlighting a deleted card, which the
@@ -252,6 +292,32 @@ class CharacterSidebar(QWidget):
     def _restore_scroll(self) -> None:
         """Restore the scroll position of a rebuilt list."""
         self._thumb_scroll.verticalScrollBar().setValue(self._saved_scroll)
+
+    def _refresh_collection_combo(self) -> None:
+        """Rebuild the collection dropdown from the library's collections.
+
+        Mirrors the Library tab's combo: 'All', 'No Collection', then every
+        collection with its card count.  The current selection is kept when
+        the collection still exists and falls back to 'All' when it is gone.
+        Signals are blocked so the re-population never re-triggers a reload.
+        """
+        combo = self._collection_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem('All', None)
+        combo.addItem('No Collection', -1)
+        for col in self.db.list_collections():
+            combo.addItem(f"{col['name']} ({col['card_count']})", int(col['id']))
+        index = combo.findData(self._collection_id)
+        if index < 0:
+            index = 0
+            self._collection_id = None
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+
+    def _on_collection_changed(self, _index: int) -> None:
+        self._collection_id = self._collection_combo.currentData()
+        self.load_cards()
 
     def _layout_rows(self, appended: list[CardThumbnail] | None = None) -> None:
         """Place the shown rows and size the scrollable area.
@@ -480,18 +546,6 @@ class CharacterSidebar(QWidget):
             return
         if self._scroll_to_row(self._pending_scroll_id):
             self._pending_scroll_id = None
-
-    def scroll_selected_to_top(self) -> None:
-        """Scroll so the selected card is at the top of the sidebar viewport."""
-        target_id = self._current_id
-
-        def _do_scroll() -> None:
-            if self._scroll_to_row(target_id):
-                self._pending_scroll_id = None
-                return
-            self._pending_scroll_id = target_id
-
-        QTimer.singleShot(0, _do_scroll)
 
     def _on_thumb_clicked(self, char_id: int) -> None:
         if char_id == self._current_id:
