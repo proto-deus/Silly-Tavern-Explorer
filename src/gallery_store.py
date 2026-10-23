@@ -129,9 +129,48 @@ def import_gallery_image(char_id: int, source_path: str | Path) -> dict:
     if not is_image_file(src):
         raise ValueError(f'Not a supported image file: {src.name}')
     data = vault.read_bytes(src)
+    return import_gallery_bytes(char_id, data, src.name)
+
+
+def sniff_image_extension(data: bytes) -> Optional[str]:
+    """Return the file extension matching *data*'s image format, or None.
+
+    Pillow is imported lazily so this module stays importable without it
+    (it is only needed for images that arrive without a usable extension).
+    """
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+        with Image.open(BytesIO(data)) as img:
+            fmt = (img.format or '').lower()
+    except Exception:
+        return None
+    return {
+        'jpeg': '.jpg', 'png': '.png', 'gif': '.gif',
+        'webp': '.webp', 'bmp': '.bmp',
+    }.get(fmt)
+
+
+def import_gallery_bytes(char_id: int, data: bytes, name: str = 'image.png') -> dict:
+    """Store raw image *data* in the character's gallery.
+
+    The in-memory counterpart of :func:`import_gallery_image`, for images
+    that never existed as a file (chat attachments, downloaded URL images).
+    Returns the same ``{file_name, content_hash}`` metadata dict.  When
+    *name* carries no supported image extension the right one is derived
+    from the data itself; unrecognised data raises ``ValueError``.
+    """
+    if not data:
+        raise ValueError('No image data')
+    if Path(name or '').suffix.lower() not in IMAGE_EXTENSIONS:
+        suffix = sniff_image_extension(data)
+        if suffix is None:
+            raise ValueError('Not a supported image')
+        name = f'{name or "image"}{suffix}'
     digest = content_hash(data)
     directory = get_gallery_dir(char_id)
-    file_name = unique_gallery_filename(directory, src.name)
+    file_name = unique_gallery_filename(directory, name)
     vault.write_bytes(directory / file_name, data)
     return {'file_name': file_name, 'content_hash': digest}
 
