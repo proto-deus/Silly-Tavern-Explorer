@@ -9,6 +9,7 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QTextCursor
 from PyQt6.QtWidgets import (
+    QComboBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -26,6 +27,7 @@ from PyQt6.QtWidgets import (
 
 from src.app_paths import data_dir
 from src.ai_client import AIClient, APIPreset, _extract_json
+from src import ai_prompts
 from src.ai_prompts import build_character_from_answers, build_wizard_question_prompts
 from src.card_models import CharacterCard
 from src.card_parser import write_chara_card_dual
@@ -182,6 +184,17 @@ class CharacterCreationWizard(QDialog):
         self._review_label.setWordWrap(True)
         self._review_label.setStyleSheet('color: #ccc; ')
         rpl.addWidget(self._review_label)
+        style_row = QHBoxLayout()
+        style_row.addWidget(QLabel('Writing style:'))
+        self._style_combo = QComboBox()
+        for label in ai_prompts.WRITING_STYLES:
+            self._style_combo.addItem(label)
+        self._style_combo.setToolTip(
+            'Sets the writing style used for the generated character card.'
+        )
+        style_row.addWidget(self._style_combo)
+        style_row.addStretch()
+        rpl.addLayout(style_row)
         self._generate_btn = QPushButton('Generate Card')
         self._generate_btn.clicked.connect(self._on_generate_card)
         rpl.addWidget(self._generate_btn)
@@ -324,7 +337,8 @@ class CharacterCreationWizard(QDialog):
         if not self._answers.get('name', '').strip():
             QMessageBox.warning(self, 'Generate', 'Please provide at least a name before generating.')
             return
-        system, user = build_character_from_answers(self._answers)
+        system, user = build_character_from_answers(
+            self._answers, style=self._style_combo.currentText())
         self._phase = 'card'
         self._generate_btn.setEnabled(False)
         self._import_btn.setEnabled(False)

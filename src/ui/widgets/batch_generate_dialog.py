@@ -7,6 +7,7 @@ from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -17,6 +18,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from src import ai_prompts
 from src.ai_client import AIClient, APIPreset
 from src.card_models import CharacterCard
 from src.card_parser import read_card_data
@@ -53,7 +55,8 @@ class _BatchWorker(QThread):
 
     def __init__(self, client: AIClient, db: LibraryDatabase,
                  do_tags: bool, do_summary: bool, do_missing_tags: bool,
-                 extra: str = '', length: str = '', tag_count: str = '', parent=None):
+                 extra: str = '', length: str = '', tag_count: str = '',
+                 style: str = 'Standard', parent=None):
         super().__init__(parent)
         self.client = client
         self.db = db
@@ -63,6 +66,7 @@ class _BatchWorker(QThread):
         self.extra = extra
         self.length = length
         self.tag_count = tag_count
+        self.style = style
         self._cancel = False
 
     def cancel(self):
@@ -134,7 +138,9 @@ class _BatchWorker(QThread):
                 modified = False
 
                 if needs_tags and not self._cancel:
-                    tags = self.client.generate_tags(card, extra=self.extra, length=self.tag_count)
+                    tags = self.client.generate_tags(card, extra=self.extra,
+                                                     length=self.tag_count,
+                                                     style=self.style)
                     if self._cancel:
                         break
                     card.tags = tags
@@ -144,6 +150,7 @@ class _BatchWorker(QThread):
                     before = len(card.tags)
                     new_tags = self.client.generate_missing_tags(
                         card, extra=self.extra, length=self.tag_count,
+                        style=self.style,
                     )
                     if self._cancel:
                         break
@@ -152,7 +159,9 @@ class _BatchWorker(QThread):
                     modified = True
 
                 if needs_summary and not self._cancel:
-                    summary = self.client.generate_summary(card, extra=self.extra, length=self.length)
+                    summary = self.client.generate_summary(card, extra=self.extra,
+                                                           length=self.length,
+                                                           style=self.style)
                     if self._cancel:
                         break
                     card.creator_notes = summary
@@ -236,6 +245,18 @@ class BatchGenerateDialog(QDialog):
         self._extra_edit.setPlaceholderText('e.g., Focus on genre tags, keep summaries brief')
         layout.addWidget(self._extra_edit)
 
+        style_row = QHBoxLayout()
+        style_row.addWidget(QLabel('Writing style:'))
+        self._style_combo = QComboBox()
+        for label in ai_prompts.WRITING_STYLES:
+            self._style_combo.addItem(label)
+        self._style_combo.setToolTip(
+            'Sets the writing style used for all cards in this batch.'
+        )
+        style_row.addWidget(self._style_combo)
+        style_row.addStretch()
+        layout.addLayout(style_row)
+
         self._progress_label = QLabel('')
         self._progress_label.setStyleSheet('color: #aaa; ')
         self._progress_label.setVisible(False)
@@ -293,6 +314,7 @@ class BatchGenerateDialog(QDialog):
             extra=self._extra_edit.text().strip(),
             length=self._length_edit.text().strip(),
             tag_count=self._tag_count_edit.text().strip(),
+            style=self._style_combo.currentText(),
             parent=self,
         )
         self._worker.progress.connect(self._on_progress)
