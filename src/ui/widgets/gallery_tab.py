@@ -362,7 +362,7 @@ if QWidget is not None:
                     self._thumb_paths.pop(cache_key(path, 112), None)
 
         def _on_thumb_loaded(self, qimg, path, _target_px, context) -> None:
-            from PyQt6.QtGui import QPixmap
+            from PyQt6.QtGui import QIcon, QPixmap
             try:
                 key, generation = context
             except (TypeError, ValueError):
@@ -380,7 +380,7 @@ if QWidget is not None:
             if item.data(ROLE_PATH) not in ('', path):
                 return
             pixmap = QPixmap.fromImage(qimg)
-            item.setIcon(pixmap)
+            item.setIcon(QIcon(pixmap))
 
         def _on_rows_moved(self, *args) -> None:
             """Persist a drag-reorder of gallery thumbnails."""
