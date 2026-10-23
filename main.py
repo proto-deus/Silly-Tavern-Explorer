@@ -21,6 +21,44 @@ def _setup_logging() -> None:
     )
 
 
+def _install_crash_hook() -> None:
+    """Log unhandled exceptions instead of letting PyQt abort the process.
+
+    PyQt6 treats an exception that escapes a Qt slot as fatal: it calls
+    ``sys.excepthook`` and, when that is still the default hook, aborts the
+    process outright - leaving nothing in the app log.  Installing this
+    hook keeps the app alive and every such failure visible in the log.
+    """
+    logger = logging.getLogger(__name__)
+
+    def _log(etype, value, tb) -> None:
+        logger.critical('Unhandled exception', exc_info=(etype, value, tb))
+
+    def _hook(etype, value, tb) -> None:
+        _log(etype, value, tb)
+        try:
+            from PyQt6.QtWidgets import QApplication, QMessageBox
+            if QApplication.instance() is not None:
+                # Non-modal show(): exec() could re-enter slot dispatch.
+                QMessageBox(
+                    QMessageBox.Icon.Critical,
+                    'ST Explorer',
+                    f'An unexpected error occurred:\n\n{value}\n\n'
+                    'See the log for details: ~/.st-explorer/app.log',
+                ).show()
+        except Exception:
+            pass
+
+    sys.excepthook = _hook
+
+    import threading
+
+    def _thread_hook(args: threading.ExceptHookArgs) -> None:
+        _log(args.exc_type, args.exc_value, args.exc_traceback)
+
+    threading.excepthook = _thread_hook
+
+
 def _check_dependencies() -> list[str]:
     """Check that all required packages are installed.
 
@@ -115,6 +153,7 @@ def main():
             os.environ.setdefault('TIKTOKEN_CACHE_DIR', str(bundled_cache))
 
     _setup_logging()
+    _install_crash_hook()
     logger = logging.getLogger(__name__)
 
     missing = _check_dependencies()
