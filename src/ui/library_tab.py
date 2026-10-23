@@ -37,6 +37,7 @@ from src.ui.widgets.async_image import (
     cancel_pending_image_loads,
 )
 from src.ui.widgets.card_thumbnail import CardThumbnail
+from src.ui.widgets.card_context_menu import show_card_context_menu
 from src.ui.widgets.flow_layout import FlowLayout
 from src.ui.widgets.rating_widget import RatingWidget
 from src.ui.widgets.tag_widget import TagChip, TagWidget
@@ -972,21 +973,22 @@ class LibraryTab(QWidget):
             # kept showing the deleted collection's results.
             self._apply_filters()
 
-    def _on_assign_collections(self) -> None:
+    def _on_assign_collections(self, char_id: int | None = None) -> None:
         from src.ui.widgets.collections_dialog import CollectionAssignDialog
 
-        if self._selected_id is None:
+        char_id = self._selected_id if char_id is None else char_id
+        if char_id is None:
             return
-        entry = self.db.get_by_id(self._selected_id)
+        entry = self.db.get_by_id(char_id)
         name = entry.get('name', '') if entry else ''
-        dlg = CollectionAssignDialog(self.db, self._selected_id, name, self)
+        dlg = CollectionAssignDialog(self.db, char_id, name, self)
         chosen = exec_dialog_with(
             dlg,
             lambda d: d.selected_collection_ids()
             if d.result() == QDialog.DialogCode.Accepted else None,
         )
         if chosen is not None:
-            self.db.set_card_collections(self._selected_id, chosen)
+            self.db.set_card_collections(char_id, chosen)
             self._refresh_collection_combo()
             self._apply_filters()
             self.status_message.emit('Collections updated', 2000)
@@ -1117,6 +1119,7 @@ class LibraryTab(QWidget):
             thumb.set_thumb_size(self._thumb_img_size)
         thumb.selection_requested.connect(self._on_selection_requested)
         thumb.double_clicked.connect(self._show_full_image)
+        thumb.context_menu_requested.connect(self._on_card_context_menu)
         self._thumbnails.append(thumb)
         self._grid_layout.addWidget(thumb)
 
@@ -1390,8 +1393,9 @@ class LibraryTab(QWidget):
         reply = QMessageBox.question(
             self, 'Bulk Delete',
             f"Delete {len(selected)} selected card(s)?\n\n"
-            "This removes them from the library and permanently deletes "
-            "their card files from disk.",
+            "WARNING: This permanently removes them from the library and "
+            "deletes their card files from disk.\n\n"
+            "This cannot be undone.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -1787,14 +1791,16 @@ class LibraryTab(QWidget):
         else:
             event.ignore()
 
-    def _on_edit(self) -> None:
-        if self._selected_id is not None:
-            self.edit_requested.emit(self._selected_id)
+    def _on_edit(self, char_id: int | None = None) -> None:
+        char_id = self._selected_id if char_id is None else char_id
+        if char_id is not None:
+            self.edit_requested.emit(char_id)
 
-    def _on_delete(self) -> None:
-        if self._selected_id is None:
+    def _on_delete(self, char_id: int | None = None) -> None:
+        char_id = self._selected_id if char_id is None else char_id
+        if char_id is None:
             return
-        entry = self.db.get_by_id(self._selected_id)
+        entry = self.db.get_by_id(char_id)
         if not entry:
             return
         reply = QMessageBox.question(
@@ -1805,7 +1811,7 @@ class LibraryTab(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            deleted_id = self._selected_id
+            deleted_id = char_id
             deleted_name = entry.get('name', '')
             try:
                 self.db.remove_card(deleted_id, delete_files=True)
@@ -1817,15 +1823,18 @@ class LibraryTab(QWidget):
                 return
             notify_card_deleted(deleted_id, deleted_name)
             self._remove_thumbnail_in_place(deleted_id)
-            self._selected_id = None
+            # The deleted card may not have been the selected one (the
+            # sidebar's menu can target any card): drop it from the selection
+            # model and let the selection UI settle on what is left.
+            self._selection.prune(set(self._all_ids))
             self._update_selection_ui()
-            self._clear_detail_pane()
             self.library_changed.emit()
 
-    def _on_export_png(self) -> None:
-        if self._selected_id is None:
+    def _on_export_png(self, char_id: int | None = None) -> None:
+        char_id = self._selected_id if char_id is None else char_id
+        if char_id is None:
             return
-        entry = self.db.get_by_id(self._selected_id)
+        entry = self.db.get_by_id(char_id)
         if not entry:
             return
         source = entry.get('source_path', '')
@@ -1847,10 +1856,11 @@ class LibraryTab(QWidget):
             logger.exception("PNG export failed")
             QMessageBox.critical(self, 'Export', f"Failed to export PNG: {e}")
 
-    def _on_export_json(self) -> None:
-        if self._selected_id is None:
+    def _on_export_json(self, char_id: int | None = None) -> None:
+        char_id = self._selected_id if char_id is None else char_id
+        if char_id is None:
             return
-        entry = self.db.get_by_id(self._selected_id)
+        entry = self.db.get_by_id(char_id)
         if not entry:
             return
         source = entry.get('source_path', '')
@@ -1876,26 +1886,29 @@ class LibraryTab(QWidget):
             logger.exception("JSON export failed")
             QMessageBox.critical(self, 'Export', f"Failed to export JSON: {e}")
 
-    def _on_open_folder(self) -> None:
-        if self._selected_id is None:
+    def _on_open_folder(self, char_id: int | None = None) -> None:
+        char_id = self._selected_id if char_id is None else char_id
+        if char_id is None:
             return
-        entry = self.db.get_by_id(self._selected_id)
+        entry = self.db.get_by_id(char_id)
         if not entry:
             return
         source = entry.get('source_path', '')
         from src.path_utils import open_containing_folder
         if not open_containing_folder(source):
             QMessageBox.warning(self, 'Open Folder', 'Source file not found.')
-            logger.warning("Could not open folder for card %s (source missing)", self._selected_id)
+            logger.warning("Could not open folder for card %s (source missing)", char_id)
 
-    def _on_toggle_favorite(self) -> None:
-        if self._selected_id is None:
+    def _on_toggle_favorite(self, char_id: int | None = None) -> None:
+        char_id = self._selected_id if char_id is None else char_id
+        if char_id is None:
             return
         try:
-            new_state = self.db.toggle_favorite(self._selected_id)
-            self._fav_btn.setChecked(new_state)
+            new_state = self.db.toggle_favorite(char_id)
+            if char_id == self._selected_id:
+                self._fav_btn.setChecked(new_state)
             # Update just the affected thumbnail instead of rebuilding the grid.
-            self._refresh_single_thumbnail(self._selected_id)
+            self._refresh_single_thumbnail(char_id)
             self.library_changed.emit()
         except Exception as e:
             QMessageBox.critical(self, 'Error', f"Failed to toggle favorite: {e}")
@@ -1921,6 +1934,54 @@ class LibraryTab(QWidget):
         dlg = ImageViewer(source, f"Full Image - {entry['name']}", self)
         dlg.show()
         self._full_image_dlg = dlg
+
+    def _on_card_context_menu(self, char_id: int, global_pos) -> None:
+        """Right-click on a card thumbnail: show the shared card menu.
+
+        A right-click inside a multi-selection keeps the selection and makes
+        Delete/Favorite apply to all of it; everything else targets the
+        right-clicked card.  Outside a multi-selection the card is simply
+        selected first, so the whole menu applies to it.
+        """
+        selected = self._selection.selected_ids
+        multi = char_id in selected and len(selected) > 1
+        if not multi:
+            self._on_selection_requested(char_id, False, False)
+        entry = self.db.get_by_id(char_id)
+        if not entry:
+            return
+        if multi:
+            handlers = {
+                'edit': lambda: self._on_edit(char_id),
+                'collections': lambda: self._on_assign_collections(char_id),
+                'full_image': lambda: self._show_full_image(char_id),
+                'open_folder': lambda: self._on_open_folder(char_id),
+                'export_png': lambda: self._on_export_png(char_id),
+                'export_json': lambda: self._on_export_json(char_id),
+                'duplicate': lambda: self.duplicate_card(char_id),
+                'favorite_add': lambda: self._on_bulk_favorite(True),
+                'favorite_remove': lambda: self._on_bulk_favorite(False),
+                'delete': self._on_bulk_delete,
+            }
+            show_card_context_menu(
+                self, global_pos, handlers, multi_count=len(selected),
+            )
+        else:
+            handlers = {
+                'edit': lambda: self._on_edit(char_id),
+                'favorite': lambda: self._on_toggle_favorite(char_id),
+                'collections': lambda: self._on_assign_collections(char_id),
+                'full_image': lambda: self._show_full_image(char_id),
+                'open_folder': lambda: self._on_open_folder(char_id),
+                'export_png': lambda: self._on_export_png(char_id),
+                'export_json': lambda: self._on_export_json(char_id),
+                'duplicate': lambda: self.duplicate_card(char_id),
+                'delete': lambda: self._on_delete(char_id),
+            }
+            show_card_context_menu(
+                self, global_pos, handlers,
+                favorite_on=bool(entry.get('is_favorite')),
+            )
 
     def get_selected_id(self) -> int | None:
         return self._selected_id
@@ -2015,11 +2076,12 @@ class LibraryTab(QWidget):
         """Delete the currently selected card (menu entry)."""
         self._on_delete()
 
-    def duplicate_card(self) -> None:
+    def duplicate_card(self, char_id: int | None = None) -> None:
         """Duplicate the selected card into the library with a '(copy)' suffix."""
-        if self._selected_id is None:
+        char_id = self._selected_id if char_id is None else char_id
+        if char_id is None:
             return
-        entry = self.db.get_by_id(self._selected_id)
+        entry = self.db.get_by_id(char_id)
         if not entry:
             return
         source = entry.get('source_path', '')

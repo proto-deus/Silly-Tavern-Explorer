@@ -578,6 +578,9 @@ class ChatInputEdit(SpellCheckTextEdit):
 class TestTab(QWidget):
     status_message = pyqtSignal(str, int)
     settings_requested = pyqtSignal()
+    # A chat image was added to the gallery: the Gallery tab should reload
+    # its panes when it shows the same character.
+    gallery_changed = pyqtSignal()
 
     def __init__(self, db: LibraryDatabase, parent: QWidget | None = None):
         super().__init__(parent)
@@ -610,6 +613,7 @@ class TestTab(QWidget):
         self._summarize_prefix = ''
         self._summarize_quiet = False
         self._memory_dialog: MemoryDialog | None = None
+        self._chat_image_dlg: QWidget | None = None
         self._attributes: list[dict] = []
         self._auto_update_attributes = True
         self._attr_worker: _SummarizeWorker | None = None
@@ -1444,6 +1448,7 @@ class TestTab(QWidget):
         bubble.regenerate_requested.connect(self._on_regenerate_message)
         bubble.variant_back_requested.connect(self._on_variant_back)
         bubble.variant_forward_requested.connect(self._on_variant_forward)
+        bubble.image_context_requested.connect(self._on_image_context)
         self._bubble_layout.insertWidget(self._bubble_layout.count() - 1, bubble)
         self._bubbles.append(bubble)
         return bubble
@@ -2124,6 +2129,98 @@ class TestTab(QWidget):
         msg['content'] = variants[new_pos]
         self._render_history()
         self._save_current_session()
+
+    # ---- chat image context menu ----
+
+    def _on_image_context(self, data, name: str, global_pos, loader=None) -> None:
+        """Right-click on a chat image.
+
+        A fetched image offers the gallery/save/open actions; an unfetched
+        URL image only offers "Load Image" (the label carries its fetch
+        routine as *loader*).
+        """
+        from PyQt6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        if not data:
+            if loader is None:
+                return
+            load_act = menu.addAction('Load Image')
+            load_act.triggered.connect(lambda _checked=False, load=loader: load())
+        else:
+            gallery_act = menu.addAction('Add to Gallery')
+            gallery_act.triggered.connect(
+                lambda _checked=False, d=data, n=name: self._on_add_image_to_gallery(d, n)
+            )
+            save_act = menu.addAction('Save Image As...')
+            save_act.triggered.connect(
+                lambda _checked=False, d=data, n=name: self._on_save_image_as(d, n)
+            )
+            open_act = menu.addAction('Open Image')
+            open_act.triggered.connect(
+                lambda _checked=False, d=data, n=name: self._on_open_chat_image(d, n)
+            )
+        menu.exec(global_pos)
+
+    def _on_add_image_to_gallery(self, data: bytes, name: str) -> None:
+        """Store a chat image in the selected character's gallery."""
+        from src import gallery_store
+
+        if not data:
+            return
+        if self._current_id is None:
+            self.status_message.emit(
+                'Select a character before adding an image to the gallery.', 5000,
+            )
+            return
+        digest = gallery_store.content_hash(data)
+        if self.db.find_gallery_by_hash(self._current_id, digest):
+            self.status_message.emit('This image is already in the gallery.', 4000)
+            return
+        try:
+            meta = gallery_store.import_gallery_bytes(self._current_id, data, name)
+            self.db.add_gallery_image(
+                self._current_id, meta['file_name'], meta['content_hash'],
+            )
+        except Exception as e:
+            logger.exception("Could not add the chat image to the gallery")
+            QMessageBox.critical(self, 'Gallery', f'Could not add the image: {e}')
+            return
+        self.status_message.emit('Image added to the gallery.', 4000)
+        self.gallery_changed.emit()
+
+    def _on_save_image_as(self, data: bytes, name: str) -> None:
+        if not data:
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self, 'Save Image', name,
+            'Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp);;All files (*)',
+        )
+        if not dest:
+            return
+        try:
+            Path(dest).write_bytes(data)
+        except OSError as e:
+            logger.exception("Could not save the chat image")
+            QMessageBox.critical(self, 'Save Image', f'Failed to save image: {e}')
+            return
+        self.status_message.emit(f'Saved {Path(dest).name}', 3000)
+
+    def _on_open_chat_image(self, data: bytes, name: str) -> None:
+        """Open a chat image in the zoomable lightbox."""
+        from src.ui.widgets.image_viewer import ImageViewer
+
+        if not data:
+            return
+        existing = self._chat_image_dlg
+        if existing is not None:
+            existing.close()
+            existing.deleteLater()
+        # Strong ref: the dialog is parented here (Qt owns the C++ side),
+        # but without a Python reference the wrapper can be collected.
+        dlg = ImageViewer(data, f'Image - {name}', self)
+        dlg.show()
+        self._chat_image_dlg = dlg
 
     # ---- attachments ----
 

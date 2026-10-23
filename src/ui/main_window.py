@@ -194,6 +194,7 @@ class MainWindow(QMainWindow):
         self._ai_tab.card_updated.connect(self._on_ai_card_updated)
         self._test_tab.settings_requested.connect(self._on_settings)
         self._test_tab.status_message.connect(self._show_status_message)
+        self._test_tab.gallery_changed.connect(self._gallery_tab.refresh)
         self._lorebooks_tab.settings_requested.connect(self._on_settings)
         self._lorebooks_tab.status_message.connect(self._show_status_message)
         self._lorebooks_tab.lorebooks_changed.connect(self._test_tab.reload_lorebooks)
@@ -201,6 +202,7 @@ class MainWindow(QMainWindow):
         self._library_tab.settings_requested.connect(self._on_settings)
         self._sidebar.card_selected.connect(self._on_sidebar_card_selected)
         self._sidebar.card_double_clicked.connect(self._sidebar.show_full_image)
+        self._sidebar.context_action.connect(self._on_sidebar_context_action)
         self._sidebar.search_changed.connect(self._library_tab.set_search_text)
         self._library_tab.search_changed.connect(self._sidebar.set_search_text)
         # The favorites filter and the sort order are shared between the
@@ -1631,6 +1633,37 @@ class MainWindow(QMainWindow):
         # above already refreshed it while visible (or deferred the load).
         # AITab likewise: select_card() above already ran, and calling it again
         # re-parsed the PNG and re-counted its tokens for no reason.
+
+    def _on_sidebar_context_action(self, action: str, char_id: int) -> None:
+        """Run a card context-menu action chosen in the shared sidebar.
+
+        The sidebar only shows the menu; the handlers live with the Library
+        tab (and edit routing here), so a right-click behaves the same as the
+        Library grid's menu.  Refreshes that the Library tab does not emit on
+        its own (sidebar collection counts, the sidebar list after a
+        duplicate) are done here.
+        """
+        if action == 'edit':
+            self._go_to_edit(char_id)
+        elif action == 'favorite':
+            self._library_tab._on_toggle_favorite(char_id)
+        elif action == 'collections':
+            self._library_tab._on_assign_collections(char_id)
+            self._sidebar._refresh_collection_combo()
+        elif action == 'full_image':
+            self._sidebar.show_full_image(char_id)
+        elif action == 'open_folder':
+            self._library_tab._on_open_folder(char_id)
+        elif action == 'export_png':
+            self._library_tab._on_export_png(char_id)
+        elif action == 'export_json':
+            self._library_tab._on_export_json(char_id)
+        elif action == 'duplicate':
+            self._library_tab.duplicate_card(char_id)
+            self._sidebar.load_cards()
+        elif action == 'delete':
+            self._library_tab._on_delete(char_id)
+            self._update_status()
 
     def _on_settings(self) -> None:
         from src.ui.widgets.settings_dialog import SettingsDialog
