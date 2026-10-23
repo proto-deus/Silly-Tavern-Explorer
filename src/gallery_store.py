@@ -32,7 +32,11 @@ logger = logging.getLogger(__name__)
 # expression picker offers first). Anything else found in a character's
 # expression folder is a custom expression and is shown after these.
 DEFAULT_EXPRESSIONS: tuple[str, ...] = (
-    'neutral', 'happy', 'sad', 'angry', 'surprised', 'disgusted', 'fearful',
+    'anger', 'annoyed', 'care', 'confused', 'crying', 'cute', 'daily_clothes',
+    'dejected', 'doubt', 'excited', 'happy', 'hat_glasses', 'laughing', 'like',
+    'love', 'mid_delta', 'misconduct', 'netorare', 'naughty', 'normal', 'pride',
+    'rage', 'sad', 'shame', 'shock', 'sleep', 'surprise', 'tsundere',
+    'turn_away', 'wink',
 )
 
 IMAGE_EXTENSIONS: tuple[str, ...] = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp')
