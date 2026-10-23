@@ -1488,22 +1488,26 @@ class AIClient:
                     continue
                 raise
 
-    def generate_tags(self, card: CharacterCard, extra: str = '', length: str = '') -> list[str]:
-        system, user = ai_prompts.build_tags_prompts(card, extra=extra, length=length)
+    def generate_tags(self, card: CharacterCard, extra: str = '', length: str = '',
+                      style: str = 'Standard') -> list[str]:
+        system, user = ai_prompts.build_tags_prompts(card, extra=extra, length=length, style=style)
         result = self.generate(system, user)
         return _parse_tags(result)
 
-    def generate_missing_tags(self, card: CharacterCard, extra: str = '', length: str = '') -> list[str]:
-        system, user = ai_prompts.build_missing_tags_prompts(card, extra=extra, length=length)
+    def generate_missing_tags(self, card: CharacterCard, extra: str = '', length: str = '',
+                              style: str = 'Standard') -> list[str]:
+        system, user = ai_prompts.build_missing_tags_prompts(card, extra=extra, length=length, style=style)
         result = self.generate(system, user)
         return _parse_tags(result)
 
-    def generate_summary(self, card: CharacterCard, extra: str = '', length: str = '') -> str:
-        system, user = ai_prompts.build_summary_prompts(card, extra=extra, length=length)
+    def generate_summary(self, card: CharacterCard, extra: str = '', length: str = '',
+                         style: str = 'Standard') -> str:
+        system, user = ai_prompts.build_summary_prompts(card, extra=extra, length=length, style=style)
         return self.generate(system, user)
 
-    def generate_character(self, concept: str, extra: str = '', length: str = '') -> CharacterCard:
-        system, user = ai_prompts.build_character_prompts(concept, extra, length=length)
+    def generate_character(self, concept: str, extra: str = '', length: str = '',
+                           style: str = 'Standard') -> CharacterCard:
+        system, user = ai_prompts.build_character_prompts(concept, extra, length=length, style=style)
         result = self.generate(system, user)
         raw = _extract_json(result)
         if raw is None:

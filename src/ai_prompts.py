@@ -82,6 +82,60 @@ LANGUAGE_RULE = (
     'If the card content is in English, answer in English.'
 )
 
+#: Writing styles selectable in the Generate tab dropdown.  Maps the
+#: dropdown label to the instruction injected into generation prompts.
+#: 'Standard' maps to '' so it adds nothing to the prompt.
+WRITING_STYLES: dict[str, str] = {
+    'Standard': '',
+    'Detailed': (
+        'Use rich, detailed, evocative prose with vivid sensory description '
+        'and depth.'
+    ),
+    'Explicit': (
+        'Use explicit, uncensored adult language and graphic descriptions '
+        'where the content calls for it.'
+    ),
+    'Concise': 'Keep the writing brief, direct and to the point.',
+    'Poetic': 'Use lyrical, literary prose with elegant phrasing and imagery.',
+    'Humorous': 'Use a light-hearted, witty, comedic tone.',
+    'Dark': 'Use a dark, gritty, serious tone.',
+    'Romantic': 'Use a warm, romantic, emotionally intimate tone.',
+    'Casual': 'Use a relaxed, informal, conversational tone.',
+    'Formal': 'Use a formal, eloquent, professional tone.',
+    'Action-Packed': (
+        'Use fast-paced, dynamic prose focused on action and movement.'
+    ),
+    'Mysterious': (
+        'Use a suspenseful, atmospheric tone that withholds full answers.'
+    ),
+}
+
+
+def style_instruction(style: str) -> str:
+    """Return the prompt sentence for a writing-style dropdown value.
+
+    Unknown styles resolve to '' so a stale saved value cannot corrupt the
+    prompt.
+    """
+    return WRITING_STYLES.get(style, '')
+
+
+def _style_extra(style: str, extra: str) -> str:
+    """Combine the writing-style instruction with the user's extra text.
+
+    Returned in the shape the ``{extra}`` template placeholder expects:
+    a leading newline followed by ``Writing style: ...`` and/or
+    ``Additional instructions: ...`` lines, or '' when both are empty.
+    """
+    parts: list[str] = []
+    style_text = style_instruction(style)
+    if style_text:
+        parts.append(f'Writing style: {style_text}')
+    if extra:
+        parts.append(f'Additional instructions: {extra}')
+    return '\n' + '\n'.join(parts) if parts else ''
+
+
 #: Strict output-format rules.  A reply that wraps its JSON in a markdown
 #: fence or adds a sentence of preamble used to fail the parser.
 JSON_ONLY_RULE = (
@@ -775,6 +829,7 @@ def build_tags_prompts(
     templates: dict[str, str] | None = None,
     extra: str = '',
     length: str = '',
+    style: str = 'Standard',
 ) -> tuple[str, str]:
     """Build the (system, user) prompts for tag generation.
 
@@ -785,7 +840,7 @@ def build_tags_prompts(
     system = tmpl.get('tags_system') or load_prompt('tags_system')
     user = tmpl.get('tags_user') or load_prompt('tags_user')
     fields = _card_fields(card)
-    fields['extra'] = f'\nAdditional instructions: {extra}' if extra else ''
+    fields['extra'] = _style_extra(style, extra)
     fields['length'] = f'\nGenerate approximately {length} tags.' if length else ''
     return substitute(_with_guard(system), **fields), substitute(user, **fields)
 
@@ -795,6 +850,7 @@ def build_missing_tags_prompts(
     templates: dict[str, str] | None = None,
     extra: str = '',
     length: str = '',
+    style: str = 'Standard',
 ) -> tuple[str, str]:
     """Build the (system, user) prompts for suggesting *additional* tags.
 
@@ -806,7 +862,7 @@ def build_missing_tags_prompts(
     user = tmpl.get('missing_tags_user') or load_prompt('missing_tags_user')
     fields = _card_fields(card)
     fields['existing_tags'] = ', '.join(card.tags) if card.tags else '(none)'
-    fields['extra'] = f'\nAdditional instructions: {extra}' if extra else ''
+    fields['extra'] = _style_extra(style, extra)
     fields['length'] = f'\nSuggest approximately {length} additional tags.' if length else ''
     return substitute(_with_guard(system), **fields), substitute(user, **fields)
 
@@ -816,12 +872,13 @@ def build_summary_prompts(
     templates: dict[str, str] | None = None,
     extra: str = '',
     length: str = '',
+    style: str = 'Standard',
 ) -> tuple[str, str]:
     tmpl = templates or {}
     system = tmpl.get('summary_system') or load_prompt('summary_system')
     user = tmpl.get('summary_user') or load_prompt('summary_user')
     fields = _card_fields(card)
-    fields['extra'] = f'\nAdditional instructions: {extra}' if extra else ''
+    fields['extra'] = _style_extra(style, extra)
     fields['length'] = f'\nTarget length: approximately {length} words.' if length else ''
     return substitute(_with_guard(system), **fields), substitute(user, **fields)
 
@@ -831,12 +888,13 @@ def build_alt_greetings_prompts(
     templates: dict[str, str] | None = None,
     extra: str = '',
     length: str = '',
+    style: str = 'Standard',
 ) -> tuple[str, str]:
     tmpl = templates or {}
     system = tmpl.get('alt_greetings_system') or load_prompt('alt_greetings_system')
     user = tmpl.get('alt_greetings_user') or load_prompt('alt_greetings_user')
     fields = _card_fields(card)
-    fields['extra'] = f'\nAdditional instructions: {extra}' if extra else ''
+    fields['extra'] = _style_extra(style, extra)
     fields['length'] = f'\nTarget length: approximately {length} words.' if length else ''
     return substitute(_with_guard(system), **fields), substitute(user, **fields)
 
@@ -846,13 +904,20 @@ def build_character_prompts(
     extra: str = '',
     templates: dict[str, str] | None = None,
     length: str = '',
+    style: str = 'Standard',
 ) -> tuple[str, str]:
     tmpl = templates or {}
     system = tmpl.get('character_system') or load_prompt('character_system')
     user = tmpl.get('character_user') or load_prompt('character_user')
     length_str = f'\nTarget length: approximately {length} words total across all fields.' if length else ''
-    return substitute(system, concept=concept or '', extra=extra or '', length=length_str), \
-        substitute(user, concept=concept or '', extra=extra or '', length=length_str)
+    # The character user template carries its own 'Additional instructions:'
+    # label, so only the style sentence is prepended here - not the full
+    # _style_extra block (which would duplicate the label).
+    style_text = style_instruction(style)
+    style_part = f'Writing style: {style_text}. ' if style_text else ''
+    extra_full = f'{style_part}{extra}'.strip()
+    return substitute(system, concept=concept or '', extra=extra_full, length=length_str), \
+        substitute(user, concept=concept or '', extra=extra_full, length=length_str)
 
 
 def build_chat_system(card: CharacterCard, templates: dict[str, str] | None = None) -> str:
@@ -1030,6 +1095,7 @@ def build_fill_prompts(
     templates: dict[str, str] | None = None,
     extra: str = '',
     field_lengths: dict[str, str] | None = None,
+    style: str = 'Standard',
 ) -> tuple[str, str]:
     """Build the (system, user) prompts for filling missing fields."""
     tmpl = templates or {}
@@ -1095,7 +1161,7 @@ def build_fill_prompts(
     return substitute(
         _with_guard(system),
         **fields_dict,
-        extra=f'\nAdditional instructions: {extra}' if extra else '',
+        extra=_style_extra(style, extra),
         length=length_str,
     ), substitute(
         user,
@@ -1108,6 +1174,7 @@ def build_fill_prompts(
 def build_character_from_answers(
     answers: dict[str, str],
     templates: dict[str, str] | None = None,
+    style: str = 'Standard',
 ) -> tuple[str, str]:
     """Build the (system, user) prompts for generating a card from guided answers.
 
@@ -1131,10 +1198,12 @@ def build_character_from_answers(
         if value:
             parts.append(f'{label}: {value}')
     body = '\n\n'.join(parts) if parts else '(no details provided)'
+    style_text = style_instruction(style)
+    style_line = f'\nWriting style: {style_text}.' if style_text else ''
     user = (
         'Create a complete character card as a JSON object based on the '
-        f'following details:\n\n{body}\n\nOutput ONLY the JSON object, '
-        'no markdown fences or explanation.'
+        f'following details:\n\n{body}{style_line}\n\nOutput ONLY the JSON '
+        'object, no markdown fences or explanation.'
     )
     return system, user
 
