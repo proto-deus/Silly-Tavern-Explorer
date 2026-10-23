@@ -143,7 +143,10 @@ class DoctorDialog(QDialog):
         self._rescan_btn.clicked.connect(self.run_check)
         btn_row.addWidget(self._rescan_btn)
         close_btn = QPushButton('Close')
-        close_btn.clicked.connect(self.accept)
+        # close() (not accept()) so the button path goes through closeEvent:
+        # accept() bypasses it, and closing while a worker runs would destroy
+        # the live QThread and abort the process.
+        close_btn.clicked.connect(self.close)
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
 
@@ -222,14 +225,38 @@ class DoctorDialog(QDialog):
         # when the dialog is destroyed (Qt aborts on "QThread: Destroyed
         # while thread is still running").  The check is read-only and
         # short; the repair can take longer, so it gets a longer bounded
-        # wait.
+        # wait.  If a worker is still busy past the wait, refuse to close
+        # rather than destroy the thread.
+        if not self._wait_for_workers():
+            QMessageBox.warning(
+                self, 'Library Check',
+                'A check or repair is still running. Please wait for it to '
+                'finish before closing.',
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def _wait_for_workers(self) -> bool:
+        """Bounded-wait for the running workers; True only when all done."""
         worker = self._worker
         if worker is not None and worker.isRunning():
-            worker.wait(5000)
-        repair = getattr(self, '_repair_worker', None)
+            worker.wait(10000)
+            if worker.isRunning():
+                return False
+        repair = self._repair_worker
         if repair is not None and repair.isRunning():
             repair.wait(30000)
-        super().closeEvent(event)
+            if repair.isRunning():
+                return False
+        return True
+
+    def reject(self) -> None:
+        # Esc (and QDialog's own closeEvent) end up here.  Rejecting while a
+        # worker runs would let exec_dialog destroy the dialog - and the live
+        # QThread - and abort the process, so busy means "stay open".
+        if self._wait_for_workers():
+            super().reject()
 
     def _on_preview(self) -> None:
 
