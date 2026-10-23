@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QRect, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QRect, Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
@@ -19,6 +19,8 @@ class CardThumbnail(QWidget):
     # char_id, ctrl_pressed, shift_pressed — drives multi-select in the grid.
     selection_requested = pyqtSignal(int, bool, bool)
     double_clicked = pyqtSignal(int)
+    # char_id, global cursor position — a right-click asked for a menu.
+    context_menu_requested = pyqtSignal(int, QPoint)
 
     def __init__(
         self,
@@ -286,6 +288,9 @@ class CardThumbnail(QWidget):
             shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
             self.clicked.emit(self.char_id)
             self.selection_requested.emit(self.char_id, ctrl, shift)
+        elif event.button() == Qt.MouseButton.RightButton:
+            self.context_menu_requested.emit(self.char_id, event.globalPosition().toPoint())
+            return
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:

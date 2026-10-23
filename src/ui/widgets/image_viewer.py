@@ -1,4 +1,7 @@
 from __future__ import annotations
+
+from pathlib import Path
+
 from src import image_safety
 
 
@@ -58,10 +61,12 @@ if QAction is not None:
         and Esc to close.
         """
 
-        def __init__(self, image_path: str, title: str = 'Image Viewer',
+        def __init__(self, image_path: str | bytes, title: str = 'Image Viewer',
                      parent=None):
             super().__init__(parent)
             self.setWindowTitle(title)
+            # Either a library file path (read through the vault) or raw
+            # image bytes that never existed on disk (chat images).
             self._image_path = image_path
             self._zoom = 1.0
             self._fit_mode = True
@@ -110,11 +115,14 @@ if QAction is not None:
             layout.addLayout(btn_row)
 
         def _load_image(self) -> None:
-            from src import vault
-            try:
-                data = vault.read_bytes(self._image_path)
-            except Exception:
-                data = b''
+            if isinstance(self._image_path, bytes):
+                data = self._image_path
+            else:
+                from src import vault
+                try:
+                    data = vault.read_bytes(self._image_path)
+                except Exception:
+                    data = b''
             pixmap = QPixmap()
             if data:
                 pixmap.loadFromData(data)
@@ -172,8 +180,11 @@ if QAction is not None:
             if not dest:
                 return
             try:
-                from src import vault
-                vault.copy_out(self._image_path, dest)
+                if isinstance(self._image_path, bytes):
+                    Path(dest).write_bytes(self._image_path)
+                else:
+                    from src import vault
+                    vault.copy_out(self._image_path, dest)
             except Exception as e:
                 QMessageBox.critical(self, 'Save Image', f'Failed to save image: {e}')
 

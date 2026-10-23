@@ -3,8 +3,9 @@ from __future__ import annotations
 import base64
 import html
 from datetime import datetime
+from urllib.parse import unquote, urlparse
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
@@ -31,6 +32,12 @@ def _plain_html(text: str) -> str:
     return html.escape(text or '').replace('\n', '<br>')
 
 
+def _image_name_from_url(url: str) -> str:
+    """A sensible file name for an image URL (``image.png`` as a fallback)."""
+    name = unquote(urlparse(url).path.rsplit('/', 1)[-1] or '')
+    return name if '.' in name else (name or 'image') + '.png'
+
+
 class MessageBubble(QFrame):
     """A single chat message rendered as a bubble.
 
@@ -45,6 +52,10 @@ class MessageBubble(QFrame):
     regenerate_requested = pyqtSignal(int)
     variant_back_requested = pyqtSignal(int)
     variant_forward_requested = pyqtSignal(int)
+    # A chat image was right-clicked: (image bytes or None when not yet
+    # fetched, suggested file name, global cursor position, loader callable
+    # or None).  The Test tab shows the menu; it owns the gallery/DB access.
+    image_context_requested = pyqtSignal(object, str, QPoint, object)
 
     def __init__(
         self,
@@ -250,6 +261,13 @@ class MessageBubble(QFrame):
         label = QLabel()
         label.setPixmap(pixmap)
         label.setToolTip(att.get('name', 'image'))
+        name = att.get('name') or 'image.png'
+        label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        label.customContextMenuRequested.connect(
+            lambda pos, data=raw, name=name, lbl=label: self.image_context_requested.emit(
+                data, name, lbl.mapToGlobal(pos), None,
+            )
+        )
         return label
 
     def _text_chip(self, att: dict) -> QWidget:
@@ -290,10 +308,24 @@ class MessageBubble(QFrame):
                 label.setText('🖼 Click to load image')
             label.setStyleSheet(f'color: #777; font-size: {self._small_px}px;')
             label.setMinimumHeight(24)
+            label.context_menu_requested.connect(
+                lambda u, data, pos, lbl=label: self._on_url_image_menu(lbl, u, data, pos)
+            )
             self._images_layout.addWidget(label)
         if urls:
             self._images_layout.addStretch()
         self._images_container.setVisible(bool(urls))
+
+    def _on_url_image_menu(self, label, url: str, data, global_pos) -> None:
+        """Forward a URL image's right-click to the Test tab.
+
+        The label carries its own fetch routine, so an unfetched image
+        passes that along as the loader and the menu can offer "Load Image".
+        """
+        loader = getattr(label, 'request_load', None)
+        self.image_context_requested.emit(
+            data, _image_name_from_url(url), global_pos, loader,
+        )
 
     def append_stream(self, text: str) -> None:
         """Append a streamed chunk (plain rendering; no colored formatting).

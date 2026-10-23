@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
 
 from src.database import SORT_LABELS, LibraryDatabase
 from src.ui.widgets.async_image import cancel_pending_image_loads
+from src.ui.widgets.card_context_menu import show_card_context_menu
 from src.ui.widgets.card_thumbnail import CardThumbnail
 
 # Owner tag for this list's queued thumbnail loads, so cancelling a rebuild of
@@ -55,6 +56,10 @@ class CharacterSidebar(QWidget):
 
     card_selected = pyqtSignal(int)
     card_double_clicked = pyqtSignal(int)
+    # A thumbnail's context menu picked an action: (action key, char_id).
+    # The actions live in MainWindow / the Library tab; this list only shows
+    # the menu, so it forwards the choice instead of implementing it.
+    context_action = pyqtSignal(str, int)
     # Emitted when the user edits the search box; the Library tab mirrors it.
     search_changed = pyqtSignal(str)
     # The favorites filter and the sort order are shared with the Library
@@ -262,6 +267,7 @@ class CharacterSidebar(QWidget):
             )
             thumb.clicked.connect(self._on_thumb_clicked)
             thumb.double_clicked.connect(self._on_thumb_double_clicked)
+            thumb.context_menu_requested.connect(self._on_thumb_context_menu)
             self._thumb_widgets.append(thumb)
             self._thumbs_by_id[char_id] = thumb
             self._search_blobs[char_id] = ' '.join(
@@ -382,6 +388,12 @@ class CharacterSidebar(QWidget):
         """Load the images of the rows that are on screen when the list shows."""
         super().showEvent(event)
         self._load_visible_images()
+        # A selection made while the sidebar was hidden (a Library-grid
+        # click) could not scroll: a list that has never been laid out has
+        # an empty scroll range, so the value would have been clamped to 0
+        # and the position lost.  Catch up now that the widget is shown;
+        # deferred one turn so the layout has assigned the real range.
+        QTimer.singleShot(0, self._flush_pending_scroll)
 
     def _on_favorites_toggled(self, checked: bool) -> None:
         self._favorites_only = checked
@@ -528,7 +540,12 @@ class CharacterSidebar(QWidget):
     def _scroll_to_row(self, char_id: int | None) -> bool:
         """Scroll the row of *char_id* to the top of the viewport.
 
-        Returns False when the row is not in the list (yet).
+        Returns False when the row is not in the list (yet) - or when the
+        list cannot scroll at all: a sidebar that has never been laid out
+        (it is hidden while the Library tab is up) has a scrollbar range
+        of 0, and setting the value then would silently clamp it to 0
+        while reporting success.  Reporting False keeps the target pending
+        so it is retried once the sidebar is shown.
         """
         if char_id is None:
             return False
@@ -536,6 +553,8 @@ class CharacterSidebar(QWidget):
             if thumb.char_id != char_id:
                 continue
             bar = self._thumb_scroll.verticalScrollBar()
+            if bar.maximum() <= 0 and y > 0:
+                return False
             bar.setValue(max(0, min(y, bar.maximum())))
             return True
         return False
@@ -555,6 +574,30 @@ class CharacterSidebar(QWidget):
 
     def _on_thumb_double_clicked(self, char_id: int) -> None:
         self.card_double_clicked.emit(char_id)
+
+    def _on_thumb_context_menu(self, char_id: int, global_pos) -> None:
+        """Right-click on a row: show the shared card menu.
+
+        The row is selected first so the menu and the rest of the app agree
+        on the target.  The choices are forwarded as ``context_action``; the
+        handlers live with the Library tab / MainWindow.
+        """
+        self._on_thumb_clicked(char_id)
+        entry = self.db.get_by_id(char_id)
+        if not entry:
+            return
+        handlers = {
+            key: (lambda k=key: self.context_action.emit(k, char_id))
+            for key in (
+                'edit', 'favorite', 'collections', 'full_image',
+                'open_folder', 'export_png', 'export_json', 'duplicate',
+                'delete',
+            )
+        }
+        show_card_context_menu(
+            self, global_pos, handlers,
+            favorite_on=bool(entry.get('is_favorite')),
+        )
 
     # ---- maintenance ----
 

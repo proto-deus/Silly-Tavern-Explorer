@@ -3,7 +3,7 @@ from __future__ import annotations
 import weakref
 from functools import partial
 
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QPoint, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QMouseEvent
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PyQt6.QtWidgets import QLabel
@@ -19,6 +19,9 @@ _CACHE_LIMIT = 64
 
 _manager: QNetworkAccessManager | None = None
 _pixmap_cache: dict[str, QPixmap] = {}
+# The unmodified bytes behind the (downscaled) pixmap, keyed the same way.
+# Gallery exports want the original, not the 512px display copy.
+_data_cache: dict[str, bytes] = {}
 
 
 def _network_manager() -> QNetworkAccessManager:
@@ -33,21 +36,32 @@ def cached_url_pixmap(url: str) -> QPixmap | None:
     return _pixmap_cache.get(url)
 
 
-def _cache_pixmap(url: str, pixmap: QPixmap) -> None:
+def cached_url_data(url: str) -> bytes | None:
+    """Return the cached original bytes for *url*, or None (does not fetch)."""
+    return _data_cache.get(url)
+
+
+def _cache_pixmap(url: str, pixmap: QPixmap, data: bytes) -> None:
     _pixmap_cache[url] = pixmap
+    _data_cache[url] = data
     while len(_pixmap_cache) > _CACHE_LIMIT:
         _pixmap_cache.pop(next(iter(_pixmap_cache)))
+    while len(_data_cache) > _CACHE_LIMIT:
+        _data_cache.pop(next(iter(_data_cache)))
 
 
 class ClickableImageLabel(QLabel):
     """QLabel that opens its tooltip URL in the default browser when clicked."""
 
     clicked = pyqtSignal(str)
+    # url, original bytes (None while unfetched), global cursor position.
+    context_menu_requested = pyqtSignal(str, object, QPoint)
 
     def __init__(self, url: str, parent=None):
         super().__init__(parent)
         self._url = url
         self._loaded = False
+        self._data: bytes | None = None
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip(url)
 
@@ -58,7 +72,20 @@ class ClickableImageLabel(QLabel):
             from PyQt6.QtGui import QDesktopServices
             QDesktopServices.openUrl(QUrl(self._url))
             self.clicked.emit(self._url)
+        elif event.button() == Qt.MouseButton.RightButton:
+            data = self._data if self._data is not None else cached_url_data(self._url)
+            self.context_menu_requested.emit(
+                self._url, data, event.globalPosition().toPoint(),
+            )
+            return
         super().mousePressEvent(event)
+
+    def request_load(self) -> None:
+        """Fetch the image if that has not happened yet (context-menu action).
+
+        The base label never fetches on its own; the lazy subclass
+        overrides this with the actual download.
+        """
 
 
 class _UrlImageLabel(ClickableImageLabel):
@@ -69,12 +96,17 @@ class _UrlImageLabel(ClickableImageLabel):
         self._max_dim = max_dim
         self._fetching = False
 
+    def request_load(self) -> None:
+        if self._loaded or self._fetching:
+            return
+        self._fetching = True
+        self.setText('Loading image…')
+        load_url_image(self._url, self, self._max_dim)
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton and not self._loaded and not self._fetching:
-            self._fetching = True
-            self.setText('Loading image…')
-            load_url_image(self._url, self, self._max_dim)
-            # Don't call super: the first click loads, it must not open the browser.
+            # The first click loads; it must not open the browser.
+            self.request_load()
             return
         super().mousePressEvent(event)
 
@@ -147,9 +179,10 @@ def load_url_image(url: str, label: QLabel, max_dim: int = 512) -> None:
                     Qt.TransformationMode.SmoothTransformation,
                 )
             pixmap = QPixmap.fromImage(image)
-            _cache_pixmap(url, pixmap)
+            _cache_pixmap(url, pixmap, data)
             if isinstance(lbl, ClickableImageLabel):
                 lbl._loaded = True
+                lbl._data = data
             lbl.setPixmap(pixmap)
         except RuntimeError:
             # The label was deleted between the liveness check and the call.
