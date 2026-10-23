@@ -1764,6 +1764,21 @@ class LibraryDatabase:
             ).fetchall()
             return [r[0] for r in rows]
 
+    def get_collection_membership(self) -> dict[int, set[int]]:
+        """Return {character_id: {collection_id, ...}} for every card.
+
+        One query for the whole map, so the sidebar (which filters its entire
+        listing by collection) does not open a connection per card.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                'SELECT character_id, collection_id FROM card_collections',
+            ).fetchall()
+        membership: dict[int, set[int]] = {}
+        for char_id, collection_id in rows:
+            membership.setdefault(int(char_id), set()).add(int(collection_id))
+        return membership
+
     def add_to_collection(self, char_id: int, collection_id: int) -> None:
         with self._conn() as conn:
             conn.execute(
