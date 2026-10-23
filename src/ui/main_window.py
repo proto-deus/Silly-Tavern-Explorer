@@ -1591,7 +1591,7 @@ class MainWindow(QMainWindow):
             result = self._prompt_dirty_switch()
             if result == 'cancel':
                 return
-        self._sidebar.select_card(char_id)
+        self._sidebar.set_selected_id(char_id)
         self._edit_tab.set_selected_id(char_id)
         self._ai_tab.select_card(char_id)
         self._gallery_tab.set_selected_card(char_id)
@@ -1600,10 +1600,10 @@ class MainWindow(QMainWindow):
 
     def _on_card_selected(self, char_id: int) -> None:
         """Sync a Library-grid selection to the shared sidebar and the tabs."""
-        # select_card (not set_selected_id): the sidebar holds every card in
-        # the library, so it can follow the selection even when the card sits
-        # on a later page of the grid.
-        self._sidebar.select_card(char_id)
+        # set_selected_id (not select_card): the sidebar only highlights the
+        # card here.  Scrolling it to the card yanked the list to the top of
+        # the viewport on every grid click, losing the user's place.
+        self._sidebar.set_selected_id(char_id)
         self._ai_tab.select_card(char_id)
         self._edit_tab.set_selected_id(char_id)
         self._gallery_tab.set_selected_card(char_id)
@@ -1668,9 +1668,6 @@ class MainWindow(QMainWindow):
             # hiding it cleared so the follow always succeeds.
             self._library_tab.reveal_card(self._sidebar.current_id())
             return
-
-        if self._sidebar.current_id() is not None:
-            self._sidebar.scroll_selected_to_top()
 
         sid = self._sidebar.current_id()
         if isinstance(widget, EditTab):
