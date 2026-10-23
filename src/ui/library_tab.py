@@ -316,9 +316,10 @@ def _detail_pane_initial_height(line_h: int) -> int:
     """Initial height of the detail pane below the card grid.
 
     200px plus one text line for each of the pane's three display sections
-    (tags, summary, description), so every one of them gains a line.
+    (tags, summary, description), plus one more so the summary keeps its
+    height now that the tags section above it also grew by a line.
     """
-    return 200 + 3 * line_h
+    return 200 + 4 * line_h
 
 
 def _summary_max_height(pane_height: int, line_h: int) -> int:
@@ -716,15 +717,18 @@ class LibraryTab(QWidget):
         splitter.addWidget(detail_container)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
-        # The detail pane starts three text lines taller than before (one
-        # extra line for each of its display sections: tags, summary and
-        # description).  QSplitter keeps this offset at any window height
-        # because free space is handed out by the stretch factors above.
+        # The detail pane starts four text lines taller than before: one
+        # extra line for each display section (tags, summary, description)
+        # plus one more so the summary keeps its height now that the tags
+        # section also grew by a line.  QSplitter keeps this offset at any
+        # window height because free space is handed out by the stretch
+        # factors above.
         splitter.setSizes([600, _detail_pane_initial_height(line_h)])
         layout.addWidget(splitter, 1)
 
         self._refresh_collection_combo()
         self._sync_filter_bar_height()
+        self._sync_chip_heights()
 
     def load_cards(self) -> None:
         self._refresh_collection_combo()
@@ -828,6 +832,17 @@ class LibraryTab(QWidget):
             self._filter_bar_layout.addWidget(chip)
         self._clear_tags_btn.setEnabled(bool(self._selected_filter_tags))
         self._sync_filter_bar_height()
+
+    def _sync_chip_heights(self) -> None:
+        """Make every chip-styled control exactly as tall as the buttons.
+
+        Qt sizes a label by its text and a checkbox by its indicator, so
+        the chips would otherwise end up a few pixels off from the push
+        buttons they are styled to look like.
+        """
+        height = self._fav_btn.sizeHint().height()
+        for chip in self.findChildren(QWidget, 'filterChip'):
+            chip.setFixedHeight(height)
 
     def _sync_filter_bar_height(self) -> None:
         """Size the tag-filter bar to its wrapped rows.
@@ -1291,6 +1306,7 @@ class LibraryTab(QWidget):
     def refresh_font_size(self) -> None:
         """Recompute baked font-dependent heights after a theme change."""
         self._sync_filter_bar_height()
+        self._sync_chip_heights()
         # The rating stars carry their own pixel size, so they have to be
         # told about the new one.
         self._detail_rating.refresh_font_size()

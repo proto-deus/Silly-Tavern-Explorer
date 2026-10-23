@@ -572,7 +572,10 @@ QLabel#filterChip, QCheckBox#filterChip {
     background-color: $hover;
     border: 1px solid $muted;
     border-radius: 4px;
-    padding: 4px 10px;
+    /* Vertical padding stays small: the chip's height is fixed to the
+       push-button height at runtime, and the checkbox indicator needs the
+       leftover room not to clip. */
+    padding: 2px 10px;
     color: $fg;
     font-weight: bold;
 }
