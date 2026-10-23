@@ -1600,10 +1600,10 @@ class MainWindow(QMainWindow):
 
     def _on_card_selected(self, char_id: int) -> None:
         """Sync a Library-grid selection to the shared sidebar and the tabs."""
-        # set_selected_id (not select_card): the sidebar only highlights the
-        # card here.  Scrolling it to the card yanked the list to the top of
-        # the viewport on every grid click, losing the user's place.
-        self._sidebar.set_selected_id(char_id)
+        # select_card (not just set_selected_id): the sidebar follows the
+        # Library click by highlighting the card AND scrolling it into view,
+        # so the same card is findable in both lists.
+        self._sidebar.select_card(char_id)
         self._ai_tab.select_card(char_id)
         self._edit_tab.set_selected_id(char_id)
         self._gallery_tab.set_selected_card(char_id)
