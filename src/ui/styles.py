@@ -151,6 +151,22 @@ QMenu::item:selected {
     background-color: $select;
 }
 
+/* Checkable menu items (the multi-select collection dropdown) need a
+   checkbox that is visible on the dark menu background. */
+QMenu::indicator {
+    width: 14px;
+    height: 14px;
+    margin-left: 2px;
+    border: 1px solid $muted;
+    border-radius: 3px;
+    background-color: $panel;
+}
+
+QMenu::indicator:checked {
+    background-color: $accent;
+    border: 1px solid $accent;
+}
+
 QMenu::separator {
     height: 1px;
     background-color: $border_dim;
@@ -232,6 +248,41 @@ QComboBox QAbstractItemView {
     border: 1px solid $border_strong;
     color: $fg;
     selection-background-color: $select;
+}
+
+/* The multi-select collection dropdown is a QToolButton standing in for a
+   combo: give it the combo's look, not the push-button's.  Text sits at
+   the left edge like a combo's, which matters in the sidebar where the
+   button is stretched to the column width. */
+QToolButton {
+    background-color: $panel;
+    border: 1px solid $border_strong;
+    border-radius: 4px;
+    padding: 5px 8px;
+    color: $fg;
+    text-align: left;
+}
+
+QToolButton:hover {
+    background-color: $hover;
+    border: 1px solid $muted_dim;
+}
+
+QToolButton:focus {
+    border: 1px solid $accent;
+}
+
+QToolButton:pressed, QToolButton::menu-button:pressed {
+    background-color: $input;
+}
+
+QToolButton::menu-indicator {
+    image: url("__COMBO_ARROW_DOWN__");
+    width: 10px;
+    height: 6px;
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    padding-right: 6px;
 }
 
 QTextEdit, QPlainTextEdit {

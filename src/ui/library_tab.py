@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Sequence
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
@@ -29,7 +30,13 @@ from src.card_models import CharacterCard
 from src.card_parser import read_card_data
 # ``_escape_like`` is the LIKE-metacharacter escaper the database's own
 # search uses; the bounded search below must escape identically.
-from src.database import SORT_LABELS, LibraryDatabase, _escape_like, sanitize_filename
+from src.database import (
+    SORT_LABELS,
+    LibraryDatabase,
+    _escape_like,
+    collection_filter_clause,
+    sanitize_filename,
+)
 from src.settings_manager import load_font_size
 from src.ui.dialog_helper import exec_dialog, exec_dialog_with
 from src.ui.widgets.async_image import (
@@ -39,6 +46,7 @@ from src.ui.widgets.async_image import (
 from src.ui.widgets.card_thumbnail import CardThumbnail
 from src.ui.widgets.card_context_menu import show_card_context_menu
 from src.ui.widgets.flow_layout import FlowLayout
+from src.ui.widgets.multi_select_dropdown import MultiSelectDropdown
 from src.ui.widgets.rating_widget import RatingWidget
 from src.ui.widgets.tag_widget import TagChip, TagWidget
 from src import safe_json
@@ -140,7 +148,7 @@ def _search_page(
     sort_by: str = 'name',
     favorites_only: bool = False,
     min_rating: int = 0,
-    collection_id: int | None = None,
+    collection_id: int | Sequence[int] | None = None,
     limit: int = GRID_PAGE_SIZE,
     offset: int = 0,
     only_id: int | None = None,
@@ -177,15 +185,10 @@ def _search_page(
         clauses.append('rating >= ?')
         params.append(int(min_rating))
     if collection_id is not None:
-        if collection_id < 0:
-            # Sentinel: cards that belong to no collection at all.
-            clauses.append('id NOT IN (SELECT character_id FROM card_collections)')
-        else:
-            clauses.append(
-                'id IN (SELECT character_id FROM card_collections '
-                'WHERE collection_id = ?)'
-            )
-            params.append(int(collection_id))
+        col_clause, col_params = collection_filter_clause(collection_id)
+        if col_clause != '1=1':
+            clauses.append(col_clause)
+            params.extend(col_params)
     # The text clause is built inside the connection block: the full-text
     # variant needs a column that only exists in a library created by a
     # newer build, so the schema has to be checked first.
@@ -482,10 +485,17 @@ class LibraryTab(QWidget):
         collection_label = QLabel('Collection:')
         collection_label.setObjectName('filterChip')
         filter_row.addWidget(collection_label)
-        self._collection_combo = QComboBox()
-        self._collection_combo.setToolTip('Filter by collection')
-        self._collection_combo.currentIndexChanged.connect(self._apply_filters)
-        filter_row.addWidget(self._collection_combo)
+        self._collection_filter = MultiSelectDropdown(empty_text='All Cards')
+        self._collection_filter.setToolTip(
+            'Filter by collection - check several to combine them'
+        )
+        self._collection_filter.selection_changed.connect(self._apply_filters)
+        # The two dropdowns in this row look tidiest at the same width;
+        # the combo's hint already covers its longest sort label.
+        self._collection_filter.setMinimumWidth(
+            self._sort_combo.sizeHint().width()
+        )
+        filter_row.addWidget(self._collection_filter)
 
         self._build_page_size_combo(filter_row)
 
@@ -800,20 +810,15 @@ class LibraryTab(QWidget):
         return self._page_size
 
     def _refresh_collection_combo(self) -> None:
-        """Rebuild the collection filter dropdown, preserving the selection."""
-        current = self._collection_combo.currentData()
-        self._collection_combo.blockSignals(True)
-        self._collection_combo.clear()
-        self._collection_combo.addItem('All Cards', None)
-        self._collection_combo.addItem('No Collection', -1)
+        """Rebuild the collection filter dropdown, preserving the selection.
+
+        Checked collections that still exist keep their check; a deleted
+        one is dropped instead of silently filtering by nothing.
+        """
+        options: list[tuple[str, int]] = [('No Collection', -1)]
         for col in self.db.list_collections():
-            self._collection_combo.addItem(
-                f"{col['name']} ({col['card_count']})", col['id'],
-            )
-        idx = self._collection_combo.findData(current)
-        if idx >= 0:
-            self._collection_combo.setCurrentIndex(idx)
-        self._collection_combo.blockSignals(False)
+            options.append((f"{col['name']} ({col['card_count']})", int(col['id'])))
+        self._collection_filter.set_options(options)
 
     def _refresh_tag_filter(self) -> None:
         # Drop any existing selected-tag chips (everything after the fixed
@@ -896,12 +901,14 @@ class LibraryTab(QWidget):
         query = self._search_edit.text().strip()
         tags = list(self._selected_filter_tags) if self._selected_filter_tags else None
         favorites_only = self._favorites_only_cb.isChecked()
-        collection_id = self._collection_combo.currentData()
+        # No check = no collection filter; otherwise match any of the
+        # checked collections (the -1 "No Collection" sentinel included).
+        selected = self._collection_filter.selected_values()
         self._filter_args = {
             'query': query,
             'tags': tags,
             'favorites_only': favorites_only,
-            'collection_id': collection_id,
+            'collection_id': selected or None,
             'full_text': self._full_text_cb.isChecked(),
             'fuzzy': self._fuzzy_cb.isChecked(),
         }
@@ -967,10 +974,9 @@ class LibraryTab(QWidget):
         changed = exec_dialog_with(dlg, lambda d: d.changed)
         if changed:
             self._refresh_collection_combo()
-            # Re-apply unconditionally: deleting the collection currently being
-            # filtered by leaves currentData() as None (the combo falls back to
-            # "All Cards"), so the old guard skipped the re-filter and the grid
-            # kept showing the deleted collection's results.
+            # Re-apply unconditionally: deleting a collection that was
+            # checked drops its check, so the grid must re-filter even
+            # though no selection_changed signal fires.
             self._apply_filters()
 
     def _on_assign_collections(self, char_id: int | None = None) -> None:
@@ -1554,9 +1560,7 @@ class LibraryTab(QWidget):
         self._favorites_only_cb.blockSignals(True)
         self._favorites_only_cb.setChecked(False)
         self._favorites_only_cb.blockSignals(False)
-        self._collection_combo.blockSignals(True)
-        self._collection_combo.setCurrentIndex(0)
-        self._collection_combo.blockSignals(False)
+        self._collection_filter.clear_selection()
         self._search_timer.stop()
         if self._search_edit.text():
             self._search_edit.blockSignals(True)
