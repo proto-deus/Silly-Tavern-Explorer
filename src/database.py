@@ -9,6 +9,7 @@ import sqlite3
 import time
 import unicodedata
 import uuid
+from collections.abc import Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -51,6 +52,42 @@ def _escape_like(text: str) -> str:
     helper instead.)
     """
     return text.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+
+def collection_filter_clause(
+    collection_id: Optional[int | Sequence[int]],
+) -> tuple[str, list]:
+    """Return a ``(where_sql, params)`` pair restricting rows by collection.
+
+    Accepts one collection id, several (a card matches when it is in *any*
+    of them), or ``None`` / an empty sequence for no restriction.  A
+    negative id is the "belongs to no collection" sentinel; combined with
+    real ids it is OR-ed in, so the pair ``[3, -1]`` keeps the members of
+    collection 3 plus every card in no collection at all.
+    """
+    if collection_id is None:
+        return '1=1', []
+    ids = (
+        [collection_id] if isinstance(collection_id, int)
+        else [int(c) for c in collection_id]
+    )
+    wants_uncollected = any(i < 0 for i in ids)
+    real_ids = [i for i in ids if i >= 0]
+    parts: list[str] = []
+    params: list = []
+    if wants_uncollected:
+        parts.append('id NOT IN (SELECT character_id FROM card_collections)')
+    if real_ids:
+        marks = ', '.join('?' * len(real_ids))
+        parts.append(
+            'id IN (SELECT character_id FROM card_collections '
+            f'WHERE collection_id IN ({marks}))'
+        )
+        params.extend(real_ids)
+    if not parts:
+        return '1=1', []
+    clause = parts[0] if len(parts) == 1 else '(' + ' OR '.join(parts) + ')'
+    return clause, params
 
 
 def _st_norm(value) -> str:
@@ -1100,11 +1137,14 @@ class LibraryDatabase:
         sort_by: str = 'name',
         favorites_only: bool = False,
         min_rating: int = 0,
-        collection_id: Optional[int] = None,
+        collection_id: Optional[int | Sequence[int]] = None,
         full_text: bool = False,
         fuzzy: bool = False,
     ) -> list[dict]:
         """Search the library.
+
+        *collection_id* restricts the result to one collection, or to any
+        of several (see :func:`collection_filter_clause`).
 
         *query* is matched against the name, the description preview, the
         tags, the creator and the creator notes.
@@ -1132,17 +1172,10 @@ class LibraryDatabase:
                 clauses.append('rating >= ?')
                 params.append(int(min_rating))
             if collection_id is not None:
-                if collection_id < 0:
-                    # Sentinel: cards that belong to no collection at all.
-                    clauses.append(
-                        'id NOT IN (SELECT character_id FROM card_collections)'
-                    )
-                else:
-                    clauses.append(
-                        'id IN (SELECT character_id FROM card_collections '
-                        'WHERE collection_id = ?)'
-                    )
-                    params.append(int(collection_id))
+                col_clause, col_params = collection_filter_clause(collection_id)
+                if col_clause != '1=1':
+                    clauses.append(col_clause)
+                    params.extend(col_params)
             if query:
                 # Escape LIKE metacharacters so a query of "%" doesn't match
                 # every row.
