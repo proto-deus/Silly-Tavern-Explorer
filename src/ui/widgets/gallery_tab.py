@@ -186,6 +186,9 @@ if QWidget is not None:
             self._refresh_btn = QPushButton('Refresh')
             self._refresh_btn.clicked.connect(self.refresh)
             header.addWidget(self._refresh_btn)
+            self._settings_btn = QPushButton('Settings')
+            self._settings_btn.clicked.connect(self.settings_requested.emit)
+            header.addWidget(self._settings_btn)
             layout.addLayout(header)
 
             self._panes = QTabWidget()
