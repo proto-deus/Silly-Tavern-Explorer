@@ -312,6 +312,10 @@ QPushButton:hover {
     border: 1px solid $muted_dim;
 }
 
+QPushButton:focus {
+    border: 1px solid $accent;
+}
+
 QPushButton:checked {
     background-color: $ok_dim;
     border: 1px solid $ok;
