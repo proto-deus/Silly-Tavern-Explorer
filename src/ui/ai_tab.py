@@ -831,6 +831,7 @@ class AITab(QWidget):
         try:
             self.db.update_card(self._selected_id, card)
             QMessageBox.information(self, 'Saved', f"Tags saved to '{card.name}'.")
+            self._on_fill_card_changed()
             self.card_updated.emit(self._selected_id)
         except Exception as e:
             QMessageBox.critical(self, 'Error', f"Failed to save: {e}")
@@ -860,6 +861,7 @@ class AITab(QWidget):
         try:
             self.db.update_card(self._selected_id, card)
             QMessageBox.information(self, 'Saved', f"Summary saved to creator notes of '{card.name}'.")
+            self._on_fill_card_changed()
             self.card_updated.emit(self._selected_id)
         except Exception as e:
             QMessageBox.critical(self, 'Error', f"Failed to save: {e}")
@@ -883,6 +885,7 @@ class AITab(QWidget):
         try:
             self.db.update_card(self._selected_id, card)
             QMessageBox.information(self, 'Saved', f"Alternate greeting saved to '{card.name}'.")
+            self._on_fill_card_changed()
             self.card_updated.emit(self._selected_id)
         except Exception as e:
             QMessageBox.critical(self, 'Error', f"Failed to save: {e}")

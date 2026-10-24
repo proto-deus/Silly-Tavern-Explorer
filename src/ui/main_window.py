@@ -868,6 +868,12 @@ class MainWindow(QMainWindow):
         and causes a storm of stray top-level windows)."""
         self._sidebar.refresh_card(char_id)
         self._library_tab._refresh_single_thumbnail(char_id)
+        # The Generate tab rewrote the card on disk: a clean Edit form showing
+        # this card must re-read it (same reason as the gallery handler) or a
+        # later Ctrl+S there would save the stale buffer over the generated
+        # content.
+        if self._edit_tab.form_loaded_for_id == char_id and not self._edit_tab.is_dirty():
+            self._edit_tab.reload_current()
         self._update_status()
 
     def _on_gallery_card_updated(self, char_id: int) -> None:
