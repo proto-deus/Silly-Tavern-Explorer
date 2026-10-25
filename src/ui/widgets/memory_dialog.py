@@ -64,7 +64,7 @@ class MemoryDialog(QDialog):
         self._list = QListWidget()
         layout.addWidget(self._list, 1)
 
-        self._auto_check = QCheckBox('Auto-summarize each exchange')
+        self._auto_check = QCheckBox('Auto-memory each exchange')
         self._auto_check.setChecked(auto_summarize)
         self._auto_check.toggled.connect(self._on_auto_toggled)
         layout.addWidget(self._auto_check)
@@ -126,7 +126,7 @@ class MemoryDialog(QDialog):
         attr_add_btn = QPushButton('Add')
         attr_add_btn.clicked.connect(self._on_attr_add)
         attr_btn_row.addWidget(attr_add_btn)
-        attr_remove_btn = QPushButton('Remove Selected')
+        attr_remove_btn = QPushButton('Remove')
         attr_remove_btn.clicked.connect(self._on_attr_remove)
         attr_btn_row.addWidget(attr_remove_btn)
         attr_btn_row.addStretch()
@@ -138,7 +138,7 @@ class MemoryDialog(QDialog):
         )
         self._auto_attr_check.toggled.connect(self._on_auto_attr_toggled)
         attr_btn_row.addWidget(self._auto_attr_check)
-        self._update_attr_btn = QPushButton('Update Attributes Now')
+        self._update_attr_btn = QPushButton('Update Now')
         self._update_attr_btn.clicked.connect(self.update_attributes_requested.emit)
         attr_btn_row.addWidget(self._update_attr_btn)
         attr_layout.addLayout(attr_btn_row)
@@ -317,5 +317,5 @@ class MemoryDialog(QDialog):
     def set_updating_attributes(self, active: bool) -> None:
         self._update_attr_btn.setEnabled(not active)
         self._update_attr_btn.setText(
-            'Updating Attributes...' if active else 'Update Attributes Now',
+            'Updating...' if active else 'Update Now',
         )

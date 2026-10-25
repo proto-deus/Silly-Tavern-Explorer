@@ -40,6 +40,7 @@ from src.provider_capabilities import (
     unsupported_settings,
 )
 from src.settings_manager import (
+    apply_logging_enabled,
     load_active_persona_id,
     load_active_provider,
     load_macro_settings,
@@ -50,7 +51,9 @@ from src.settings_manager import (
     load_test_settings,
     save_active_persona_id,
     save_all_provider_settings,
+    save_font_size,
     save_macro_settings,
+    save_logging_enabled,
     save_personas,
     save_provider_models,
     save_spellcheck_enabled,
@@ -1101,10 +1104,16 @@ class _PromptsPanel(QWidget):
         save_active_context_template_id(self._context_combo.currentData() or 'default')
 
 
-class _EditorPanel(QWidget):
-    """Text-editing behaviour shared by every editable field."""
+class _AppPanel(QWidget):
+    """App-wide behaviour: spell checking, logging, and the UI font size."""
 
-    def __init__(self, spellcheck_enabled: bool = True, parent: QWidget | None = None):
+    def __init__(
+        self,
+        spellcheck_enabled: bool = True,
+        logging_enabled: bool = True,
+        font_size: int = 13,
+        parent: QWidget | None = None,
+    ):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         group = QGroupBox('Spell Checking')
@@ -1117,10 +1126,43 @@ class _EditorPanel(QWidget):
         )
         group_layout.addWidget(self._spellcheck)
         layout.addWidget(group)
+
+        logging_group = QGroupBox('Logging')
+        logging_layout = QVBoxLayout(logging_group)
+        self._logging = QCheckBox('Write the application log (app.log)')
+        self._logging.setChecked(bool(logging_enabled))
+        self._logging.setToolTip(
+            'Appends diagnostics to ~/.st-explorer/app.log while the app\n'
+            'runs. Turning it off stops new log entries immediately; the\n'
+            'existing file is left in place.'
+        )
+        logging_layout.addWidget(self._logging)
+        layout.addWidget(logging_group)
+
+        ui_group = QGroupBox('Interface')
+        ui_form = QFormLayout(ui_group)
+        self._font_size = QSpinBox()
+        # The same range the Font Size dialog and the settings clamp to, so
+        # a hand-edited value cannot put this out of sync with the setting.
+        self._font_size.setRange(8, 32)
+        self._font_size.setSuffix(' px')
+        self._font_size.setValue(int(font_size))
+        self._font_size.setToolTip(
+            'The application font size - the same setting as '
+            'View > Font Size...'
+        )
+        ui_form.addRow('Font size:', self._font_size)
+        layout.addWidget(ui_group)
         layout.addStretch()
 
     def spellcheck_enabled(self) -> bool:
         return self._spellcheck.isChecked()
+
+    def logging_enabled(self) -> bool:
+        return self._logging.isChecked()
+
+    def font_size(self) -> int:
+        return self._font_size.value()
 
 
 class _TestPanel(QWidget):
@@ -1395,7 +1437,7 @@ class _EncryptionPanel(QWidget):
 
 
 class SettingsDialog(QDialog):
-    """Master settings dialog with API / LLM / Macros / Prompts / Editor / Test tabs."""
+    """Master settings dialog with API / LLM / Macros / Prompts / App / Test tabs."""
 
     settings_changed = pyqtSignal()
 
@@ -1432,14 +1474,17 @@ class SettingsDialog(QDialog):
             load_personas(), load_active_persona_id(),
         )
         self._prompts_panel = _PromptsPanel()
-        self._editor_panel = _EditorPanel(load_spellcheck_enabled())
+        from src.settings_manager import load_font_size, load_logging_enabled
+        self._app_panel = _AppPanel(
+            load_spellcheck_enabled(), load_logging_enabled(), load_font_size(),
+        )
         self._test_panel = _TestPanel(test)
         self._encryption_panel = _EncryptionPanel()
         self._tabs.addTab(self._api_panel, 'API')
         self._tabs.addTab(self._llm_panel, 'LLM')
         self._tabs.addTab(self._macros_panel, 'Macros')
         self._tabs.addTab(self._prompts_panel, 'Prompts')
-        self._tabs.addTab(self._editor_panel, 'Editor')
+        self._tabs.addTab(self._app_panel, 'App')
         self._tabs.addTab(self._test_panel, 'Test')
         self._tabs.addTab(self._encryption_panel, 'Encryption')
         layout.addWidget(self._tabs)
@@ -1495,7 +1540,15 @@ class SettingsDialog(QDialog):
         save_user_persona(active_text)
         self._prompts_panel.save()
         save_test_settings(test)
-        save_spellcheck_enabled(self._editor_panel.spellcheck_enabled())
+        save_spellcheck_enabled(self._app_panel.spellcheck_enabled())
+        # The log toggle is applied live (the FileHandler is added/removed
+        # from the root logger), so no restart is needed.
+        logging_enabled = self._app_panel.logging_enabled()
+        save_logging_enabled(logging_enabled)
+        apply_logging_enabled(logging_enabled)
+        # The theme/font re-application happens in the main window's
+        # settings_changed handler, which also refreshes the tab styles.
+        save_font_size(self._app_panel.font_size())
         logger.info("Settings saved")
         self.settings_changed.emit()
         # accept() does not go through closeEvent, so the fetch worker must
