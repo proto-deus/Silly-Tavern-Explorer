@@ -80,8 +80,10 @@ from src.settings_manager import (
     load_macro_settings,
     load_provider_models,
     load_test_settings,
+    merge_vn_overrides,
     save_active_lorebooks,
     save_active_sampling,
+    save_test_settings,
 )
 from src.token_counter import count_tokens
 from src.ui.spell_check import SpellCheckTextEdit
@@ -91,6 +93,12 @@ from src.ui.widgets.chat_image_loader import _widget_alive
 from src.ui.widgets.context_inspector_dialog import ContextInspectorDialog
 from src.ui.widgets.edit_message_dialog import TextEditDialog
 from src.ui.widgets.memory_dialog import MemoryDialog
+from src.ui.widgets.vn_backdrop import (
+    MODE_CHAT,
+    MODE_STACKED,
+    VNBackdrop,
+    default_index,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +407,15 @@ class _SummarizeWorker(QThread):
                 self.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
+class _ExpressionWorker(_SummarizeWorker):
+    """Classifies one reply's tone into an expression label (non-streaming).
+
+    Same one-shot request shape as the summarizer, so it reuses the run()
+    plumbing; the separate class only documents what the result means (and
+    keeps the Test tab's worker bookkeeping readable).
+    """
+
+
 class _SessionsDialog(QDialog):
     """Popup listing saved chats for a card: Load / Export / Delete / Import.
 
@@ -650,6 +667,17 @@ class TestTab(QWidget):
         # Standalone lorebooks injected alongside the card's character book.
         self._active_lore_names: list[str] = load_active_lorebooks()
         self._extra_books: list[CharacterBook] = []
+        # Visual-novel stage state: the gallery file name of the current
+        # backdrop (persisted per chat), the parallel list of file names for
+        # the loaded images, the keyword strings per loaded image path (for
+        # keyword-driven switching), and the in-flight expression
+        # classification.
+        self._vn_backdrop_file = ''
+        self._vn_files: list[str] = []
+        self._vn_keywords: dict[str, str] = {}
+        self._vn_lightbox: QWidget | None = None
+        self._expr_worker: _ExpressionWorker | None = None
+        self._expr_generation = 0
 
         # Model/Temp/Min-P/Ctx write-through to the saved provider settings so
         # the settings dialog always shows what the Test tab is using.
@@ -704,6 +732,8 @@ class TestTab(QWidget):
         self._example_placement = (
             placement if placement in ('system', 'post_history', 'history') else 'system'
         )
+        view = settings.get('view_mode', 'chat')
+        self._view_mode = view if view in ('chat', 'visual_novel') else 'chat'
 
     def reload_preset(self) -> None:
         """Reload API preset + macros + test settings (after settings change)."""
@@ -718,6 +748,7 @@ class TestTab(QWidget):
             self._preset.temperature, self._preset.min_p, self._preset.context_size,
         )
         self._refresh_min_p_tooltip()
+        self._apply_view_mode()
         self._render_history()
 
     def _refresh_min_p_tooltip(self) -> None:
@@ -946,6 +977,24 @@ class TestTab(QWidget):
         self._header.setStyleSheet('font-weight: bold; color: #e0e0e0;')
         header_row.addWidget(self._header)
         header_row.addStretch()
+        # Quick switch mirror of Settings -> Test -> View Mode: swapping the
+        # presentation is a one-click affair from the tab itself.
+        view_label = QLabel('View')
+        view_label.setStyleSheet('color: #777;')
+        header_row.addWidget(view_label)
+        self._view_combo = QComboBox()
+        self._view_combo.addItem('Chat', 'chat')
+        self._view_combo.addItem('Visual Novel', 'visual_novel')
+        self._view_combo.setToolTip('How the Test tab presents the conversation.')
+        self._view_combo.currentIndexChanged.connect(self._on_view_mode_changed)
+        header_row.addWidget(self._view_combo)
+        self._vn_btn = QPushButton('VN')
+        self._vn_btn.setToolTip(
+            'Per-character visual-novel settings: pinned backdrop image and '
+            'overrides of the global VN options.'
+        )
+        self._vn_btn.clicked.connect(self._on_vn_settings)
+        header_row.addWidget(self._vn_btn)
         right_layout.addLayout(header_row)
 
         self._chat_scroll = QScrollArea()
@@ -957,7 +1006,14 @@ class TestTab(QWidget):
         self._bubble_layout.setSpacing(8)
         self._bubble_layout.addStretch()
         self._chat_scroll.setWidget(self._bubble_container)
-        right_layout.addWidget(self._chat_scroll, 1)
+        # The stage hosts the chat scroll: in Visual Novel mode it shrinks the
+        # chat to a textbox and puts a gallery backdrop behind/above it; in
+        # chat mode the stage just fills the same space the scroll used to.
+        self._vn_backdrop = VNBackdrop()
+        self._vn_backdrop.set_chat_widget(self._chat_scroll)
+        self._vn_backdrop.image_clicked.connect(self._on_backdrop_clicked)
+        self._vn_backdrop.index_changed.connect(self._on_backdrop_index)
+        right_layout.addWidget(self._vn_backdrop, 1)
 
         # Stick-to-bottom: follow new messages only while the viewport is
         # already at the bottom edge; scrolling up pauses the following.
@@ -1107,8 +1163,9 @@ class TestTab(QWidget):
             self._new_session_btn, self._sessions_btn, self._memory_btn,
             self._context_btn, self._auto_summarize_btn,
             self._impersonate_btn, self._continue_btn,
-            self._lore_btn,
+            self._lore_btn, self._vn_btn,
         ]
+        self._apply_view_mode()
 
     def _set_inputs_enabled(self, enabled: bool) -> None:
         for w in self._input_widgets:
@@ -1116,6 +1173,239 @@ class TestTab(QWidget):
 
     def _is_generating(self) -> bool:
         return self._generating
+
+    # ---- visual novel stage ----
+
+    def _vn_effective(self) -> dict:
+        """Global test settings with the current character's overrides.
+
+        The global half is read fresh on every call: the settings dialog and
+        the quick-switch combo both write through ``save_test_settings``, and
+        a cached copy here would keep showing the old presentation.
+        """
+        overrides = self.db.get_card_settings(self._current_id) if self._current_id else None
+        return merge_vn_overrides(load_test_settings(), overrides)
+
+    def _apply_view_mode(self) -> None:
+        """Re-layout the stage for the active view mode and VN settings."""
+        if getattr(self, '_vn_backdrop', None) is None:
+            return
+        eff = self._vn_effective()
+        if self._view_mode == 'visual_novel':
+            mode = MODE_STACKED
+        else:
+            mode = MODE_CHAT
+        self._vn_backdrop.set_mode(mode, int(eff.get('vn_chat_height_pct') or 30))
+        self._vn_backdrop.set_chat_opacity(int(eff.get('vn_overlay_opacity') or 60))
+        self._vn_backdrop.set_fit_mode(str(eff.get('vn_image_fit') or 'contain'))
+        self._vn_backdrop.set_show_caption(bool(eff.get('vn_show_caption', True)))
+        self._vn_backdrop.set_sprite_style(
+            str(eff.get('vn_sprite_position') or 'center'),
+            int(eff.get('vn_sprite_height_pct') or 75),
+        )
+        # Keep the quick-switch combo in sync without re-entering the handler.
+        combo = getattr(self, '_view_combo', None)
+        if combo is not None:
+            combo.blockSignals(True)
+            idx = combo.findData(self._view_mode)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+        self._vn_refresh_backdrop()
+
+    def _on_view_mode_changed(self) -> None:
+        combo = getattr(self, '_view_combo', None)
+        if combo is None:
+            return
+        view = combo.currentData()
+        if view not in ('chat', 'visual_novel'):
+            return
+        self._view_mode = view
+        # Write-through so Settings -> Test shows what the tab is doing
+        # (same pattern as the sampling overrides row).
+        settings = load_test_settings()
+        settings['view_mode'] = view
+        save_test_settings(settings)
+        self._apply_view_mode()
+
+    def _vn_refresh_backdrop(self) -> None:
+        """Rebuild the backdrop image list and restore the current image."""
+        if getattr(self, '_vn_backdrop', None) is None:
+            return
+        from src import gallery_store
+        self._vn_backdrop.set_placeholder(self._card.name if self._card else '')
+        self._vn_keywords = {}
+        if self._current_id is None:
+            self._vn_files = []
+            self._vn_backdrop.set_images([])
+            return
+        eff = self._vn_effective()
+        pool = str(eff.get('vn_backdrop_pool') or 'both')
+        paths: list[str] = []
+        labels: list[str] = []
+        files: list[str] = []
+        # Comparable "when was this added" keys: (created_at, row id).  The
+        # ids of the two tables are unrelated sequences, so a plain id sort
+        # would mix them up when the pool spans both stores.
+        created: list[tuple[str, int]] = []
+        if pool in ('both', 'global'):
+            for row in self.db.list_backdrop_images():
+                file_name = str(row.get('file_name') or '')
+                path = str(gallery_store.backdrop_image_path(file_name))
+                if not file_name or not Path(path).is_file():
+                    continue
+                paths.append(path)
+                labels.append(str(row.get('caption') or '').strip() or Path(file_name).stem)
+                files.append(file_name)
+                created.append((str(row.get('created_at') or ''), int(row.get('id') or 0)))
+                self._vn_keywords[path] = str(row.get('keywords') or '')
+        if pool in ('both', 'gallery'):
+            for row in self.db.list_gallery_images(self._current_id):
+                file_name = str(row.get('file_name') or '')
+                path = str(gallery_store.gallery_image_path(self._current_id, file_name))
+                if not file_name or not Path(path).is_file():
+                    continue
+                paths.append(path)
+                labels.append(str(row.get('caption') or '').strip() or Path(file_name).stem)
+                files.append(file_name)
+                created.append((str(row.get('created_at') or ''), int(row.get('id') or 0)))
+                self._vn_keywords[path] = str(row.get('keywords') or '')
+        if not paths and eff.get('vn_use_portrait_fallback', True):
+            entry = self.db.get_by_id(self._current_id) or {}
+            thumb = str(entry.get('thumbnail_path') or '')
+            if thumb and Path(thumb).is_file():
+                paths.append(thumb)
+                labels.append('Portrait')
+                files.append('')
+                created.append(('', 0))
+        # A restored chat keeps the image it was left on; keywords only
+        # shape the opening scene when nothing pinned one.
+        had_pin = bool(self._vn_backdrop_file) or bool(str(eff.get('backdrop_file') or ''))
+        self._vn_files = files
+        self._vn_backdrop.set_images(
+            paths, labels, index=self._vn_initial_index(eff, created),
+        )
+        if not had_pin:
+            self._maybe_switch_backdrop(self._last_assistant_text())
+        self._maybe_update_expression(self._last_assistant_text(), allow_llm=False)
+
+    def _vn_initial_index(self, eff: dict, created: list[tuple[str, int]]) -> int:
+        """Pick the backdrop for a freshly loaded chat.
+
+        Priority: the image this chat was left on (per-chat state), then the
+        character's pinned image, then the configured source.  Pins are
+        matched by file name (first hit wins when a shared backdrop and a
+        gallery image share a name).
+        """
+        files = self._vn_files
+        if not files:
+            return -1
+        if self._vn_backdrop_file and self._vn_backdrop_file in files:
+            return files.index(self._vn_backdrop_file)
+        pin = str(eff.get('backdrop_file') or '')
+        if pin and pin in files:
+            return files.index(pin)
+        source = str(eff.get('vn_image_source') or 'first')
+        if source == 'latest' and created and any(c != ('', 0) for c in created):
+            return max(range(len(created)), key=lambda i: created[i])
+        return default_index(source, len(files))
+
+    def _after_assistant_text(self, text: str) -> None:
+        """React to a finished reply: keyword switch, else blind advance.
+
+        A keyword match wins over ``vn_advance_on_reply`` - the user asked
+        for a specific scene, so cycling past it would be wrong.
+        """
+        if self._view_mode != 'visual_novel':
+            return
+        if self._maybe_switch_backdrop(text):
+            return
+        eff = self._vn_effective()
+        if eff.get('vn_advance_on_reply') and getattr(self, '_vn_backdrop', None) is not None:
+            self._vn_backdrop.next_image()
+
+    def _maybe_switch_backdrop(self, text: str) -> bool:
+        """Switch the stage to the image whose keywords match *text*.
+
+        Returns True when a keyword match changed the visible image.  A
+        no-op outside Visual Novel mode or while the feature is off.
+        """
+        if getattr(self, '_vn_backdrop', None) is None:
+            return False
+        if self._view_mode != 'visual_novel':
+            return False
+        eff = self._vn_effective()
+        if not eff.get('vn_backdrop_keywords', False):
+            return False
+        from src.expression_detect import detect_keyword_match, parse_keywords
+        mapping = {
+            path: keywords for path, keywords in self._vn_keywords.items()
+            if parse_keywords(keywords)
+        }
+        if not mapping:
+            return False
+        path = detect_keyword_match(text or '', mapping)
+        if not path:
+            return False
+        paths = self._vn_backdrop.paths()
+        if path not in paths:
+            return False
+        index = paths.index(path)
+        if index == self._vn_backdrop.current_index():
+            return False
+        self._vn_backdrop.show_index(index)
+        return True
+
+    def _on_backdrop_index(self, index: int) -> None:
+        """Track the visible image so the chat remembers its backdrop."""
+        if 0 <= index < len(self._vn_files):
+            self._vn_backdrop_file = self._vn_files[index]
+        else:
+            self._vn_backdrop_file = ''
+
+    def _on_backdrop_clicked(self) -> None:
+        """Open the gallery lightbox on the current backdrop."""
+        paths = self._vn_backdrop.paths()
+        if not paths:
+            return
+        from src.ui.widgets.image_viewer import GalleryLightbox
+
+        def _sync(i: int) -> None:
+            if _widget_alive(self._vn_backdrop):
+                self._vn_backdrop.show_index(i)
+
+        # Keep a strong reference: the dialog is shown mode-less (so the chat
+        # stays usable) and a garbage-collected dialog is a dead C++ object.
+        self._vn_lightbox = GalleryLightbox(
+            paths,
+            start_index=self._vn_backdrop.current_index(),
+            title=self._card.name if self._card else 'Gallery',
+            on_index_changed=_sync,
+            parent=self,
+        )
+        self._vn_lightbox.show()
+
+    def _on_vn_settings(self) -> None:
+        """Open the per-character visual-novel settings dialog."""
+        if self._current_id is None:
+            return
+        from src.ui.widgets.vn_settings_dialog import VNSettingsDialog
+        entry = self.db.get_by_id(self._current_id) or {}
+        rows = self.db.list_gallery_images(self._current_id)
+        dlg = VNSettingsDialog(
+            str(entry.get('name') or ''),
+            rows,
+            self.db.get_card_settings(self._current_id),
+            parent=self,
+            backdrop_rows=self.db.list_backdrop_images(),
+        )
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        values = dlg.values() if accepted else None
+        dlg.deleteLater()
+        if not accepted:
+            return
+        self.db.set_card_settings(self._current_id, values or {})
+        self._apply_view_mode()
+        self.status_message.emit('VN settings saved.', 3000)
 
     # ---- card list ----
 
@@ -1192,12 +1482,16 @@ class TestTab(QWidget):
         self._jailbreak = data.get('jailbreak') or ''
         self._persona_id = load_active_persona_id()
         self._persona = get_persona(self._persona_id).get('text', '')
+        # The chat remembers which gallery image it was left on; restoring it
+        # before the backdrop rebuild lets _vn_initial_index pick it up.
+        self._vn_backdrop_file = str(data.get('vn_backdrop') or '')
         self._sync_auto_toggle()
         self._update_memory_button()
         self._refresh_memory_dialog()
         self._update_prompt_buttons()
         self._at_bottom = True
         self._render_history()
+        self._vn_refresh_backdrop()
 
     def _start_new_session(self) -> None:
         self._session_id = ChatSessionStore.new_session_id()
@@ -1212,6 +1506,7 @@ class TestTab(QWidget):
         self._jailbreak = ''
         self._persona_id = load_active_persona_id()
         self._persona = get_persona(self._persona_id).get('text', '')
+        self._vn_backdrop_file = ''
         self._sync_auto_toggle()
         self._update_memory_button()
         self._update_prompt_buttons()
@@ -1221,6 +1516,7 @@ class TestTab(QWidget):
                 )
         self._at_bottom = True
         self._render_history()
+        self._vn_refresh_backdrop()
 
     def _update_prompt_buttons(self) -> None:
         """Reflect note/jailbreak state on their toolbar button."""
@@ -1861,6 +2157,8 @@ class TestTab(QWidget):
             self._finish_generation()
             self._append_continuation(response)
             self._save_current_session()
+            self._maybe_update_expression(self._last_assistant_text())
+            self._after_assistant_text(self._last_assistant_text())
             return
         role = 'user' if mode == 'user' else 'assistant'
         self._messages = append_message(
@@ -1881,6 +2179,10 @@ class TestTab(QWidget):
         self._append_message_tail()
         self._finish_generation()
         self._save_current_session()
+        if role == 'assistant':
+            text = str(self._messages[-1].get('content') or '')
+            self._maybe_update_expression(text)
+            self._after_assistant_text(text)
         if role == 'assistant' and self._auto_summarize:
             self._start_summarize(self._last_exchange_text(), source='auto')
         if role == 'assistant' and self._auto_update_attributes and self._attributes:
@@ -2032,6 +2334,7 @@ class TestTab(QWidget):
             self._set_message_content(msg, new_text)
             self._render_history()
             self._save_current_session()
+            self._maybe_update_expression(self._last_assistant_text(), allow_llm=False)
 
     def _on_delete_message(self, index: int) -> None:
         if index < 0 or index >= len(self._messages) or self._is_generating():
@@ -2161,6 +2464,7 @@ class TestTab(QWidget):
         msg['content'] = variants[new_pos]
         self._render_history()
         self._save_current_session()
+        self._maybe_update_expression(self._last_assistant_text(), allow_llm=False)
 
     # ---- chat image context menu ----
 
@@ -2220,6 +2524,7 @@ class TestTab(QWidget):
             return
         self.status_message.emit('Image added to the gallery.', 4000)
         self.gallery_changed.emit()
+        self._vn_refresh_backdrop()
 
     def _on_save_image_as(self, data: bytes, name: str) -> None:
         if not data:
@@ -2547,6 +2852,110 @@ class TestTab(QWidget):
             parts.append(f"{self._card.name if self._card else 'Assistant'}: {assistant_text}")
         return '\n'.join(parts)
 
+    # ---- expression sprites ----
+
+    def _expression_dir(self):
+        """The character's SillyTavern expression folder (``None`` when none)."""
+        if self._current_id is None:
+            return None
+        from src import gallery_store
+        entry = self.db.get_by_id(self._current_id) or {}
+        user_images = gallery_store.configured_user_images_dir()
+        if user_images is None:
+            return None
+        stem = gallery_store.expression_stem_for(
+            entry.get('st_avatar_url'), str(entry.get('name') or ''),
+        )
+        return gallery_store.expression_images_dir(user_images, stem)
+
+    def _last_assistant_text(self) -> str:
+        for msg in reversed(self._messages):
+            if msg.get('role') == 'assistant':
+                return str(msg.get('content') or '')
+        return ''
+
+    def _maybe_update_expression(self, text: str, allow_llm: bool = True) -> None:
+        """Pick the expression sprite that matches *text*'s tone.
+
+        Only the Visual Novel view has a sprite at all, so other modes are a
+        no-op.  *allow_llm* is False on quiet re-detections (chat load,
+        edits) so browsing history never costs an extra request.
+        """
+        if getattr(self, '_vn_backdrop', None) is None:
+            return
+        self._expr_generation += 1
+        if self._view_mode != 'visual_novel':
+            self._vn_backdrop.set_sprite(None)
+            return
+        eff = self._vn_effective()
+        if not eff.get('vn_expression_auto', True):
+            self._vn_backdrop.set_sprite(None)
+            return
+        exp_dir = self._expression_dir()
+        if exp_dir is None:
+            return
+        from src import gallery_store
+        available = gallery_store.list_expression_images(exp_dir)
+        if not available:
+            self._vn_backdrop.set_sprite(None)
+            return
+        if allow_llm and eff.get('vn_expression_llm', False):
+            self._classify_expression_llm(text, available)
+            return
+        from src.expression_detect import detect_expression
+        self._apply_expression(detect_expression(text, available.keys()), available)
+
+    def _apply_expression(self, name: str, available: dict) -> None:
+        """Show the sprite for *name* (or hide it when there is no image)."""
+        path = available.get(str(name or '').lower())
+        if getattr(self, '_vn_backdrop', None) is not None:
+            self._vn_backdrop.set_sprite(str(path) if path else None)
+
+    def _classify_expression_llm(self, text: str, available: dict) -> None:
+        """Ask the model for the tone label; falls back to keywords."""
+        if self._expr_worker is not None:
+            # One classification at a time: the newest reply always wins, so
+            # a queued request is superseded rather than chained.
+            self._expr_generation += 1
+            return
+        from src.ai_prompts import build_expression_classify_prompts
+        labels = sorted(available)
+        system, user = build_expression_classify_prompts(labels, text)
+        self._expr_available = dict(available)
+        self._expr_text = text
+        client = AIClient(self._effective_preset())
+        self._expr_worker = _ExpressionWorker(client, system, user, self)
+        self._expr_worker.completed.connect(self._on_expression_result)
+        self._expr_worker.error.connect(self._on_expression_error)
+        self._expr_worker.finished.connect(self._expr_worker.deleteLater)
+        self._expr_worker.start()
+
+    @pyqtSlot(str)
+    def _on_expression_result(self, result: str) -> None:
+        worker = self._expr_worker
+        self._expr_worker = None
+        self._retire_worker(worker)
+        available = getattr(self, '_expr_available', {}) or {}
+        self._apply_or_fallback(result, available)
+
+    def _apply_or_fallback(self, result: str, available: dict) -> None:
+        from src.expression_detect import detect_expression, match_expression_label
+        name = match_expression_label(result, available.keys())
+        if not name:
+            # The model named something we have no image for (or output
+            # prose): keywords are the reliable safety net.
+            name = detect_expression(getattr(self, '_expr_text', ''), available.keys())
+        self._apply_expression(name, available)
+
+    @pyqtSlot(str)
+    def _on_expression_error(self, error: str) -> None:
+        worker = self._expr_worker
+        self._expr_worker = None
+        self._retire_worker(worker)
+        logger.debug("Expression classification failed: %s", error)
+        available = getattr(self, '_expr_available', {}) or {}
+        self._apply_or_fallback('', available)
+
     def _start_summarize(
         self,
         text: str,
@@ -2855,12 +3264,15 @@ class TestTab(QWidget):
             author_note=self._author_note,
             jailbreak=self._jailbreak,
             persona_id=self._persona_id,
+            vn_backdrop=self._vn_backdrop_file or '',
         )
 
     def refresh_font_size(self) -> None:
         """Re-apply the app font size to the chat bubbles and token counter."""
         self._font_size = load_font_size()
         self._apply_font_sizes()
+        if getattr(self, '_vn_backdrop', None) is not None:
+            self._vn_backdrop.refresh_font_size()
         self._render_history()
 
     def _apply_font_sizes(self) -> None:
@@ -2898,7 +3310,7 @@ class TestTab(QWidget):
                     return False
             except RuntimeError:
                 pass
-        for worker in (self._summarize_worker, self._attr_worker):
+        for worker in (self._summarize_worker, self._attr_worker, self._expr_worker):
             if not self._worker_is_alive(worker):
                 continue
             try:
@@ -2917,6 +3329,15 @@ class TestTab(QWidget):
                     return False
             except RuntimeError:
                 pass
+        # Backdrop/sprite decodes are cheap but unbounded on fast nav: drop
+        # whatever is still queued, then drain the pool so no decode is still
+        # inside run() at shutdown - exiting under a live pool thread aborts
+        # the process (0xC0000409) because the runnable holds Python state.
+        from src.ui.widgets.async_image import cancel_pending_image_loads
+        cancel_pending_image_loads('vn_backdrop')
+        from PyQt6.QtCore import QThreadPool
+        remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
+        QThreadPool.globalInstance().waitForDone(remaining_ms)
         return True
 
     def _wait_worker(self, worker: QThread, deadline: float) -> bool:
