@@ -115,9 +115,9 @@ def default_index(source: str, count: int, rng: random.Random | None = None) -> 
 
 
 try:
-    from PyQt6.QtCore import QRect, Qt, pyqtSignal
-    from PyQt6.QtGui import QColor, QFont, QPainter, QPixmap
-    from PyQt6.QtWidgets import QLabel, QPushButton, QWidget
+    from PyQt6.QtCore import QPoint, QRect, Qt, pyqtSignal
+    from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
+    from PyQt6.QtWidgets import QLabel, QWidget
 except ImportError:
     QWidget = None  # type: ignore[misc,assignment]
 
@@ -130,19 +130,43 @@ if QWidget is not None:
         A custom painter instead of ``QLabel.setScaledContents`` because the
         fit modes need aspect-ratio-aware placement (and clipping for
         ``cover``), which a label cannot express.
+
+        In Visual Novel mode the label also paints the prev/next chevron
+        chips and owns their hit zones.  They are drawn as vector graphics
+        in the very same paint pass as the image - no child widgets, no
+        style sheets, no font glyphs - so they appear exactly when and
+        where the image appears and cannot be hidden by stacking, styling,
+        or missing-glyph problems.
         """
 
         clicked = pyqtSignal()
+        nav_prev_requested = pyqtSignal()
+        nav_next_requested = pyqtSignal()
+
+        #: Chip size (px) and gap between the drawn image edge and the chip.
+        CHIP_W = 44
+        CHIP_H = 56
+        NAV_INSET = 10
+        #: Minimum drawn-image size before the chips hug it instead of the
+        #: whole section (very narrow letterboxed images would overlap).
+        MIN_ANCHOR_W = 140
+        MIN_ANCHOR_H = 90
 
         def __init__(self, parent: QWidget | None = None):
             super().__init__(parent)
             self._pixmap: QPixmap | None = None
             self._placeholder = ''
             self._fit_mode = FIT_CONTAIN
+            self._nav_enabled = False
+            self._nav_hover = 0  # 0 none, -1 prev chip, 1 next chip
+            self.setMouseTracking(True)
 
         def set_pixmap(self, pixmap: QPixmap | None) -> None:
             self._pixmap = pixmap
             self.update()
+
+        def pixmap(self) -> QPixmap | None:
+            return self._pixmap
 
         def set_placeholder(self, text: str) -> None:
             self._placeholder = text or ''
@@ -152,20 +176,114 @@ if QWidget is not None:
             self._fit_mode = mode if mode in FIT_MODES else FIT_CONTAIN
             self.update()
 
+        def set_nav_enabled(self, enabled: bool) -> None:
+            """Show/hide the prev/next chevron chips."""
+            enabled = bool(enabled)
+            if enabled != self._nav_enabled:
+                self._nav_enabled = enabled
+                if not enabled:
+                    self._nav_hover = 0
+                self._update_nav_cursor(self._mouse_pos())
+                self.update()
+
+        # ---- navigation chrome ----
+
+        def drawn_image_rect(self) -> QRect:
+            """Rect (label-local) the pixmap occupies with the fit mode.
+
+            Falls back to the full label while no pixmap is loaded.
+            """
+            if self._pixmap is None or self._pixmap.isNull():
+                return QRect(0, 0, self.width(), self.height())
+            x, y, w, h = fit_rect(
+                self._pixmap.width(), self._pixmap.height(),
+                self.width(), self.height(), self._fit_mode,
+            )
+            return QRect(x, y, w, h)
+
+        def _nav_anchor(self) -> QRect:
+            """Rect the chips hug: the drawn image when it is large enough,
+            otherwise the whole label."""
+            anchor = self.drawn_image_rect()
+            if anchor.width() < self.MIN_ANCHOR_W or anchor.height() < self.MIN_ANCHOR_H:
+                return QRect(0, 0, self.width(), self.height())
+            return anchor
+
+        def nav_chip_rect(self, side: int) -> QRect:
+            """Chip rect for *side*: -1 (prev) or 1 (next)."""
+            anchor = self._nav_anchor()
+            y = anchor.y() + max(8, (anchor.height() - self.CHIP_H) // 2)
+            if side < 0:
+                x = anchor.x() + self.NAV_INSET
+            else:
+                x = anchor.x() + anchor.width() - self.NAV_INSET - self.CHIP_W
+            return QRect(x, y, self.CHIP_W, self.CHIP_H)
+
+        def _nav_hit_test(self, pos: QPoint) -> int:
+            """-1 / 1 when *pos* is on a chip (with a small mercy margin)."""
+            if not self._nav_enabled:
+                return 0
+            for side in (-1, 1):
+                zone = self.nav_chip_rect(side).adjusted(-6, -6, 6, 6)
+                if zone.contains(pos):
+                    return side
+            return 0
+
+        def _mouse_pos(self):
+            """Current cursor position in label coordinates (best effort)."""
+            try:
+                from PyQt6.QtGui import QCursor
+                return self.mapFromGlobal(QCursor.pos())
+            except Exception:
+                return None
+
+        def _update_nav_cursor(self, pos) -> None:
+            on_chip = pos is not None and self._nav_hit_test(pos) != 0
+            self.setCursor(
+                Qt.CursorShape.PointingHandCursor
+                if on_chip else Qt.CursorShape.ArrowCursor,
+            )
+
+        # ---- input ----
+
         def mousePressEvent(self, event) -> None:
             if event.button() == Qt.MouseButton.LeftButton:
+                hit = self._nav_hit_test(event.position().toPoint())
+                if hit < 0:
+                    self.nav_prev_requested.emit()
+                    event.accept()
+                    return
+                if hit > 0:
+                    self.nav_next_requested.emit()
+                    event.accept()
+                    return
                 self.clicked.emit()
             super().mousePressEvent(event)
+
+        def mouseMoveEvent(self, event) -> None:
+            pos = event.position().toPoint()
+            hit = self._nav_hit_test(pos)
+            self._update_nav_cursor(pos)
+            if hit != self._nav_hover:
+                self._nav_hover = hit
+                self.update()
+            super().mouseMoveEvent(event)
+
+        def leaveEvent(self, event) -> None:
+            self._update_nav_cursor(None)
+            if self._nav_hover:
+                self._nav_hover = 0
+                self.update()
+            super().leaveEvent(event)
+
+        # ---- painting ----
 
         def paintEvent(self, event) -> None:
             painter = QPainter(self)
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             if self._pixmap is not None and not self._pixmap.isNull():
-                x, y, w, h = fit_rect(
-                    self._pixmap.width(), self._pixmap.height(),
-                    self.width(), self.height(), self._fit_mode,
-                )
-                painter.drawPixmap(QRect(x, y, w, h), self._pixmap)
+                drawn = self.drawn_image_rect()
+                painter.drawPixmap(drawn, self._pixmap)
             elif self._placeholder:
                 painter.setPen(QColor(128, 128, 128, 200))
                 font = QFont(self.font())
@@ -174,7 +292,35 @@ if QWidget is not None:
                 painter.drawText(
                     self.rect(), int(Qt.AlignmentFlag.AlignCenter), self._placeholder,
                 )
+            if self._nav_enabled:
+                self._draw_nav_chrome(painter)
             painter.end()
+
+        def _draw_nav_chrome(self, painter) -> None:
+            """Chip + chevron for each side, drawn as pure vector graphics."""
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            for side in (-1, 1):
+                chip = self.nav_chip_rect(side)
+                hover = self._nav_hover == side
+                painter.setPen(QPen(QColor(255, 255, 255, 100), 1))
+                painter.setBrush(QColor(0, 0, 0, 215 if hover else 150))
+                painter.drawRoundedRect(chip, 10, 10)
+                center = chip.center()
+                lean = 5.0   # horizontal run of each chevron half
+                arm = 10.0   # vertical half-height of the chevron
+                path = QPainterPath()
+                if side < 0:  # '<' - vertex on the left
+                    path.moveTo(center.x() + lean, center.y() - arm)
+                    path.lineTo(center.x() - lean, center.y())
+                    path.lineTo(center.x() + lean, center.y() + arm)
+                else:         # '>' - vertex on the right
+                    path.moveTo(center.x() - lean, center.y() - arm)
+                    path.lineTo(center.x() + lean, center.y())
+                    path.lineTo(center.x() - lean, center.y() + arm)
+                pen = QPen(QColor('#ffffff'), 3.0)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.strokePath(path, pen)
 
     class _SpriteLabel(QWidget):
         """Expression sprite: aspect-preserving, bottom-aligned by its rect."""
@@ -217,7 +363,7 @@ if QWidget is not None:
 
         #: The backdrop was clicked (open the lightbox).
         image_clicked = pyqtSignal()
-        #: The visible image changed (nav buttons or ``show_index``).
+        #: The visible image changed (chevron chips or ``show_index``).
         index_changed = pyqtSignal(int)
 
         def __init__(self, parent: QWidget | None = None):
@@ -252,8 +398,6 @@ if QWidget is not None:
                 'background-color: rgba(0, 0, 0, 120); color: #e0e0e0;'
                 'padding: 3px 8px; border-radius: 4px;'
             )
-            self._prev_btn = self._nav_button('\u25c0', self._prev_clicked)
-            self._next_btn = self._nav_button('\u25b6', self._next_clicked)
             # The divider marks the boundary between the image section and
             # the chat section in the stacked VN layout.
             self._divider = QWidget(self)
@@ -262,26 +406,14 @@ if QWidget is not None:
             self._divider.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             self._divider.setVisible(False)
             self._image_label.clicked.connect(self.image_clicked.emit)
+            # The prev/next chevrons are painted by the label itself (same
+            # paint pass as the image, so they can never be stacked away);
+            # the label only reports which chip was pressed.
+            self._image_label.nav_prev_requested.connect(self._prev_clicked)
+            self._image_label.nav_next_requested.connect(self._next_clicked)
             self._apply_chrome_font()
 
         # ---- setup ----
-
-        def _nav_button(self, text: str, slot) -> QPushButton:
-            # Must be parented to the stage: an unparented button becomes a
-            # top-level window of its own (a tiny floating window that
-            # _relayout would move/raise in screen coordinates) instead of
-            # chrome sitting on the image.
-            btn = QPushButton(text, self)
-            btn.setFixedSize(28, 48)
-            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            btn.setStyleSheet(
-                'QPushButton { background-color: rgba(0, 0, 0, 110);'
-                ' color: #e0e0e0; border: 1px solid rgba(255, 255, 255, 40);'
-                ' border-radius: 4px; font-size: 12px; }'
-                'QPushButton:hover { background-color: rgba(0, 0, 0, 170); }'
-            )
-            btn.clicked.connect(slot)
-            return btn
 
         def set_chat_widget(self, widget: QWidget | None) -> None:
             """Embed the chat area and start positioning it with the stage."""
@@ -460,6 +592,9 @@ if QWidget is not None:
             cached = cache.get(key)
             if cached is not None:
                 apply(cached)
+                # The drawn image rect may change with the new pixmap, so
+                # the chrome (arrows/caption) needs a fresh layout.
+                self._relayout()
                 return
 
             def on_loaded(qimage, _path, _px, context) -> None:
@@ -475,6 +610,7 @@ if QWidget is not None:
                 while len(cache) > 12:
                     cache.pop(next(iter(cache)), None)
                 apply(pixmap)
+                self._relayout()
 
             loader = AsyncImageLoader(path, target_px, context=generation,
                                       owner='vn_backdrop')
@@ -495,8 +631,10 @@ if QWidget is not None:
 
         def _update_chrome(self) -> None:
             count = len(self._paths)
-            self._prev_btn.setVisible(self._mode != MODE_CHAT and count > 1)
-            self._next_btn.setVisible(self._mode != MODE_CHAT and count > 1)
+            # The chevrons live inside the image label's own paint pass;
+            # enabling them there cannot lose a race with stacking, styling,
+            # or fonts.
+            self._image_label.set_nav_enabled(self._mode != MODE_CHAT and count > 1)
             show_caption = self._mode != MODE_CHAT and self._show_caption and count > 0
             self._caption.setVisible(show_caption)
             if show_caption and 0 <= self._index < count:
@@ -530,6 +668,20 @@ if QWidget is not None:
                 return QRect(0, 0, w, max(0, h - self._chat_height() - DIVIDER_H))
             return QRect(0, 0, w, h)
 
+        def _drawn_rect(self, image_rect: QRect) -> QRect:
+            """The rect the pixmap actually occupies inside *image_rect*.
+
+            With ``contain`` a non-matching aspect ratio letterboxes, so the
+            caption must hug the drawn image rather than the stage's outer
+            edges.  The label computes the same rect for its chevrons.
+            """
+            drawn = self._image_label.drawn_image_rect()
+            return QRect(
+                image_rect.x() + drawn.x(),
+                image_rect.y() + drawn.y(),
+                drawn.width(), drawn.height(),
+            )
+
         def _relayout(self) -> None:
             if not self._widget_alive():
                 return
@@ -550,15 +702,8 @@ if QWidget is not None:
             )
             self._sprite_label.raise_()
 
-            btn_y = image_rect.y() + max(8, (image_rect.height() - self._prev_btn.height()) // 2)
-            self._prev_btn.move(image_rect.x() + 8, btn_y)
-            self._next_btn.move(
-                image_rect.x() + image_rect.width() - self._next_btn.width() - 8, btn_y,
-            )
-            self._prev_btn.raise_()
-            self._next_btn.raise_()
-
-            self._caption.move(image_rect.x() + 10, image_rect.y() + 8)
+            caption_rect = self._drawn_rect(image_rect)
+            self._caption.move(caption_rect.x() + 10, caption_rect.y() + 8)
             self._caption.raise_()
 
             if self._mode == MODE_STACKED:
