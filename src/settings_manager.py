@@ -997,6 +997,48 @@ def load_spellcheck_enabled() -> bool:
     return _get_settings().value('ui/spellcheck_enabled', True, type=bool)
 
 
+def save_logging_enabled(enabled: bool) -> None:
+    """Persist whether the app writes the app.log file."""
+    _get_settings().setValue('logging/enabled', bool(enabled))
+
+
+def load_logging_enabled() -> bool:
+    """Return whether the app log (app.log) is written (on by default)."""
+    # ``type=bool`` for the same "true"/"false" string reason as above.
+    return _get_settings().value('logging/enabled', True, type=bool)
+
+
+def app_log_path() -> Path:
+    """The location of the app log file."""
+    from src.app_paths import data_dir
+
+    return data_dir() / 'app.log'
+
+
+def apply_logging_enabled(enabled: bool) -> None:
+    """Add or remove the app.log FileHandler on the root logger.
+
+    Called with the stored value at startup and again whenever the setting
+    changes, so the checkbox takes effect without a restart.
+    """
+    log_path = app_log_path()
+    root = logging.getLogger()
+    fmt = '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+    for handler in list(root.handlers):
+        filename = getattr(handler, 'baseFilename', None)
+        if filename and Path(filename) == log_path:
+            root.removeHandler(handler)
+            handler.close()
+    if enabled:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(log_path, encoding='utf-8')
+            handler.setFormatter(logging.Formatter(fmt))
+            root.addHandler(handler)
+        except OSError:
+            logger.warning("Could not open the app log for writing", exc_info=True)
+
+
 def save_library_selected_ids(ids: list[int]) -> None:
     s = _get_settings()
     s.setValue('ui/library_selected_ids', ids)
