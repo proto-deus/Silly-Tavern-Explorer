@@ -623,13 +623,26 @@ QFrame[frameShape="4"] {
 
 /* --- Library filter chips and dividers -------------------------------- */
 
-QLabel#filterChip, QCheckBox#filterChip {
+/* The clickable chips (Full text, Fuzzy, Favorites only) dress like the
+   push buttons they sit next to.  The non-clickable row labels (Sort:,
+   Collection:, ...) get the dropdown look instead, so a label can no
+   longer be mistaken for a button that does something. */
+QCheckBox#filterChip {
     background-color: $hover;
     border: 1px solid $muted;
     border-radius: 4px;
     /* Vertical padding stays small: the chip's height is fixed to the
        push-button height at runtime, and the checkbox indicator needs the
        leftover room not to clip. */
+    padding: 2px 10px;
+    color: $fg;
+    font-weight: bold;
+}
+
+QLabel#filterChip {
+    background-color: $panel;
+    border: 1px solid $border_strong;
+    border-radius: 4px;
     padding: 2px 10px;
     color: $fg;
     font-weight: bold;

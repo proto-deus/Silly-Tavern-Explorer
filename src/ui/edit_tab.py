@@ -402,18 +402,18 @@ class EditTab(QWidget):
         self._sections.append(self._notes_section)
 
         # Private user notes: DB-only metadata, never written to the PNG.
+        # They are persisted by the card's Save button (save() also writes
+        # them), so no separate save control is needed here.
         user_notes_container = QWidget()
         user_notes_v = QVBoxLayout(user_notes_container)
         user_notes_v.setContentsMargins(0, 0, 0, 0)
         self._user_notes_edit = SpellCheckTextEdit()
         self._user_notes_edit.setMaximumHeight(120)
         self._user_notes_edit.setPlaceholderText(
-            'Private notes — stored locally, never written to the card file'
+            'Private notes — stored locally, never written to the card '
+            'file. Saved together with the card (Save).'
         )
         user_notes_v.addWidget(self._user_notes_edit)
-        save_notes_btn = QPushButton('Save Notes')
-        save_notes_btn.clicked.connect(self._save_user_notes)
-        user_notes_v.addWidget(save_notes_btn)
         self._user_notes_section = CollapsibleSection('My Notes:', user_notes_container)
         form_layout.addWidget(self._user_notes_section)
         self._sections.append(self._user_notes_section)
@@ -461,25 +461,25 @@ class EditTab(QWidget):
         form_layout.addWidget(self._alt_greeting_section)
         self._sections.append(self._alt_greeting_section)
 
-        self._char_book_btn = QPushButton('Character Book...')
-        self._char_book_btn.setEnabled(False)
-        self._char_book_btn.clicked.connect(self._edit_character_book)
-        form_layout.addWidget(self._char_book_btn)
-
         row = QHBoxLayout()
         row.addWidget(self._make_label('Creator:'))
         self._creator_edit = QLineEdit()
         row.addWidget(self._creator_edit)
-        row.addWidget(self._make_label('Version:'))
-        self._version_edit = QLineEdit()
-        self._version_edit.setMaximumWidth(100)
-        row.addWidget(self._version_edit)
+        # The Character Book button sits between the creator name field and
+        # the Extensions button (it used to occupy a full-width line of its
+        # own above the row).
+        self._char_book_btn = QPushButton('Character Book...')
+        self._char_book_btn.setEnabled(False)
+        self._char_book_btn.clicked.connect(self._edit_character_book)
+        row.addWidget(self._char_book_btn)
         self._extensions_btn = QPushButton('Extensions...')
         self._extensions_btn.setEnabled(False)
         self._extensions_btn.clicked.connect(self._edit_extensions)
         row.addWidget(self._extensions_btn)
         form_layout.addLayout(row)
 
+        # The version field shares the talkativeness line (it used to ride
+        # with the creator row).
         row2 = QHBoxLayout()
         row2.addWidget(self._make_label('Talkativeness:'))
         self._talk_spin = QDoubleSpinBox()
@@ -487,6 +487,10 @@ class EditTab(QWidget):
         self._talk_spin.setSingleStep(0.1)
         self._talk_spin.setValue(0.5)
         row2.addWidget(self._talk_spin)
+        row2.addWidget(self._make_label('Version:'))
+        self._version_edit = QLineEdit()
+        self._version_edit.setMaximumWidth(100)
+        row2.addWidget(self._version_edit)
         row2.addStretch()
         form_layout.addLayout(row2)
 
@@ -1204,22 +1208,6 @@ class EditTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, 'Error', f"Failed to change image: {e}")
 
-    def _save_user_notes(self) -> None:
-        """Persist the private user notes for the currently selected card."""
-        if self._current_id is None:
-            return
-        if self._form_loaded_for_id != self._current_id:
-            # The notes field belongs to a different card than the current
-            # selection; writing would attach them to the wrong card.
-            return
-        try:
-            self.db.set_user_notes(self._current_id, self._user_notes_edit.toPlainText())
-        except Exception as e:
-            logger.exception("Failed to save user notes for card %s", self._current_id)
-            QMessageBox.critical(self, 'Error', f"Failed to save notes: {e}")
-            return
-        self.status_message.emit('Notes saved', 2000)
-
     def save(self) -> bool:
         """Save the current card. Returns True on success."""
         if self._current_id is None:
@@ -1239,9 +1227,9 @@ class EditTab(QWidget):
         try:
             self.db.update_card(self._current_id, card, rename_file_on_name_change=True)
             # The notes field marks the form dirty and the reload below
-            # restores it from the DB, so it must be persisted here too -
-            # otherwise typing notes and pressing Ctrl+S silently discarded
-            # them (the separate "Save Notes" button was the only writer).
+            # restores it from the DB, so it must be persisted here - this
+            # is the only writer since the separate "Save Notes" button
+            # was removed.
             self.db.set_user_notes(
                 self._current_id, self._user_notes_edit.toPlainText(),
             )

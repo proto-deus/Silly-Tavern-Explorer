@@ -950,7 +950,7 @@ class MainWindow(QMainWindow):
 
     def _on_view_font_size(self) -> None:
         from src.ui.dialog_helper import exec_dialog_with
-        from src.ui.styles import apply_theme, available_themes
+        from src.ui.styles import available_themes
 
         dlg = QDialog(self)
         dlg.setWindowTitle('Font Size & Theme')
@@ -991,19 +991,28 @@ class MainWindow(QMainWindow):
             size, theme = result
             save_font_size(size)
             save_theme(theme)
-            apply_theme(QApplication.instance(), size, theme)
-            # Every tab that bakes a pixel size into a widget stylesheet has
-            # to be told about the new size.
-            for tab in (
-                self._test_tab, self._library_tab, self._gallery_tab,
-                self._edit_tab, self._ai_tab, self._lorebooks_tab,
-            ):
-                refresh = getattr(tab, 'refresh_font_size', None)
-                if callable(refresh):
-                    try:
-                        refresh()
-                    except Exception:
-                        logger.debug("Could not refresh the font size of %r", tab, exc_info=True)
+            self._apply_font_settings()
+
+    def _apply_font_settings(self) -> None:
+        """Apply the stored font size/theme and refresh the tab styles.
+
+        Every tab that bakes a pixel size into a widget stylesheet has to be
+        told about a new size; shared by the View > Font Size dialog and the
+        Settings > App font-size field.
+        """
+        from src.ui.styles import apply_theme
+
+        apply_theme(QApplication.instance(), load_font_size(), load_theme())
+        for tab in (
+            self._test_tab, self._library_tab, self._gallery_tab,
+            self._edit_tab, self._ai_tab, self._lorebooks_tab,
+        ):
+            refresh = getattr(tab, 'refresh_font_size', None)
+            if callable(refresh):
+                try:
+                    refresh()
+                except Exception:
+                    logger.debug("Could not refresh the font size of %r", tab, exc_info=True)
 
     def _on_view_find_duplicates(self) -> None:
         from src.ui.widgets.duplicate_scanner import DuplicateScannerDialog
@@ -1685,6 +1694,12 @@ class MainWindow(QMainWindow):
         from src.ui.spell_check import apply_enabled_to_all
 
         apply_enabled_to_all()
+        # A font size changed in Settings > App: re-apply the theme when the
+        # stored size differs from the one currently applied.
+        from src.ui.styles import base_font_size
+
+        if base_font_size() != load_font_size():
+            self._apply_font_settings()
 
     def _on_tab_changed(self, index: int) -> None:
         if self._suppress_tab_change:

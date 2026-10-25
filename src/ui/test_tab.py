@@ -674,7 +674,7 @@ class TestTab(QWidget):
         self._reload_extra_books()
 
         self._build_ui()
-        # The Auto-Summarize button starts unchecked like every QPushButton;
+        # The Auto-Memory button starts unchecked like every QPushButton;
         # mirror the (on-by-default) flag onto it before anything is shown.
         self._sync_auto_toggle()
         self._set_inputs_enabled(False)
@@ -931,7 +931,7 @@ class TestTab(QWidget):
         )
         self._pairings_btn.clicked.connect(self._on_pairings)
         toolbar_row.addWidget(self._pairings_btn)
-        self._auto_summarize_btn = QPushButton('Auto-Summarize')
+        self._auto_summarize_btn = QPushButton('Auto-Memory')
         self._auto_summarize_btn.setCheckable(True)
         self._auto_summarize_btn.clicked.connect(self._on_auto_summarize_toggled)
         toolbar_row.addWidget(self._auto_summarize_btn)
@@ -1178,7 +1178,7 @@ class TestTab(QWidget):
         self._memories = normalize_memories(data)
         self._summarized_through = 0
         self._regen_bump = 0
-        # Restore the persisted Auto-Summarize / Auto-update toggles; chats
+        # Restore the persisted Auto-Memory / Auto-update toggles; chats
         # saved before the flags were persisted faithfully come back ON.
         self._auto_summarize, self._auto_update_attributes = session_flags(data)
         # Sessions saved before persistent attributes existed get the default
@@ -2036,6 +2036,14 @@ class TestTab(QWidget):
     def _on_delete_message(self, index: int) -> None:
         if index < 0 or index >= len(self._messages) or self._is_generating():
             return
+        msg = self._messages[index]
+        variants = msg.get('variants')
+        if isinstance(variants, list) and len(variants) > 1:
+            # Several responses live at this point in the chat (the ▶ (New)
+            # alternates): Delete removes only the response currently
+            # displayed, leaving its siblings and every later message alone.
+            self._delete_displayed_variant(msg, variants)
+            return
         count = len(self._messages) - index
         if QMessageBox.question(
             self, 'Delete Messages',
@@ -2045,6 +2053,30 @@ class TestTab(QWidget):
             return
         self._messages = self._messages[:index]
         self._remove_memories_from(index)
+        self._render_history()
+        self._save_current_session()
+
+    def _delete_displayed_variant(self, msg: dict, variants: list) -> None:
+        """Remove the variant *msg* currently shows, keep the rest."""
+        # Clamped: a stored variant_pos may be corrupt (session JSON is
+        # user-editable) and an out-of-range index must not crash the slot.
+        pos = max(
+            0,
+            min(_safe_variant_pos(msg.get('variant_pos'), len(variants) - 1),
+                len(variants) - 1),
+        )
+        if QMessageBox.question(
+            self, 'Delete Response',
+            f'This point in the chat has {len(variants)} stored responses. '
+            f'Delete only the one currently displayed?\n\n'
+            f'The other response(s) and every later message are kept.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        del variants[pos]
+        new_pos = max(0, min(pos, len(variants) - 1))
+        msg['variant_pos'] = new_pos
+        msg['content'] = variants[new_pos]
         self._render_history()
         self._save_current_session()
 
@@ -2601,7 +2633,7 @@ class TestTab(QWidget):
         """Re-derive persistent attributes from *text*.  Returns True when started.
 
         *quiet* (per-turn auto-update) only logs failures; an explicit
-        "Update Attributes Now" run reports them in a popup.
+        "Update Now" run reports them in a popup.
         """
         if (
             self._attr_worker is not None
