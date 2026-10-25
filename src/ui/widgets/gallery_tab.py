@@ -1,7 +1,10 @@
-"""Gallery tab: per-character extra images, ST expression images, V3 assets.
+"""Gallery tab: global VN backdrops, per-character images, ST expressions, V3 assets.
 
-Three panes over one character (selected via the shared sidebar):
+Four panes:
 
+* **Backdrops** — global visual-novel backdrops shared by every character,
+  kept under ``backdrops/`` (add, drag-reorder, caption, keywords, export);
+  usable with no character selected;
 * **Gallery** — extra images kept in the library under
   ``gallery/<char_id>/`` (add, drag-reorder, caption, export, set as the
   card's portrait);
@@ -9,6 +12,10 @@ Three panes over one character (selected via the shared sidebar):
   ``<st user images>/<charName>/`` so ST sees every change;
 * **Card Assets** — read-only view of the V3 ``assets`` array, with
   previews when the referenced file can be found on disk.
+
+Backdrops and gallery images both carry a keyword list: in Visual Novel
+mode a reply whose text matches an image's keywords can switch the stage to
+that image (see ``src.expression_detect``).
 """
 from __future__ import annotations
 
@@ -16,17 +23,19 @@ import logging
 from pathlib import Path
 
 from src import gallery_store
+from src.expression_detect import format_keywords, parse_keywords
 from src.ui.styles import ui_font_px
 
 logger = logging.getLogger(__name__)
 
 GALLERY_LOADER_OWNER = 'gallery'
 
-# Qt item roles used by both list panes.
+# Qt item roles used by the list panes.
 ROLE_PATH = 256            # full path to the image ('' when missing)
 ROLE_CAPTION = 257         # gallery caption / expression display name
-ROLE_IMAGE_ID = 258        # gallery DB row id (gallery pane only)
-ROLE_FILE_NAME = 259       # stored file name (gallery pane only)
+ROLE_IMAGE_ID = 258        # gallery/backdrop DB row id
+ROLE_FILE_NAME = 259       # stored file name
+ROLE_KEYWORDS = 260        # user-editable keyword string (gallery/backdrops)
 
 IMAGE_FILE_FILTER = 'Image Files (*.png *.jpg *.jpeg *.webp *.gif *.bmp);;All Files (*)'
 
@@ -194,11 +203,23 @@ if QWidget is not None:
             self._panes = QTabWidget()
             layout.addWidget(self._panes, 1)
 
+            self._backdrop_list = self._make_list(drag_reorder=True)
+            self._backdrop_list.itemDoubleClicked.connect(self._on_backdrop_double_clicked)
+            self._backdrop_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self._backdrop_list.customContextMenuRequested.connect(self._on_backdrop_menu)
+            self._backdrop_list.reordered.connect(lambda: self._on_rows_moved(self._backdrop_list))
+            self._backdrop_hint = QLabel('')
+            self._backdrop_hint.setWordWrap(True)
+            self._backdrop_hint.setStyleSheet('color: #888;')
+            self._panes.addTab(self._wrap_with_hint(
+                self._backdrop_hint, self._backdrop_list,
+            ), 'Backdrops')
+
             self._gallery_list = self._make_list(drag_reorder=True)
             self._gallery_list.itemDoubleClicked.connect(self._on_gallery_double_clicked)
             self._gallery_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self._gallery_list.customContextMenuRequested.connect(self._on_gallery_menu)
-            self._gallery_list.reordered.connect(self._on_rows_moved)
+            self._gallery_list.reordered.connect(lambda: self._on_rows_moved(self._gallery_list))
             self._gallery_hint = QLabel('')
             self._gallery_hint.setWordWrap(True)
             self._gallery_hint.setStyleSheet('color: #888;')
@@ -273,15 +294,17 @@ if QWidget is not None:
                 self.refresh()
 
         def refresh(self) -> None:
-            """Rebuild all three panes for the selected character."""
+            """Rebuild all panes (backdrops always, the rest per character)."""
             self._generation += 1
             self._thumb_paths.clear()
+            self._refresh_backdrops()
             char_id = self._char_id
             self._entry = self.db.get_by_id(char_id) if char_id is not None else None
             if self._entry is None:
                 self._title_label.setText('No character selected')
                 self._count_label.setText('')
                 for lst in (self._gallery_list, self._expr_list, self._assets_list):
+                    self._forget_thumbs(lst)
                     lst.clear()
                 self._update_actions()
                 return
@@ -306,11 +329,127 @@ if QWidget is not None:
             ))
             self._update_actions()
 
+        def _active_pane(self) -> str:
+            """Which store the header actions and drops should target."""
+            index = self._panes.currentIndex()
+            if index == 0:
+                return 'backdrops'
+            return 'gallery'
+
         def _update_actions(self) -> None:
-            enabled = self._entry is not None
-            self._add_btn.setEnabled(enabled)
-            self._folder_btn.setEnabled(enabled)
-            self._export_btn.setEnabled(enabled and self._gallery_list.count() > 0)
+            has_char = self._entry is not None
+            global_pane = self._active_pane() == 'backdrops'
+            self._add_btn.setEnabled(global_pane or has_char)
+            self._folder_btn.setEnabled(global_pane or has_char)
+            self._export_btn.setEnabled(
+                (global_pane and self._backdrop_list.count() > 0)
+                or (has_char and self._gallery_list.count() > 0),
+            )
+
+        # ---- backdrops pane (global) ----
+
+        def _refresh_backdrops(self) -> None:
+            self._forget_thumbs(self._backdrop_list)
+            self._backdrop_list.clear()
+            rows = self.db.list_backdrop_images()
+            self._backdrop_hint.setText(
+                f'{len(rows)} backdrop(s), shared by every character. '
+                'These fill the Visual Novel stage. Drag thumbnails to reorder.'
+                if rows else
+                'No shared backdrops yet. Add images here to use them as '
+                'Visual Novel backdrops for every character.'
+            )
+            for row in rows:
+                path = str(gallery_store.backdrop_image_path(row['file_name']))
+                caption = row.get('caption') or Path(row['file_name']).stem
+                item = QListWidgetItem(caption)
+                item.setData(ROLE_PATH, path if Path(path).is_file() else '')
+                item.setData(ROLE_CAPTION, row.get('caption') or '')
+                item.setData(ROLE_IMAGE_ID, row['id'])
+                item.setData(ROLE_FILE_NAME, row['file_name'])
+                item.setData(ROLE_KEYWORDS, row.get('keywords') or '')
+                item.setToolTip(self._item_tooltip(row, path))
+                item.setSizeHint(QSize(128, 150))
+                self._backdrop_list.addItem(item)
+                if item.data(ROLE_PATH):
+                    self._request_thumb(item, path)
+
+        @staticmethod
+        def _item_tooltip(row: dict, path: str) -> str:
+            lines = [str(row.get('file_name') or '')]
+            if row.get('caption'):
+                lines.append(str(row['caption']))
+            keywords = parse_keywords(row.get('keywords') or '')
+            if keywords:
+                lines.append('Keywords: ' + ', '.join(keywords))
+            if not path:
+                lines.append('(missing file)')
+            return '\n'.join(lines)
+
+        def _on_backdrop_double_clicked(self, item: QListWidgetItem) -> None:
+            self._open_lightbox(
+                self._backdrop_items_with_paths(), self._backdrop_item_index(item),
+                title='Backdrops',
+            )
+
+        def _backdrop_items_with_paths(self) -> tuple[list[str], list[str]]:
+            paths, labels = [], []
+            for i in range(self._backdrop_list.count()):
+                item = self._backdrop_list.item(i)
+                path = item.data(ROLE_PATH) or ''
+                if path:
+                    paths.append(path)
+                    labels.append(item.data(ROLE_CAPTION) or item.text())
+            return paths, labels
+
+        def _backdrop_item_index(self, item: QListWidgetItem) -> int:
+            path = item.data(ROLE_PATH) or ''
+            paths, _ = self._backdrop_items_with_paths()
+            try:
+                return paths.index(path)
+            except ValueError:
+                return 0
+
+        def _on_backdrop_menu(self, pos) -> None:
+            items = self._backdrop_list.selectedItems()
+            if not items:
+                return
+            path = items[0].data(ROLE_PATH) or ''
+            menu = QMenu(self._backdrop_list)
+            open_act = menu.addAction('Open')
+            open_act.triggered.connect(lambda: self._open_lightbox(
+                self._backdrop_items_with_paths(), self._backdrop_item_index(items[0]),
+                title='Backdrops',
+            ))
+            caption_act = menu.addAction('Edit Caption...')
+            caption_act.triggered.connect(lambda: self._edit_caption(items[0], True))
+            keywords_act = menu.addAction('Edit Keywords...')
+            keywords_act.triggered.connect(lambda: self._edit_keywords(items[0], True))
+            export_act = menu.addAction('Export This...')
+            export_act.triggered.connect(lambda: self._export_one(path))
+            reveal_act = menu.addAction('Reveal in Folder')
+            reveal_act.triggered.connect(lambda: self._reveal(path))
+            menu.addSeparator()
+            delete_act = menu.addAction('Delete')
+            delete_act.triggered.connect(self._delete_backdrop_items)
+            menu.exec(self._backdrop_list.viewport().mapToGlobal(pos))
+
+        def _delete_backdrop_items(self) -> None:
+            items = self._backdrop_list.selectedItems()
+            if not items:
+                return
+            reply = QMessageBox.question(
+                self, 'Delete Backdrops',
+                f'Delete {len(items)} backdrop(s)?',
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            for item in items:
+                row = self.db.delete_backdrop_image(int(item.data(ROLE_IMAGE_ID)))
+                if row:
+                    gallery_store.delete_backdrop_file(row['file_name'])
+            self._refresh_backdrops()
+            self._update_actions()
 
         # ---- gallery pane ----
 
@@ -335,7 +474,8 @@ if QWidget is not None:
                 item.setData(ROLE_CAPTION, row.get('caption') or '')
                 item.setData(ROLE_IMAGE_ID, row['id'])
                 item.setData(ROLE_FILE_NAME, row['file_name'])
-                item.setToolTip(f"{row['file_name']}\n{row.get('caption') or ''}".strip())
+                item.setData(ROLE_KEYWORDS, row.get('keywords') or '')
+                item.setToolTip(self._item_tooltip(row, path))
                 item.setSizeHint(QSize(128, 150))
                 self._gallery_list.addItem(item)
                 if item.data(ROLE_PATH):
@@ -385,19 +525,32 @@ if QWidget is not None:
             pixmap = QPixmap.fromImage(qimg)
             item.setIcon(QIcon(pixmap))
 
-        def _on_rows_moved(self, *args) -> None:
-            """Persist a drag-reorder of gallery thumbnails."""
+        def _on_rows_moved(self, lst: QListWidget | None = None) -> None:
+            """Persist a drag-reorder of gallery or backdrop thumbnails."""
+            sender = lst if lst is not None else self.sender()
+            if sender is self._backdrop_list:
+                order = self._list_image_ids(self._backdrop_list)
+                try:
+                    self.db.set_backdrop_order(order)
+                except Exception:
+                    logger.exception("Could not persist backdrop order")
+                return
             if self._char_id is None:
                 return
-            order = []
-            for i in range(self._gallery_list.count()):
-                image_id = self._gallery_list.item(i).data(ROLE_IMAGE_ID)
-                if image_id is not None:
-                    order.append(int(image_id))
+            order = self._list_image_ids(self._gallery_list)
             try:
                 self.db.set_gallery_order(self._char_id, order)
             except Exception:
                 logger.exception("Could not persist gallery order")
+
+        @staticmethod
+        def _list_image_ids(lst: QListWidget) -> list[int]:
+            order = []
+            for i in range(lst.count()):
+                image_id = lst.item(i).data(ROLE_IMAGE_ID)
+                if image_id is not None:
+                    order.append(int(image_id))
+            return order
 
         def _on_gallery_double_clicked(self, item: QListWidgetItem) -> None:
             self._open_lightbox(self._gallery_items_with_paths(), self._item_index(item))
@@ -434,6 +587,8 @@ if QWidget is not None:
             card_act.triggered.connect(lambda: self._set_as_card_image(path))
             caption_act = menu.addAction('Edit Caption...')
             caption_act.triggered.connect(lambda: self._edit_caption(items[0]))
+            keywords_act = menu.addAction('Edit Keywords...')
+            keywords_act.triggered.connect(lambda: self._edit_keywords(items[0]))
             export_act = menu.addAction('Export This...')
             export_act.triggered.connect(lambda: self._export_one(path))
             reveal_act = menu.addAction('Reveal in Folder')
@@ -443,7 +598,7 @@ if QWidget is not None:
             delete_act.triggered.connect(self._delete_gallery_items)
             menu.exec(self._gallery_list.viewport().mapToGlobal(pos))
 
-        def _edit_caption(self, item: QListWidgetItem) -> None:
+        def _edit_caption(self, item: QListWidgetItem, global_store: bool = False) -> None:
             image_id = item.data(ROLE_IMAGE_ID)
             current = item.data(ROLE_CAPTION) or ''
             text, ok = QInputDialog.getText(
@@ -452,12 +607,42 @@ if QWidget is not None:
             if not ok:
                 return
             try:
-                self.db.set_gallery_caption(int(image_id), text)
+                if global_store:
+                    self.db.set_backdrop_caption(int(image_id), text)
+                else:
+                    self.db.set_gallery_caption(int(image_id), text)
             except Exception:
-                logger.exception("Could not save gallery caption")
+                logger.exception("Could not save image caption")
                 return
             item.setData(ROLE_CAPTION, text)
             item.setText(text or Path(item.data(ROLE_FILE_NAME)).stem)
+
+        def _edit_keywords(self, item: QListWidgetItem, global_store: bool = False) -> None:
+            """Edit the comma-separated keyword list that drives VN switching."""
+            image_id = item.data(ROLE_IMAGE_ID)
+            current = format_keywords(parse_keywords(item.data(ROLE_KEYWORDS) or ''))
+            text, ok = QInputDialog.getText(
+                self, 'Edit Keywords', 'Keywords (comma-separated):', text=current,
+            )
+            if not ok:
+                return
+            keywords = format_keywords(parse_keywords(text))
+            try:
+                if global_store:
+                    self.db.set_backdrop_keywords(int(image_id), keywords)
+                else:
+                    self.db.set_gallery_keywords(int(image_id), keywords)
+            except Exception:
+                logger.exception("Could not save image keywords")
+                return
+            item.setData(ROLE_KEYWORDS, keywords)
+            row = {
+                'file_name': item.data(ROLE_FILE_NAME) or '',
+                'caption': item.data(ROLE_CAPTION) or '',
+                'keywords': keywords,
+            }
+            item.setToolTip(self._item_tooltip(row, item.data(ROLE_PATH) or ''))
+            self.status_message.emit('Keywords updated.', 3000)
 
         def _delete_gallery_items(self) -> None:
             items = self._gallery_list.selectedItems()
@@ -481,16 +666,7 @@ if QWidget is not None:
         # ---- expressions pane ----
 
         def _user_images_dir(self) -> Path | None:
-            from src.settings_manager import (
-                load_st_characters_path, load_st_user_images_path,
-            )
-            configured = load_st_user_images_path().strip()
-            if configured:
-                return Path(configured)
-            characters = load_st_characters_path().strip()
-            if characters:
-                return gallery_store.resolve_user_images_dir(characters)
-            return None
+            return gallery_store.configured_user_images_dir()
 
         def _expression_dir(self) -> Path | None:
             user_images = self._user_images_dir()
@@ -731,7 +907,8 @@ if QWidget is not None:
 
         # ---- shared actions ----
 
-        def _open_lightbox(self, items: tuple[list[str], list[str]], index: int) -> None:
+        def _open_lightbox(self, items: tuple[list[str], list[str]], index: int,
+                           title: str | None = None) -> None:
             paths, labels = items
             if not paths:
                 return
@@ -739,7 +916,7 @@ if QWidget is not None:
             if self._lightbox is not None:
                 self._lightbox.close()
                 self._lightbox.deleteLater()
-            name = (self._entry or {}).get('name') or 'Gallery'
+            name = title or (self._entry or {}).get('name') or 'Gallery'
             self._lightbox = GalleryLightbox(
                 paths, index, labels=labels, title=name, parent=self,
             )
@@ -793,6 +970,9 @@ if QWidget is not None:
                 QMessageBox.critical(self, 'Export', f'Failed to export: {e}')
 
         def _on_export_all(self) -> None:
+            if self._active_pane() == 'backdrops':
+                self._export_all_backdrops()
+                return
             if self._entry is None:
                 return
             directory = QFileDialog.getExistingDirectory(self, 'Export Gallery Images To')
@@ -827,16 +1007,39 @@ if QWidget is not None:
                 f'Exported {count} image(s) to {base}', 6000,
             )
 
+        def _export_all_backdrops(self) -> None:
+            directory = QFileDialog.getExistingDirectory(self, 'Export Backdrops To')
+            if not directory:
+                return
+            base = Path(directory) / 'backdrops'
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+                count = 0
+                for i in range(self._backdrop_list.count()):
+                    item = self._backdrop_list.item(i)
+                    path = item.data(ROLE_PATH) or ''
+                    if path:
+                        from src import vault
+                        vault.copy_out(path, base / item.data(ROLE_FILE_NAME))
+                        count += 1
+            except Exception as e:
+                QMessageBox.critical(self, 'Export', f'Export failed: {e}')
+                return
+            self.status_message.emit(
+                f'Exported {count} image(s) to {base}', 6000,
+            )
+
         # ---- add / import ----
 
         def _on_add_images(self) -> None:
-            paths, _ = QFileDialog.getOpenFileNames(
-                self, 'Add Gallery Images', '', IMAGE_FILE_FILTER,
-            )
+            target = 'backdrops' if self._active_pane() == 'backdrops' else 'gallery'
+            title = 'Add Backdrop Images' if target == 'backdrops' else 'Add Gallery Images'
+            paths, _ = QFileDialog.getOpenFileNames(self, title, '', IMAGE_FILE_FILTER)
             if paths:
-                self._import_paths(filter_image_paths(paths))
+                self._import_paths(filter_image_paths(paths), target)
 
         def _on_import_folder(self) -> None:
+            target = 'backdrops' if self._active_pane() == 'backdrops' else 'gallery'
             directory = QFileDialog.getExistingDirectory(self, 'Import Images From Folder')
             if not directory:
                 return
@@ -846,10 +1049,11 @@ if QWidget is not None:
             if not paths:
                 self.status_message.emit('No image files in that folder.', 4000)
                 return
-            self._import_paths(paths)
+            self._import_paths(paths, target)
 
-        def _import_paths(self, paths: list[str]) -> None:
-            if self._char_id is None or not paths:
+        def _import_paths(self, paths: list[str], target: str = 'gallery') -> None:
+            char_id = None if target == 'backdrops' else self._char_id
+            if (target == 'gallery' and char_id is None) or not paths:
                 return
             if self._worker_alive(self._worker):
                 self.status_message.emit(
@@ -857,12 +1061,12 @@ if QWidget is not None:
                 )
                 return
             from src.ui.widgets.gallery_import_worker import GalleryImportWorker
-            worker = GalleryImportWorker(self._char_id, paths, self.db, self)
+            worker = GalleryImportWorker(char_id, paths, self.db, self)
             self._worker = worker
             self._progress = QProgressDialog(
                 'Adding images...', 'Cancel', 0, len(paths), self,
             )
-            self._progress.setWindowTitle('Gallery')
+            self._progress.setWindowTitle('Backdrops' if char_id is None else 'Gallery')
             worker.progress.connect(self._on_import_progress)
             worker.completed.connect(self._on_import_completed)
             worker.error.connect(self._on_import_error)
@@ -886,6 +1090,7 @@ if QWidget is not None:
                 self._progress.setValue(done)
 
         def _on_import_completed(self, summary) -> None:
+            self._refresh_backdrops()
             self._refresh_gallery()
             self._update_actions()
             self.status_message.emit(summary.message(), 6000)
@@ -937,7 +1142,8 @@ if QWidget is not None:
         def dropEvent(self, event) -> None:
             paths = self._droppable_paths(event.mimeData())
             if paths:
-                self._import_paths(paths)
+                target = 'backdrops' if self._active_pane() == 'backdrops' else 'gallery'
+                self._import_paths(paths, target)
                 event.acceptProposedAction()
 
         # ---- shutdown ----

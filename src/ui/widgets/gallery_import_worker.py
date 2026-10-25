@@ -1,4 +1,4 @@
-"""Background batch import of gallery images.
+"""Background batch import of gallery / backdrop images.
 
 Pure summary accumulation (no Qt) sits alongside a thin ``QThread`` runner so
 the result bookkeeping can be unit-tested without an event loop — the same
@@ -47,20 +47,22 @@ class GalleryImportSummary:
 
 
 def import_gallery_paths(
-    char_id: int,
+    char_id: int | None,
     paths: list[str],
     db,
     summary: GalleryImportSummary | None = None,
     progress_cb=None,
     cancel_cb=None,
 ) -> GalleryImportSummary:
-    """Import each image into the character's gallery.
+    """Import each image into a gallery or the global backdrop library.
 
-    Identical content (SHA-256) is never stored twice for one character:
-    a re-dropped export counts as a skip, not a second copy.  *progress_cb*
-    is called with ``(done, total, filename)``; *cancel_cb* is polled before
-    each file so a long batch can be abandoned mid-way.  Exceptions are
-    captured per file so one bad image never aborts the batch.
+    *char_id* selects the target: a card id imports into that character's
+    gallery, ``None`` imports into the shared VN backdrops.  Identical
+    content (SHA-256) is never stored twice for one target: a re-dropped
+    export counts as a skip, not a second copy.  *progress_cb* is called
+    with ``(done, total, filename)``; *cancel_cb* is polled before each file
+    so a long batch can be abandoned mid-way.  Exceptions are captured per
+    file so one bad image never aborts the batch.
     """
     result = summary if summary is not None else GalleryImportSummary()
     total = len(paths)
@@ -72,13 +74,20 @@ def import_gallery_paths(
             progress_cb(done, total, Path(path).name)
         try:
             data_hash = gallery_store.content_hash(vault.read_bytes(path))
-            if db.find_gallery_by_hash(char_id, data_hash) is not None:
-                result.add_skipped(path)
-                continue
-            meta = gallery_store.import_gallery_image(char_id, path)
-            db.add_gallery_image(
-                char_id, meta['file_name'], meta['content_hash'],
-            )
+            if char_id is None:
+                if db.find_backdrop_by_hash(data_hash) is not None:
+                    result.add_skipped(path)
+                    continue
+                meta = gallery_store.import_backdrop_image(path)
+                db.add_backdrop_image(meta['file_name'], meta['content_hash'])
+            else:
+                if db.find_gallery_by_hash(char_id, data_hash) is not None:
+                    result.add_skipped(path)
+                    continue
+                meta = gallery_store.import_gallery_image(char_id, path)
+                db.add_gallery_image(
+                    char_id, meta['file_name'], meta['content_hash'],
+                )
             result.add_imported()
         except Exception as e:
             logger.warning("Gallery import failed for %s: %s", path, e)
@@ -102,7 +111,7 @@ if QThread is not None:
         completed = pyqtSignal(object)         # GalleryImportSummary
         error = pyqtSignal(str)
 
-        def __init__(self, char_id: int, paths: list[str], db, parent=None):
+        def __init__(self, char_id: int | None, paths: list[str], db, parent=None):
             super().__init__(parent)
             self._char_id = char_id
             self._paths = list(paths)

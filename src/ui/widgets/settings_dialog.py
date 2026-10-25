@@ -1041,6 +1041,7 @@ class _PromptsPanel(QWidget):
             ('Impersonate', ['impersonate_user', 'continue_user']),
             ('Memory', ['memory_summary_system', 'memory_summary_user']),
             ('Attributes', ['attribute_update_system', 'attribute_update_user']),
+            ('Expression', ['expression_classify_system', 'expression_classify_user']),
             ('Lorebook', ['lorebook_system', 'lorebook_user']),
             ('Lorebook Entry', ['lorebook_entry_system', 'lorebook_entry_user']),
         ]
@@ -1171,6 +1172,24 @@ class _TestPanel(QWidget):
     def __init__(self, settings: dict, parent: QWidget | None = None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
+
+        # View Mode leads the panel: it decides how the whole tab presents,
+        # and the VN settings below only matter in one of its modes.
+        view_row = QHBoxLayout()
+        view_row.addWidget(QLabel('View Mode:'))
+        self._view_mode = QComboBox()
+        self._view_mode.addItem('Chat (scrolling conversation)', 'chat')
+        self._view_mode.addItem('Visual Novel (backdrop + chat box)', 'visual_novel')
+        self._view_mode.setToolTip(
+            'How the Test tab presents the conversation.\n'
+            'Visual Novel shows a gallery image in the main area with a '
+            'smaller chat window for the dialogue.'
+        )
+        idx = self._view_mode.findData(settings.get('view_mode', 'chat'))
+        self._view_mode.setCurrentIndex(idx if idx >= 0 else 0)
+        view_row.addWidget(self._view_mode, 1)
+        layout.addLayout(view_row)
+
         group = QGroupBox('Chat Display')
         form = QFormLayout(group)
 
@@ -1217,6 +1236,118 @@ class _TestPanel(QWidget):
         placement_row.addWidget(self._example_placement, 1)
         options_layout.addLayout(placement_row)
         layout.addWidget(options_group)
+
+        vn_group = QGroupBox('Visual Novel Mode')
+        vn_form = QFormLayout(vn_group)
+
+        self._vn_image_source = QComboBox()
+        self._vn_image_source.addItem('First gallery image', 'first')
+        self._vn_image_source.addItem('Latest added', 'latest')
+        self._vn_image_source.addItem('Random on open', 'random')
+        self._vn_image_source.setToolTip(
+            'Which gallery image a chat opens with.\n'
+            'A pinned backdrop (per chat or per character) takes precedence.'
+        )
+        idx = self._vn_image_source.findData(settings.get('vn_image_source', 'first'))
+        self._vn_image_source.setCurrentIndex(idx if idx >= 0 else 0)
+        vn_form.addRow('Backdrop image:', self._vn_image_source)
+
+        self._vn_backdrop_pool = QComboBox()
+        self._vn_backdrop_pool.addItem(
+            'Shared backdrops + character gallery', 'both',
+        )
+        self._vn_backdrop_pool.addItem('Shared backdrops only', 'global')
+        self._vn_backdrop_pool.addItem('Character gallery only', 'gallery')
+        self._vn_backdrop_pool.setToolTip(
+            'Which images fill the Visual Novel stage.\n'
+            'Shared backdrops live in the Gallery tab -> Backdrops and are '
+            'used by every character; the character gallery is per card.'
+        )
+        idx = self._vn_backdrop_pool.findData(settings.get('vn_backdrop_pool', 'both'))
+        self._vn_backdrop_pool.setCurrentIndex(idx if idx >= 0 else 0)
+        vn_form.addRow('Backdrop pool:', self._vn_backdrop_pool)
+
+        self._vn_image_fit = QComboBox()
+        self._vn_image_fit.addItem('Contain (letterbox)', 'contain')
+        self._vn_image_fit.addItem('Cover (crop to fill)', 'cover')
+        self._vn_image_fit.addItem('Stretch', 'stretch')
+        idx = self._vn_image_fit.findData(settings.get('vn_image_fit', 'contain'))
+        self._vn_image_fit.setCurrentIndex(idx if idx >= 0 else 0)
+        vn_form.addRow('Image fit:', self._vn_image_fit)
+
+        self._vn_chat_height = self._percent_field(15, 50, settings.get('vn_chat_height_pct', 30))
+        vn_form.addRow('Chat panel height (%):', self._vn_chat_height[0])
+
+        self._vn_overlay_opacity = self._percent_field(
+            20, 100, settings.get('vn_overlay_opacity', 60),
+        )
+        self._vn_overlay_opacity[1].setToolTip(
+            'Opacity of the dark scrim behind the chat panel, so the text '
+            'stays readable next to any image.'
+        )
+        vn_form.addRow('Chat panel opacity (%):', self._vn_overlay_opacity[0])
+
+        self._vn_advance_on_reply = QCheckBox('Advance to the next image on each reply')
+        self._vn_advance_on_reply.setChecked(bool(settings.get('vn_advance_on_reply', False)))
+        vn_form.addRow('Image advance:', self._vn_advance_on_reply)
+
+        self._vn_backdrop_keywords = QCheckBox('Switch image from reply keywords')
+        self._vn_backdrop_keywords.setChecked(bool(settings.get('vn_backdrop_keywords', False)))
+        self._vn_backdrop_keywords.setToolTip(
+            'When a reply matches an image\'s keywords (Gallery tab -> right-'
+            'click -> Edit Keywords...), the stage switches to that image.\n'
+            'Keyword matches win over the blind image advance.'
+        )
+        vn_form.addRow('Keyword switching:', self._vn_backdrop_keywords)
+
+        self._vn_show_caption = QCheckBox('Show caption and image counter')
+        self._vn_show_caption.setChecked(bool(settings.get('vn_show_caption', True)))
+        vn_form.addRow('Caption:', self._vn_show_caption)
+
+        self._vn_use_portrait = QCheckBox('Use the card portrait when the gallery is empty')
+        self._vn_use_portrait.setChecked(bool(settings.get('vn_use_portrait_fallback', True)))
+        vn_form.addRow('Fallback image:', self._vn_use_portrait)
+        layout.addWidget(vn_group)
+
+        expr_group = QGroupBox('Expression Images')
+        expr_form = QFormLayout(expr_group)
+        self._vn_expression_auto = QCheckBox('Auto-switch the sprite on each reply')
+        self._vn_expression_auto.setChecked(bool(settings.get('vn_expression_auto', True)))
+        self._vn_expression_auto.setToolTip(
+            'Picks the SillyTavern expression image that matches the tone of '
+            'the reply and shows it as a character sprite over the backdrop.'
+        )
+        expr_form.addRow('Expressions:', self._vn_expression_auto)
+
+        self._vn_expression_llm = QCheckBox('Use LLM classification')
+        self._vn_expression_llm.setChecked(bool(settings.get('vn_expression_llm', False)))
+        self._vn_expression_llm.setToolTip(
+            'Ask the model to classify the tone (one small request per reply).\n'
+            'Off: local keyword detection - instant and offline, but only as '
+            'smart as its word lists.\n'
+            'Falls back to keyword detection when the request fails.'
+        )
+        expr_form.addRow('Detection:', self._vn_expression_llm)
+
+        self._vn_sprite_position = QComboBox()
+        self._vn_sprite_position.addItem('Left', 'left')
+        self._vn_sprite_position.addItem('Center', 'center')
+        self._vn_sprite_position.addItem('Right', 'right')
+        idx = self._vn_sprite_position.findData(settings.get('vn_sprite_position', 'center'))
+        self._vn_sprite_position.setCurrentIndex(idx if idx >= 0 else 1)
+        expr_form.addRow('Sprite position:', self._vn_sprite_position)
+
+        self._vn_sprite_height = self._percent_field(
+            40, 100, settings.get('vn_sprite_height_pct', 75),
+        )
+        expr_form.addRow('Sprite height (%):', self._vn_sprite_height[0])
+
+        hint = QLabel('Uses SillyTavern expression images (Settings -> ST paths).')
+        hint.setStyleSheet('color: #888;')
+        hint.setWordWrap(True)
+        expr_form.addRow(hint)
+        layout.addWidget(expr_group)
+
         layout.addStretch()
 
     def _color_field(self, initial: str):
@@ -1229,6 +1360,24 @@ class _TestPanel(QWidget):
         h.addWidget(pick_btn)
         pick_btn.clicked.connect(lambda: self._pick_color(edit))
         return (row, edit, pick_btn)
+
+    def _percent_field(self, lo: int, hi: int, initial):
+        """A small spin box in a row, mirroring ``_color_field``'s tuple."""
+        from PyQt6.QtWidgets import QSpinBox
+
+        spin = QSpinBox()
+        spin.setRange(lo, hi)
+        spin.setSuffix(' %')
+        try:
+            spin.setValue(max(lo, min(hi, int(initial))))
+        except (TypeError, ValueError):
+            spin.setValue(lo)
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(spin)
+        h.addStretch()
+        return (row, spin)
 
     def _pick_color(self, edit: QLineEdit) -> None:
         color = QColorDialog.getColor(QColor(edit.text()), self)
@@ -1244,6 +1393,20 @@ class _TestPanel(QWidget):
             'auto_scroll': self._auto_scroll.isChecked(),
             'include_first_message': self._include_first.isChecked(),
             'example_placement': self._example_placement.currentData(),
+            'view_mode': self._view_mode.currentData(),
+            'vn_image_source': self._vn_image_source.currentData(),
+            'vn_backdrop_pool': self._vn_backdrop_pool.currentData(),
+            'vn_image_fit': self._vn_image_fit.currentData(),
+            'vn_chat_height_pct': self._vn_chat_height[1].value(),
+            'vn_overlay_opacity': self._vn_overlay_opacity[1].value(),
+            'vn_advance_on_reply': self._vn_advance_on_reply.isChecked(),
+            'vn_backdrop_keywords': self._vn_backdrop_keywords.isChecked(),
+            'vn_show_caption': self._vn_show_caption.isChecked(),
+            'vn_use_portrait_fallback': self._vn_use_portrait.isChecked(),
+            'vn_expression_auto': self._vn_expression_auto.isChecked(),
+            'vn_expression_llm': self._vn_expression_llm.isChecked(),
+            'vn_sprite_position': self._vn_sprite_position.currentData(),
+            'vn_sprite_height_pct': self._vn_sprite_height[1].value(),
         }
 
 
