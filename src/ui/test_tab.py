@@ -1363,7 +1363,11 @@ class TestTab(QWidget):
             self._vn_backdrop_file = ''
 
     def _on_backdrop_clicked(self) -> None:
-        """Open the gallery lightbox on the current backdrop."""
+        """Open the gallery lightbox on the current backdrop.
+
+        An already-open lightbox is reused - refreshed in place and brought
+        to the front - so repeated clicks never stack up extra windows.
+        """
         paths = self._vn_backdrop.paths()
         if not paths:
             return
@@ -1375,6 +1379,19 @@ class TestTab(QWidget):
 
         # Keep a strong reference: the dialog is shown mode-less (so the chat
         # stays usable) and a garbage-collected dialog is a dead C++ object.
+        box = self._vn_lightbox
+        if isinstance(box, GalleryLightbox) and _widget_alive(box):
+            index = self._vn_backdrop.current_index()
+            if box.paths() != paths:
+                box.set_images(
+                    paths, start_index=index, labels=self._vn_backdrop.labels(),
+                )
+            elif box.current_index() != index:
+                box.show_index(index)
+            box.show()
+            box.raise_()
+            box.activateWindow()
+            return
         self._vn_lightbox = GalleryLightbox(
             paths,
             start_index=self._vn_backdrop.current_index(),
