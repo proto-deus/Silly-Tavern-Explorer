@@ -266,9 +266,12 @@ if QWidget is not None:
 
         # ---- setup ----
 
-        @staticmethod
-        def _nav_button(text: str, slot) -> QPushButton:
-            btn = QPushButton(text)
+        def _nav_button(self, text: str, slot) -> QPushButton:
+            # Must be parented to the stage: an unparented button becomes a
+            # top-level window of its own (a tiny floating window that
+            # _relayout would move/raise in screen coordinates) instead of
+            # chrome sitting on the image.
+            btn = QPushButton(text, self)
             btn.setFixedSize(28, 48)
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             btn.setStyleSheet(
@@ -386,6 +389,9 @@ if QWidget is not None:
 
         def paths(self) -> list[str]:
             return list(self._paths)
+
+        def labels(self) -> list[str]:
+            return list(self._labels)
 
         def current_index(self) -> int:
             return self._index

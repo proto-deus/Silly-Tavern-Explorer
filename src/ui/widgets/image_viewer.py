@@ -259,8 +259,11 @@ if QAction is not None:
                 f'{self._entry_label()} — {self._index + 1}/{len(self._paths)}'
             )
 
-        def _show_index(self, index: int) -> None:
-            if index == self._index or not self._paths:
+        def _show_index(self, index: int, force: bool = False) -> None:
+            if not self._paths:
+                return
+            index = min(max(0, index), len(self._paths) - 1)
+            if index == self._index and not force:
                 return
             self._index = index
             self._image_path = self._paths[index]
@@ -272,6 +275,34 @@ if QAction is not None:
                     self._on_index_changed(index)
                 except Exception:
                     pass
+
+        def paths(self) -> list[str]:
+            return list(self._paths)
+
+        def current_index(self) -> int:
+            return self._index
+
+        def show_index(self, index: int) -> None:
+            """Show *index* even when it is already the current one.
+
+            Used to re-sync a reused lightbox with its caller.
+            """
+            self._show_index(index, force=True)
+
+        def set_images(self, image_paths: list[str], start_index: int = 0,
+                       labels: list[str] | None = None) -> None:
+            """Replace the image list and show *start_index* within it.
+
+            Lets a caller reuse an open lightbox when the image pool
+            changes instead of spawning another window.  An empty list is
+            a no-op (the caller decides whether to close the window).
+            """
+            new_paths = [str(p) for p in image_paths or []]
+            if not new_paths:
+                return
+            self._paths = new_paths
+            self._labels = [str(x) for x in (labels or [])]
+            self._show_index(start_index, force=True)
 
         def next_image(self) -> None:
             self._show_index(wrap_index(self._index, 1, len(self._paths)))
