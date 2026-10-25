@@ -441,6 +441,52 @@ def check_gallery_images(db, gallery_dir: str | Path | None = None) -> list[Find
     return out
 
 
+def check_backdrop_images(db, backdrops_dir: str | Path | None = None) -> list[Finding]:
+    """Global VN backdrop metadata and files that have drifted apart.
+
+    Same two failure modes as the per-character gallery: rows whose file is
+    gone (drop the row) and files no row references (report only - never
+    delete user images).
+    """
+    if backdrops_dir is None:
+        from src.gallery_store import get_backdrops_dir
+        root = get_backdrops_dir()
+    else:
+        root = Path(backdrops_dir)
+    try:
+        rows = db.list_backdrop_images()
+    except Exception:
+        logger.exception("Doctor could not list backdrop rows")
+        return []
+    out: list[Finding] = []
+    known: set[str] = set()
+    for row in rows:
+        file_name = str(row.get('file_name') or '')
+        known.add(file_name)
+        if file_name and not (root / file_name).is_file():
+            out.append(Finding(
+                'backdrop-missing-file', 'warning',
+                f"Backdrop image '{file_name}' is missing from disk",
+                detail=f'backdrops/{file_name}', fixable=True,
+                items=[str(row.get('id'))],
+            ))
+    if not root.is_dir():
+        return out
+    strays = [
+        p.name for p in sorted(root.iterdir())
+        if p.is_file() and p.name not in known
+        and not p.name.startswith('.ste-') and not p.name.endswith('.tmp')
+    ]
+    if strays:
+        out.append(Finding(
+            'backdrop-orphan-file', 'info',
+            f'{len(strays)} file(s) in the backdrops folder are not in the library',
+            detail=', '.join(strays[:10]), fixable=True,
+            items=strays,
+        ))
+    return out
+
+
 def check_stale_links(db, characters_dir: str | Path | None = None) -> list[Finding]:
     """Cards linked to a SillyTavern file that is no longer there."""
     if characters_dir is None:
@@ -593,6 +639,7 @@ def run_all(db, db_path: str | Path | None = None,
         ('orphan-files', lambda: check_orphan_files(db, library_dir)),
         ('orphan-sessions', lambda: check_orphan_sessions(db, sessions_dir)),
         ('gallery-images', lambda: check_gallery_images(db, gallery_dir)),
+        ('backdrop-images', lambda: check_backdrop_images(db)),
         ('stale-links', lambda: check_stale_links(db, st_characters_dir)),
         ('stale-tombstones', lambda: check_stale_tombstones(db)),
         ('undecryptable-keys', check_undecryptable_keys),
@@ -682,6 +729,14 @@ def plan_repairs(report: DoctorReport) -> list[RepairPlan]:
                     f'is already gone (the files are not touched)'
                 ),
             ))
+        elif finding.category == 'backdrop-missing-file':
+            plans.append(RepairPlan(
+                finding, action='drop-backdrop-rows', targets=list(finding.items),
+                description=(
+                    f'Drop {len(finding.items)} backdrop row(s) whose image file '
+                    f'is already gone (the files are not touched)'
+                ),
+            ))
         elif finding.category == 'stale-tombstone':
             plans.append(RepairPlan(
                 finding, action='clear-tombstones', targets=list(finding.items),
@@ -695,7 +750,7 @@ def plan_repairs(report: DoctorReport) -> list[RepairPlan]:
                 finding, action='clean-tag-blob', targets=[],
                 description='Remove the non-text tag values from this card',
             ))
-        elif finding.category in ('orphan-file', 'gallery-orphan-file'):
+        elif finding.category in ('orphan-file', 'gallery-orphan-file', 'backdrop-orphan-file'):
             plans.append(RepairPlan(
                 finding, action='report-only', targets=list(finding.items),
                 description='Nothing is deleted; the files are only reported',
@@ -758,6 +813,8 @@ def _apply_plan(db, plan: RepairPlan) -> list[str]:
         return _remove_gallery_dirs(finding, plan.targets)
     if action == 'drop-gallery-rows':
         return _drop_gallery_rows(db, finding, plan.targets)
+    if action == 'drop-backdrop-rows':
+        return _drop_backdrop_rows(db, finding, plan.targets)
     if action == 'clear-tombstones':
         return _clear_tombstones(db, finding, plan.targets)
     if action == 'clean-tag-blob':
@@ -783,6 +840,12 @@ def _apply_plan(db, plan: RepairPlan) -> list[str]:
             return [
                 'Files in the gallery folder that are not in the library '
                 'were left in place; add them to the gallery if you still '
+                'want them.'
+            ]
+        if finding.category == 'backdrop-orphan-file':
+            return [
+                'Files in the backdrops folder that are not in the library '
+                'were left in place; add them to the backdrops if you still '
                 'want them.'
             ]
         return [
@@ -870,6 +933,27 @@ def _drop_gallery_rows(db, finding: Finding,
     if not dropped:
         return []
     return [f'Removed {dropped} gallery entr{"y" if dropped == 1 else "ies"} '
+            f'whose image file is missing']
+
+
+def _drop_backdrop_rows(db, finding: Finding,
+                        targets: list[str] | None = None) -> list[str]:
+    """Delete backdrop rows whose file is already gone (never a file itself)."""
+    dropped = 0
+    for item in (finding.items if targets is None else targets):
+        try:
+            image_id = int(str(item).strip())
+        except (TypeError, ValueError):
+            continue
+        try:
+            row = db.delete_backdrop_image(image_id)
+            if row is not None:
+                dropped += 1
+        except Exception:
+            logger.warning("Could not drop backdrop row %s", image_id)
+    if not dropped:
+        return []
+    return [f'Removed {dropped} backdrop entr{"y" if dropped == 1 else "ies"} '
             f'whose image file is missing']
 
 

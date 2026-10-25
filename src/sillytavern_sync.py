@@ -886,6 +886,16 @@ def pull_card_from_st(st_entry: StCardEntry, db) -> PullResult:
                         "Could not migrate gallery images from superseded card %s", char_id,
                     )
                 try:
+                    # Per-character settings (VN backdrop pin & co.) are
+                    # character state too and follow the re-import.
+                    migrate_settings = getattr(db, 'migrate_card_settings', None)
+                    if migrate_settings is not None:
+                        migrate_settings(char_id, new_id)
+                except Exception:
+                    logger.warning(
+                        "Could not migrate card settings from superseded card %s", char_id,
+                    )
+                try:
                     db.remove_card(
                         char_id,
                         delete_files=False,

@@ -1,11 +1,14 @@
-"""Per-character gallery images and SillyTavern expression images.
+"""Per-character gallery images, global VN backdrops and ST expression images.
 
-Two distinct stores live here:
+Three distinct stores live here:
 
 * **Gallery** — extra images kept with the library under
   ``~/.st-explorer/gallery/<char_id>/``. Files go through the vault
   transparent I/O like every other library file, and their metadata
-  (caption, order) lives in the ``gallery_images`` table.
+  (caption, keywords, order) lives in the ``gallery_images`` table.
+* **Backdrops** — shared visual-novel backdrops under
+  ``~/.st-explorer/backdrops/``, usable by every character. Same storage
+  rules as the gallery; metadata lives in the ``backdrop_images`` table.
 * **Expressions** — SillyTavern expression images read and written
   directly in the ST user-images directory
   (``data/<user>/user/images/<charName>/<expression>.<ext>``). These are
@@ -246,6 +249,83 @@ def export_gallery_file(char_id: int, file_name: str, dest_path: str | Path) -> 
     return True
 
 
+# ---- Global backdrops (library-local, shared) ---------------------------
+
+
+def get_backdrops_dir() -> Path:
+    """Return (creating) the on-disk directory for global VN backdrops."""
+    d = _base_data_dir() / 'backdrops'
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def backdrop_image_path(file_name: str) -> Path:
+    """Full path of a stored global backdrop.
+
+    Same traversal guards as :func:`gallery_image_path`: the name is reduced
+    to its final component and checked against ``'.'`` / ``'..'`` so a
+    crafted name can never escape the backdrops folder.
+    """
+    from src.fs_utils import safe_filename_component
+    return get_backdrops_dir() / safe_filename_component(file_name)
+
+
+def import_backdrop_image(source_path: str | Path) -> dict:
+    """Copy one image into the global backdrop library.
+
+    Returns a metadata dict ``{file_name, content_hash}`` describing the
+    stored file.  Raises ``ValueError`` for non-image sources and the
+    usual OSError/vault errors on failure.
+    """
+    src = Path(source_path)
+    if not is_image_file(src):
+        raise ValueError(f'Not a supported image file: {src.name}')
+    data = vault.read_bytes(src)
+    return import_backdrop_bytes(data, src.name)
+
+
+def import_backdrop_bytes(data: bytes, name: str = 'image.png') -> dict:
+    """Store raw image *data* in the global backdrop library.
+
+    The in-memory counterpart of :func:`import_backdrop_image`, for images
+    that never existed as a file.  Same extension sniffing and naming rules
+    as the per-character gallery import.
+    """
+    if not data:
+        raise ValueError('No image data')
+    if Path(name or '').suffix.lower() not in IMAGE_EXTENSIONS:
+        suffix = sniff_image_extension(data)
+        if suffix is None:
+            raise ValueError('Not a supported image')
+        name = f'{name or "image"}{suffix}'
+    digest = content_hash(data)
+    directory = get_backdrops_dir()
+    file_name = unique_gallery_filename(directory, name)
+    vault.write_bytes(directory / file_name, data)
+    return {'file_name': file_name, 'content_hash': digest}
+
+
+def delete_backdrop_file(file_name: str) -> bool:
+    """Delete one stored global backdrop; True when a file was removed."""
+    path = backdrop_image_path(file_name)
+    try:
+        if path.is_file():
+            path.unlink()
+            return True
+    except OSError as e:
+        logger.warning("Could not delete backdrop image %s: %s", path, e)
+    return False
+
+
+def export_backdrop_file(file_name: str, dest_path: str | Path) -> bool:
+    """Copy one global backdrop out as plaintext to *dest_path*."""
+    src = backdrop_image_path(file_name)
+    if not src.is_file():
+        return False
+    vault.copy_out(src, dest_path)
+    return True
+
+
 # ---- Expressions (SillyTavern user images) -----------------------------
 
 
@@ -256,6 +336,24 @@ def resolve_user_images_dir(characters_dir: str | Path) -> Path:
     ``.../characters`` <-> ``.../user/images``.
     """
     return Path(characters_dir).parent / 'user' / 'images'
+
+
+def configured_user_images_dir() -> Optional[Path]:
+    """Return the ST user-images dir from app settings (``None`` when unset).
+
+    The explicitly configured ``st/user_images_path`` wins; otherwise the
+    directory is derived from ``st/characters_path``.  Shared by the Gallery
+    tab and the Test tab's expression sprites so both resolve the folder the
+    same way.
+    """
+    from src.settings_manager import load_st_characters_path, load_st_user_images_path
+    configured = load_st_user_images_path().strip()
+    if configured:
+        return Path(configured)
+    characters = load_st_characters_path().strip()
+    if characters:
+        return resolve_user_images_dir(characters)
+    return None
 
 
 def expression_stem_for(st_avatar_url: Optional[str], card_name: str) -> str:

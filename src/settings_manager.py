@@ -521,7 +521,78 @@ DEFAULT_TEST_SETTINGS: dict = {
     # 'system' (SillyTavern-style labelled block in the system prompt),
     # 'post_history' (block after the history), or 'history' (real turns).
     'example_placement': 'system',
+    # Test-tab presentation: 'chat' is the classic scrolling conversation,
+    # 'visual_novel' puts a gallery backdrop behind a smaller chat window.
+    'view_mode': 'chat',
+    # Which gallery image opens with a chat: first (by sort order), the
+    # latest added, or a random pick.  A pinned image (per chat or per
+    # character) takes precedence over this.
+    'vn_image_source': 'first',
+    # Which images fill the VN stage: 'both' (shared backdrops first, then
+    # the character's gallery), 'global' (shared backdrops only) or
+    # 'gallery' (the character's own gallery images only).
+    'vn_backdrop_pool': 'both',
+    # Backdrop scaling: 'contain' letterboxes, 'cover' crops to fill,
+    # 'stretch' ignores the aspect ratio.
+    'vn_image_fit': 'contain',
+    # Height share (percent) of the VN chat panel below the backdrop image.
+    'vn_chat_height_pct': 30,
+    # Opacity (percent) of the scrim behind the chat panel.
+    'vn_overlay_opacity': 60,
+    # Cycle to the next gallery image whenever an assistant reply lands.
+    'vn_advance_on_reply': False,
+    # Show the image caption and the "2/7" counter over the backdrop.
+    'vn_show_caption': True,
+    # Use the card portrait as the backdrop when the gallery is empty.
+    'vn_use_portrait_fallback': True,
+    # Expression sprites: auto-pick a SillyTavern expression image from the
+    # emotional tone of each assistant reply.
+    'vn_expression_auto': True,
+    # Classify the tone with a small LLM request instead of local keywords.
+    # Costs one extra request per reply; falls back to keywords on failure.
+    'vn_expression_llm': False,
+    # Switch the backdrop when a reply matches an image's keyword list
+    # (Gallery tab -> Edit Keywords...).  Off by default: the keywords only
+    # fire once the user has actually written some.
+    'vn_backdrop_keywords': False,
+    # Sprite alignment over the backdrop: 'left' | 'center' | 'right'.
+    'vn_sprite_position': 'center',
+    # Sprite height share (percent) of the backdrop area height.
+    'vn_sprite_height_pct': 75,
 }
+
+# Keys a character may override with its own value (see ``card_settings``).
+# They share the global key names (plus ``backdrop_file``, which is purely
+# per-character) so :func:`merge_vn_overrides` is a plain dict update.
+# Everything else in the test settings stays global.
+VN_OVERRIDE_KEYS: tuple[str, ...] = (
+    'backdrop_file',
+    'vn_image_source',
+    'vn_image_fit',
+    'vn_advance_on_reply',
+    'vn_expression_auto',
+    'vn_backdrop_keywords',
+)
+
+
+def merge_vn_overrides(global_settings: dict, overrides: dict | None) -> dict:
+    """Return *global_settings* with per-character VN overrides applied.
+
+    *overrides* is the decoded ``card_settings`` blob for one character; only
+    keys listed in :data:`VN_OVERRIDE_KEYS` are honoured and only when they
+    carry a usable value, so ``None``/absent means "keep the global setting".
+    ``backdrop_file`` has no global counterpart; it rides along in the result
+    so callers can resolve the backdrop from one dict.
+    """
+    result = dict(global_settings or {})
+    for key in VN_OVERRIDE_KEYS:
+        if not overrides or key not in overrides:
+            continue
+        value = overrides[key]
+        if value is None:
+            continue
+        result[key] = value
+    return result
 
 
 def load_test_settings() -> dict:

@@ -294,6 +294,7 @@ class ChatSessionStore:
         context_template: str | None = None,
         attributes: list[dict] | None = None,
         auto_update_attributes: bool | None = None,
+        vn_backdrop: str | None = None,
     ) -> None:
         """Write a session, preserving its original ``created_at``.
 
@@ -302,9 +303,9 @@ class ChatSessionStore:
         follows the same convention so the flag can be turned off explicitly
         without also wiping the memory list.  ``author_note`` / ``jailbreak`` /
         ``persona_id`` / ``system_template`` / ``context_template`` /
-        ``attributes`` / ``auto_update_attributes`` are likewise kept
-        unchanged when ``None``, so callers that don't manage them (import
-        paths, older code) can't wipe them.
+        ``attributes`` / ``auto_update_attributes`` / ``vn_backdrop`` are
+        likewise kept unchanged when ``None``, so callers that don't manage
+        them (import paths, older code) can't wipe them.
         """
         path = self._path(char_id, session_id)
         created_at = None
@@ -336,6 +337,8 @@ class ChatSessionStore:
                 context_template = stored_ctx if isinstance(stored_ctx, str) else ''
             if attributes is None:
                 attributes = normalize_attributes(existing)
+            if vn_backdrop is None:
+                vn_backdrop = str(existing.get('vn_backdrop') or '')
         now = datetime.now().isoformat(timespec='seconds')
         data = {
             'id': session_id,
@@ -357,6 +360,7 @@ class ChatSessionStore:
             'persona_id': persona_id or '',
             'system_template': system_template or '',
             'context_template': context_template or '',
+            'vn_backdrop': vn_backdrop or '',
             'created_at': created_at or now,
             'updated_at': now,
         }

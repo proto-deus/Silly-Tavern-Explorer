@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterable
 from typing import Any
 
 from src.card_models import CharacterCard
@@ -462,6 +463,26 @@ DEFAULT_ATTRIBUTE_UPDATE_USER = (
     'Output the updated values for any attribute that changed (or NO CHANGES).'
 )
 
+# Expression classification: pick the emotion class for one finished reply so
+# the visual-novel sprite can follow the tone. Deliberately tiny - it runs
+# once per reply and only needs a single label back.
+DEFAULT_EXPRESSION_CLASSIFY_SYSTEM = (
+    'You classify the emotional tone of a roleplay reply so a character '
+    'expression image can be chosen.\n'
+    'Rules:\n'
+    '- Reply with EXACTLY one label from the provided list.\n'
+    '- Judge the reply as a whole; actions in *asterisks* and dialogue both '
+    'count.\n'
+    '- If several labels fit, pick the most prominent one.\n'
+    '- Output only the label - no quotes, no punctuation, no explanation.'
+)
+
+DEFAULT_EXPRESSION_CLASSIFY_USER = (
+    'Available labels:\n{labels}\n\n'
+    'Reply to classify:\n{text}\n\n'
+    'Output exactly one label from the list above.'
+)
+
 # Lorebook (world info) generation prompts.
 DEFAULT_LOREBOOK_SYSTEM = (
     'You are an expert lorebook (world info) designer for roleplay AI. Given a '
@@ -543,6 +564,8 @@ PROMPT_KEYS: list[str] = [
     'memory_summary_user',
     'attribute_update_system',
     'attribute_update_user',
+    'expression_classify_system',
+    'expression_classify_user',
     'lorebook_system',
     'lorebook_user',
     'lorebook_entry_system',
@@ -571,6 +594,8 @@ _DEFAULTS: dict[str, str] = {
     'memory_summary_user': DEFAULT_MEMORY_SUMMARY_USER,
     'attribute_update_system': DEFAULT_ATTRIBUTE_UPDATE_SYSTEM,
     'attribute_update_user': DEFAULT_ATTRIBUTE_UPDATE_USER,
+    'expression_classify_system': DEFAULT_EXPRESSION_CLASSIFY_SYSTEM,
+    'expression_classify_user': DEFAULT_EXPRESSION_CLASSIFY_USER,
     'lorebook_system': DEFAULT_LOREBOOK_SYSTEM,
     'lorebook_user': DEFAULT_LOREBOOK_USER,
     'lorebook_entry_system': DEFAULT_LOREBOOK_ENTRY_SYSTEM,
@@ -615,6 +640,8 @@ PLACEHOLDERS: dict[str, tuple[str, ...]] = {
     'memory_summary_user': ('conversation',),
     'attribute_update_system': (),
     'attribute_update_user': ('attributes', 'conversation'),
+    'expression_classify_system': (),
+    'expression_classify_user': ('labels', 'text'),
     'lorebook_system': (),
     'lorebook_user': (
         'concept', 'count', 'card_context', 'existing_entries', 'length', 'extra',
@@ -973,6 +1000,32 @@ def build_attribute_update_prompts(
         user,
         attributes='\n'.join(lines) or '(none)',
         conversation=conversation or '',
+    )
+
+
+def build_expression_classify_prompts(
+    labels: Iterable[str],
+    text: str,
+    templates: dict[str, str] | None = None,
+) -> tuple[str, str]:
+    """Build the (system, user) prompts for classifying one reply's tone.
+
+    *labels* is the expression vocabulary the character actually has images
+    for - offering only those keeps the model from inventing names.  *text*
+    is the reply itself; it is capped at :data:`EXCERPT_LIMIT` characters
+    because a multi-page reply's tone is already clear from its head.
+    """
+    tmpl = templates or {}
+    system = tmpl.get('expression_classify_system') or load_prompt(
+        'expression_classify_system'
+    )
+    user = tmpl.get('expression_classify_user') or load_prompt('expression_classify_user')
+    label_list = ', '.join(str(label) for label in labels or () if str(label).strip())
+    body = (text or '')[:EXCERPT_LIMIT]
+    return substitute(system), substitute(
+        user,
+        labels=label_list or 'normal',
+        text=body,
     )
 
 

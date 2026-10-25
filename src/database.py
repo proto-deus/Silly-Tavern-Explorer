@@ -787,18 +787,57 @@ class LibraryDatabase:
                     character_id INTEGER NOT NULL,
                     file_name TEXT NOT NULL,
                     caption TEXT NOT NULL DEFAULT '',
+                    keywords TEXT NOT NULL DEFAULT '',
                     sort_order INTEGER DEFAULT 0,
                     content_hash TEXT NOT NULL DEFAULT '',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE (character_id, file_name)
                 )
             ''')
+            # Legacy databases predate the keyword column; add it in place
+            # (CREATE TABLE IF NOT EXISTS never touches an existing table).
+            cols = {row[1] for row in conn.execute(
+                'PRAGMA table_info(gallery_images)',
+            ).fetchall()}
+            if 'keywords' not in cols:
+                conn.execute(
+                    "ALTER TABLE gallery_images ADD COLUMN keywords TEXT NOT NULL DEFAULT ''",
+                )
             # The gallery pane lists per character in sort_order on every
             # load; without this every open full-scanned the table.
             conn.execute(
                 'CREATE INDEX IF NOT EXISTS idx_gallery_images_character '
                 'ON gallery_images (character_id, sort_order)'
             )
+            # Global visual-novel backdrops shared by every character:
+            # files under backdrops/, metadata here (caption, keywords,
+            # order) exactly like the per-character gallery.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS backdrop_images (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_name TEXT NOT NULL UNIQUE,
+                    caption TEXT NOT NULL DEFAULT '',
+                    keywords TEXT NOT NULL DEFAULT '',
+                    sort_order INTEGER DEFAULT 0,
+                    content_hash TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_backdrop_images_order '
+                'ON backdrop_images (sort_order)'
+            )
+            # Per-character settings (visual-novel backdrop pin, image
+            # source, ...): one JSON blob per card. A table rather than a
+            # sidecar file so the row follows card re-imports and vanishes
+            # with the card in the same transaction.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS card_settings (
+                    character_id INTEGER PRIMARY KEY,
+                    settings_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
             if schema_version < _SCHEMA_VERSION:
                 # Only ever *raise* the version: a database written by a
                 # NEWER build (a user_version above ours) must not be
@@ -1557,6 +1596,7 @@ class LibraryDatabase:
             if not preserve_related:
                 conn.execute('DELETE FROM card_collections WHERE character_id = ?', (char_id,))
                 conn.execute('DELETE FROM gallery_images WHERE character_id = ?', (char_id,))
+                conn.execute('DELETE FROM card_settings WHERE character_id = ?', (char_id,))
             conn.execute('DELETE FROM characters WHERE id = ?', (char_id,))
         logger.info("Removed card ID %s", char_id)
         # Chat sessions live on disk under sessions/<char_id>/. They are
@@ -1851,7 +1891,7 @@ class LibraryDatabase:
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                'SELECT id, character_id, file_name, caption, sort_order, '
+                'SELECT id, character_id, file_name, caption, keywords, sort_order, '
                 'content_hash, created_at FROM gallery_images '
                 'WHERE character_id = ? ORDER BY sort_order, id',
                 (char_id,),
@@ -1862,7 +1902,7 @@ class LibraryDatabase:
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                'SELECT id, character_id, file_name, caption, sort_order, '
+                'SELECT id, character_id, file_name, caption, keywords, sort_order, '
                 'content_hash, created_at FROM gallery_images WHERE id = ?',
                 (image_id,),
             ).fetchone()
@@ -1879,7 +1919,7 @@ class LibraryDatabase:
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                'SELECT id, character_id, file_name, caption, sort_order, '
+                'SELECT id, character_id, file_name, caption, keywords, sort_order, '
                 'content_hash, created_at FROM gallery_images '
                 'WHERE character_id = ? AND content_hash = ?',
                 (char_id, content_hash),
@@ -1888,6 +1928,7 @@ class LibraryDatabase:
 
     def add_gallery_image(
         self, char_id: int, file_name: str, content_hash: str = '', caption: str = '',
+        keywords: str = '',
     ) -> int:
         """Insert a gallery row; new images append at the end of the order."""
         from src.fs_utils import safe_filename_component
@@ -1903,9 +1944,10 @@ class LibraryDatabase:
             next_order = int(row[0]) if row else 0
             cursor = conn.execute(
                 'INSERT INTO gallery_images '
-                '(character_id, file_name, caption, sort_order, content_hash) '
-                'VALUES (?, ?, ?, ?, ?)',
-                (char_id, safe_name, caption or '', next_order, content_hash or ''),
+                '(character_id, file_name, caption, keywords, sort_order, content_hash) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (char_id, safe_name, caption or '', keywords or '', next_order,
+                 content_hash or ''),
             )
             new_id = cursor.lastrowid
             conn.commit()
@@ -1916,6 +1958,14 @@ class LibraryDatabase:
             conn.execute(
                 'UPDATE gallery_images SET caption = ? WHERE id = ?',
                 (caption or '', image_id),
+            )
+            conn.commit()
+
+    def set_gallery_keywords(self, image_id: int, keywords: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                'UPDATE gallery_images SET keywords = ? WHERE id = ?',
+                (keywords or '', image_id),
             )
             conn.commit()
 
@@ -1983,7 +2033,7 @@ class LibraryDatabase:
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                'SELECT id, character_id, file_name, caption, sort_order, '
+                'SELECT id, character_id, file_name, caption, keywords, sort_order, '
                 'content_hash, created_at FROM gallery_images '
                 'ORDER BY character_id, sort_order, id',
             ).fetchall()
@@ -2053,6 +2103,192 @@ class LibraryDatabase:
                     )
             conn.commit()
         return changed
+
+    # ---- global backdrop images ----
+
+    def list_backdrop_images(self) -> list[dict]:
+        """Return the global VN backdrop rows in display order."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                'SELECT id, file_name, caption, keywords, sort_order, '
+                'content_hash, created_at FROM backdrop_images '
+                'ORDER BY sort_order, id',
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_backdrop_image(self, image_id: int) -> Optional[dict]:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                'SELECT id, file_name, caption, keywords, sort_order, '
+                'content_hash, created_at FROM backdrop_images WHERE id = ?',
+                (image_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def find_backdrop_by_hash(self, content_hash: str) -> Optional[dict]:
+        """Return the backdrop row already holding *content_hash*, if any."""
+        if not content_hash:
+            return None
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                'SELECT id, file_name, caption, keywords, sort_order, '
+                'content_hash, created_at FROM backdrop_images '
+                'WHERE content_hash = ?',
+                (content_hash,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def add_backdrop_image(
+        self, file_name: str, content_hash: str = '', caption: str = '',
+        keywords: str = '',
+    ) -> int:
+        """Insert a global backdrop row; new images append at the end."""
+        from src.fs_utils import safe_filename_component
+        safe_name = safe_filename_component(file_name)
+        if not safe_name:
+            raise ValueError(f'Invalid backdrop file name: {file_name!r}')
+        with self._conn() as conn:
+            row = conn.execute(
+                'SELECT COALESCE(MAX(sort_order), -1) + 1 FROM backdrop_images',
+            ).fetchone()
+            next_order = int(row[0]) if row else 0
+            cursor = conn.execute(
+                'INSERT INTO backdrop_images '
+                '(file_name, caption, keywords, sort_order, content_hash) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (safe_name, caption or '', keywords or '', next_order,
+                 content_hash or ''),
+            )
+            new_id = cursor.lastrowid
+            conn.commit()
+        return new_id
+
+    def set_backdrop_caption(self, image_id: int, caption: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                'UPDATE backdrop_images SET caption = ? WHERE id = ?',
+                (caption or '', image_id),
+            )
+            conn.commit()
+
+    def set_backdrop_keywords(self, image_id: int, keywords: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                'UPDATE backdrop_images SET keywords = ? WHERE id = ?',
+                (keywords or '', image_id),
+            )
+            conn.commit()
+
+    def set_backdrop_order(self, ordered_ids: list[int]) -> None:
+        """Persist a drag-reordered global backdrop sequence.
+
+        Same wholesale rewrite as :meth:`set_gallery_order`: the listed ids
+        come first in order, unmentioned rows follow keeping their relative
+        order, and the result is a total order over every row.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                'SELECT id FROM backdrop_images ORDER BY sort_order, id',
+            ).fetchall()
+            own = {int(row[0]) for row in rows}
+            ordered: list[int] = []
+            seen: set[int] = set()
+            for image_id in ordered_ids or []:
+                try:
+                    image_id = int(image_id)
+                except (TypeError, ValueError):
+                    continue
+                if image_id in own and image_id not in seen:
+                    seen.add(image_id)
+                    ordered.append(image_id)
+            ordered.extend(int(row[0]) for row in rows if int(row[0]) not in seen)
+            for position, image_id in enumerate(ordered):
+                conn.execute(
+                    'UPDATE backdrop_images SET sort_order = ? WHERE id = ?',
+                    (position, image_id),
+                )
+            conn.commit()
+
+    def delete_backdrop_image(self, image_id: int) -> Optional[dict]:
+        """Remove one backdrop row and return it (for the caller's file delete)."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                'SELECT id, file_name FROM backdrop_images WHERE id = ?',
+                (image_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute('DELETE FROM backdrop_images WHERE id = ?', (image_id,))
+            conn.commit()
+            return dict(row)
+
+    # ---- per-character settings ----
+
+    def get_card_settings(self, char_id: int) -> dict:
+        """Return the character's settings blob (``{}`` when never saved).
+
+        A hand-edited or corrupted blob degrades to "no overrides" rather
+        than raising in a UI slot: the settings are cosmetic preferences and
+        the global defaults are always a valid state.
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                'SELECT settings_json FROM card_settings WHERE character_id = ?',
+                (char_id,),
+            ).fetchone()
+        if not row or not row[0]:
+            return {}
+        try:
+            parsed = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Corrupted card settings for %s; ignoring", char_id)
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def set_card_settings(self, char_id: int, settings: dict) -> None:
+        """Upsert the character's settings blob."""
+        payload = json.dumps(settings or {})
+        with self._conn() as conn:
+            conn.execute(
+                'INSERT INTO card_settings (character_id, settings_json, updated_at) '
+                'VALUES (?, ?, CURRENT_TIMESTAMP) '
+                'ON CONFLICT(character_id) DO UPDATE SET '
+                'settings_json = excluded.settings_json, '
+                'updated_at = CURRENT_TIMESTAMP',
+                (char_id, payload),
+            )
+            conn.commit()
+
+    def delete_card_settings(self, char_id: int) -> None:
+        with self._conn() as conn:
+            conn.execute('DELETE FROM card_settings WHERE character_id = ?', (char_id,))
+            conn.commit()
+
+    def migrate_card_settings(self, old_id: int, new_id: int) -> None:
+        """Re-point the settings blob from *old_id* to *new_id*.
+
+        Same story as :meth:`migrate_gallery_images`: when a superseded card
+        is re-imported under a new row id, its preferences belong to the
+        character and must follow it. An existing blob on the target wins -
+        the new row is the newer state.
+        """
+        if old_id == new_id:
+            return
+        with self._conn() as conn:
+            # INSERT OR IGNORE keeps an existing blob on the target (the new
+            # row is the newer state); the old row is dropped afterwards.
+            conn.execute(
+                'INSERT OR IGNORE INTO card_settings (character_id, settings_json, updated_at) '
+                'SELECT ?, settings_json, updated_at '
+                'FROM card_settings WHERE character_id = ?',
+                (new_id, old_id),
+            )
+            conn.execute('DELETE FROM card_settings WHERE character_id = ?', (old_id,))
+            conn.commit()
 
     # ---- SillyTavern linking ----
 
