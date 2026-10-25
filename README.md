@@ -14,6 +14,7 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 - **Library integrity check ("Doctor")** — File > Check Library audits the whole library and reports each problem with its suggested repair: cards whose file is missing, files that hold no character data any more, malformed tag values, stray files in the library folder, chat sessions belonging to deleted cards, gallery entries whose image is gone or whose folder belongs to a deleted card, SillyTavern links whose file has vanished, stale deletion records, API keys that can no longer be decrypted, and SQLite's own integrity check. **Preview Fixes** is a dry run: it lists exactly which rows would be dropped and which folders would be deleted, and you can untick the destructive ones before applying. No automatic fix ever deletes a card file, and a repair that removes a card row whose file has vanished keeps that card's chat history and gallery images. The check runs in a background thread, so the window stays responsive
 - **Command palette** — `Ctrl+K` (or `Ctrl+P`) opens a searchable list of every enabled menu action; typing filters by fuzzy subsequence and the best match is ranked first (an exact prefix beats a match at a word boundary, which beats a match anywhere), the arrow keys move the selection and `Enter` runs the action. The palette follows the active theme
 - **Card linter** — View > Check Card reports the quality problems of the selected card: empty required fields, a missing first message, an over-long description, a token budget overrun, an unbalanced example dialogue, character-book entries without content or keys, placeholder text, and text that looks like a prompt-injection attempt
+- **App settings** — the Settings > App tab holds the spell-check toggle, the application-log switch (toggling it live adds/removes the `app.log` file handler), and the UI font size (the same setting as View > Font Size...)
 - **Live token count** with debounced updates
 
 ### Library Tab
@@ -74,11 +75,12 @@ A desktop application for browsing, editing, and managing SillyTavern character 
 - **Persona pairings** — the Pairings button saves the current character together with the persona you are chatting with, so you can jump back into the right voice later; the manager can export and import the list
 - **Chat export** — export any saved chat from the Chats window as `.txt`, `.json` (messages, memories, and metadata), `.md` (Markdown), `.html` (a standalone page), or a SillyTavern `.jsonl` chat
 - **Inline formatting** rendered in distinct colors: `"dialogue"`, `*action*`, and `_emphasis_`
+- **Alternate responses** — ▶ steps through a reply's stored alternatives, ▶ (New) generates another one, and Regenerate replaces them all; Delete on a reply with alternatives removes only the currently displayed response (the others and later messages are kept)
 - **File attachments** — attach text files (`.txt`, `.md`, `.json`, `.csv`, code, etc.) or images (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`) to a message via the Attach button.
 - **Inline URL images** — image URLs in assistant responses are fetched asynchronously and shown as clickable thumbnails (click to open in browser)
 - **Chat memory** — a Memory dialog manages per-session memory entries (add/edit/delete), which are appended as a `[Chat memory]` bullet list to the system prompt (most recent 20 entries)
-- **Persistent attributes** — the Memory dialog also tracks watched story state that stays current through long roleplays (defaults: Setting, `{{char}}` mood, `{{char}}` clothing, Time & weather, `{{char}}` physical state, `{{user}}`-`{{char}}` relationship, Current activity, Who is present). "Auto-update each exchange" (on by default) asks the model after every reply which attributes changed and rewrites only those as short facts; "Update Attributes Now" runs the same pass over the whole conversation on demand. Rows are fully customizable — rename, add, remove, toggle per-row on/off, edit values by hand, and tune the "What To Watch For" hints. Current values are injected as a `[Persistent attributes]` block between the user persona and chat memory (SillyTavern prompt order; `{{char}}`/`{{user}}` macros in names are resolved; empty values are omitted), and everything is stored per chat session
-- **Auto-summarize** — toggle to automatically summarize each exchange into a memory entry after every assistant reply; "Summarize Now" summarizes the current conversation on demand
+- **Persistent attributes** — the Memory dialog also tracks watched story state that stays current through long roleplays (defaults: Setting, `{{char}}` mood, `{{char}}` clothing, Time & weather, `{{char}}` physical state, `{{user}}`-`{{char}}` relationship, Current activity, Who is present). "Auto-update each exchange" (on by default) asks the model after every reply which attributes changed and rewrites only those as short facts; "Update Now" runs the same pass over the whole conversation on demand. Rows are fully customizable — rename, add, remove, toggle per-row on/off, edit values by hand, and tune the "What To Watch For" hints. Current values are injected as a `[Persistent attributes]` block between the user persona and chat memory (SillyTavern prompt order; `{{char}}`/`{{user}}` macros in names are resolved; empty values are omitted), and everything is stored per chat session
+- **Auto-memory** — the Auto-Memory toggle automatically summarizes each exchange into a memory entry after every assistant reply; "Summarize Now" summarizes the current conversation on demand
 - **Auto-saved chats** — each card's conversation is saved automatically (JSON files under `~/.st-explorer/sessions/`); a **Chats** button opens a popup to load, export, import, or delete saved chats (with title, message count, and timestamps), and **New Chat** starts fresh
 - **Macros** — `{{time}}`, `{{date}}`, `{{datetime}}`, `{{random:a|b|c}}` / `{{pick: a, b}}`, and dice rolls `{{roll: 2d6+3}}` on top of `{{user}}` / `{{char}}` and custom macros
 - **Persona manager** — named `{{user}}` personas (name + description) with a per-chat selection, injected as the `[User persona]` block
@@ -152,7 +154,7 @@ python main.py
 3. Pick a system prompt from the **System Prompt** dropdown (Natural Chat, Simple Roleplay, ...) or keep Custom; create your own in **Settings > Prompts > Manage System Prompts...**. Optionally pick a **Context** template (framing/names/example formatting) or manage them in **Settings > Prompts > Manage Context Templates...**
 4. Type a message and press Enter — responses stream back token-by-token
 5. Use **Regenerate** to redo the last reply or **Cancel** to interrupt an in-flight response
-6. Use **Attach** to add text/image files, and the **Memory** button to manage persistent memory (or toggle **Auto-Summarize**)
+6. Use **Attach** to add text/image files, and the **Memory** button to manage persistent memory (or toggle **Auto-Memory**)
 7. Chats auto-save per character; use **Chats** to load, export, import, or delete past conversations
 8. Click **Prompt** to see the exact prompt the next request will send - every block with its token cost, the context-pressure meter and the payload that would be posted
 
@@ -265,7 +267,7 @@ is unaffected and stays an instruction.
 - AI-generated cards: `~/.st-explorer/generated/`
 - Standalone lorebooks: `~/.st-explorer/lorebooks/*.json`
 - Chat sessions: `~/.st-explorer/sessions/` (one JSON file per card per session)
-- Application log: `~/.st-explorer/app.log`
+- Application log: `~/.st-explorer/app.log` (written only while enabled in Settings > App)
 - Spell-check word list: `~/.st-explorer/spellcheck.json` (words added to / ignored by the personal dictionary)
 - Lorebook sync baseline: `~/.st-explorer/lorebook_sync_state.json`
 - API-key encryption key (macOS/Linux only): `~/.st-explorer/secret.key` (created on first save, owner-only permissions)

@@ -7,17 +7,25 @@ from src.app_paths import data_dir
 
 
 def _setup_logging() -> None:
-    log_dir = data_dir()
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / 'app.log'
+    # The file handler only when the app log is enabled (Settings > App);
+    # the console stream is always attached.
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    try:
+        from src.settings_manager import load_logging_enabled
+        enabled = load_logging_enabled()
+    except Exception:
+        enabled = True
+    if enabled:
+        log_dir = data_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            logging.FileHandler(log_dir / 'app.log', encoding='utf-8'),
+        )
 
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        handlers=[
-            logging.FileHandler(log_file, encoding='utf-8'),
-            logging.StreamHandler(sys.stdout),
-        ],
+        handlers=handlers,
     )
 
 
