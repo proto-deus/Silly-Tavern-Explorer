@@ -2247,7 +2247,7 @@ class TestTab(QWidget):
         self._response_mode = 'assistant'
         worker = self._worker
         self._worker = None
-        if worker is not None:
+        if worker is not None and self._worker_is_alive(worker):
             # The worker's run() may already have emitted its result when the
             # user presses Cancel; without disconnecting, the queued
             # completed/error would land after this call and append a second
@@ -2265,10 +2265,17 @@ class TestTab(QWidget):
             # still be a few instructions from returning: keep the worker
             # referenced until the thread has really finished.
             self._retire_worker(worker)
-        # Remove the streaming placeholder widget too: only _on_response
-        # dropped it before, so cancelling a generation left a phantom
-        # bubble on screen (and one more bubble than messages) until some
-        # later action happened to rebuild the history.
+        # A worker whose thread already stopped is skipped on purpose: the
+        # finished hookup (deleteLater) may have destroyed its C++ object,
+        # and touching the wrapper then raises RuntimeError - an exception
+        # escaping this slot aborted the rest of the cleanup and left the
+        # streaming bubble (empty or partial, with greyed-out buttons) on
+        # screen after every fast cancel. A stopped worker cannot emit
+        # anything new, so there is nothing left to disconnect.
+        # Drop the streaming placeholder on every finish (not just in
+        # _on_response): cancelling a generation must not leave a phantom
+        # bubble on screen (one more bubble than messages) until some later
+        # action happened to rebuild the history.
         self._drop_stream_bubble()
         restored = self._restore_interrupted_response()
         self._send_btn.setEnabled(True)
