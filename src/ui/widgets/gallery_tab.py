@@ -203,18 +203,6 @@ if QWidget is not None:
             self._panes = QTabWidget()
             layout.addWidget(self._panes, 1)
 
-            self._backdrop_list = self._make_list(drag_reorder=True)
-            self._backdrop_list.itemDoubleClicked.connect(self._on_backdrop_double_clicked)
-            self._backdrop_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            self._backdrop_list.customContextMenuRequested.connect(self._on_backdrop_menu)
-            self._backdrop_list.reordered.connect(lambda: self._on_rows_moved(self._backdrop_list))
-            self._backdrop_hint = QLabel('')
-            self._backdrop_hint.setWordWrap(True)
-            self._backdrop_hint.setStyleSheet('color: #888;')
-            self._panes.addTab(self._wrap_with_hint(
-                self._backdrop_hint, self._backdrop_list,
-            ), 'Backdrops')
-
             self._gallery_list = self._make_list(drag_reorder=True)
             self._gallery_list.itemDoubleClicked.connect(self._on_gallery_double_clicked)
             self._gallery_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -223,9 +211,10 @@ if QWidget is not None:
             self._gallery_hint = QLabel('')
             self._gallery_hint.setWordWrap(True)
             self._gallery_hint.setStyleSheet('color: #888;')
-            self._panes.addTab(self._wrap_with_hint(
+            self._gallery_pane = self._wrap_with_hint(
                 self._gallery_hint, self._gallery_list,
-            ), 'Gallery')
+            )
+            self._panes.addTab(self._gallery_pane, 'Gallery')
 
             expr_pane = QWidget()
             expr_layout = QVBoxLayout(expr_pane)
@@ -242,11 +231,23 @@ if QWidget is not None:
             self._panes.addTab(expr_pane, 'Expressions')
 
             self._assets_list = self._make_list()
-            self._assets_list.itemDoubleClicked.connect(self._on_asset_double_clicked)
             self._panes.addTab(self._wrap_with_hint(
                 QLabel('Declared V3 assets for this card (read-only).'),
                 self._assets_list,
             ), 'Card Assets')
+
+            self._backdrop_list = self._make_list(drag_reorder=True)
+            self._backdrop_list.itemDoubleClicked.connect(self._on_backdrop_double_clicked)
+            self._backdrop_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self._backdrop_list.customContextMenuRequested.connect(self._on_backdrop_menu)
+            self._backdrop_list.reordered.connect(lambda: self._on_rows_moved(self._backdrop_list))
+            self._backdrop_hint = QLabel('')
+            self._backdrop_hint.setWordWrap(True)
+            self._backdrop_hint.setStyleSheet('color: #888;')
+            self._backdrop_pane = self._wrap_with_hint(
+                self._backdrop_hint, self._backdrop_list,
+            )
+            self._panes.addTab(self._backdrop_pane, 'Backdrops')
 
             self._panes.currentChanged.connect(lambda _i: self._update_actions())
             self.setAcceptDrops(True)
@@ -289,6 +290,12 @@ if QWidget is not None:
 
         def showEvent(self, event) -> None:
             super().showEvent(event)
+            # Entering the tab always opens on the card gallery (Backdrops
+            # used to be the first tab, so it was what "Gallery" showed).
+            # The pane a user picked inside the tab still applies until they
+            # leave and come back.
+            if self._panes.currentWidget() is not self._gallery_pane:
+                self._panes.setCurrentWidget(self._gallery_pane)
             if self._load_pending:
                 self._load_pending = False
                 self.refresh()
@@ -331,8 +338,7 @@ if QWidget is not None:
 
         def _active_pane(self) -> str:
             """Which store the header actions and drops should target."""
-            index = self._panes.currentIndex()
-            if index == 0:
+            if self._panes.currentWidget() is self._backdrop_pane:
                 return 'backdrops'
             return 'gallery'
 
