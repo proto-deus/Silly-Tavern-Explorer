@@ -1235,6 +1235,16 @@ class _TestPanel(QWidget):
         self._example_placement.setCurrentIndex(idx if idx >= 0 else 0)
         placement_row.addWidget(self._example_placement, 1)
         options_layout.addLayout(placement_row)
+
+        self._style_variation = QCheckBox('Vary reply style each turn')
+        self._style_variation.setChecked(bool(settings.get('style_variation', True)))
+        self._style_variation.setToolTip(
+            'Rotate a small style directive into each reply (opening, '
+            'rhythm, focus) so consecutive messages do not follow the same '
+            'structure.\n'
+            'The Test tab shows a Vary toggle for quick switching.'
+        )
+        options_layout.addWidget(self._style_variation)
         layout.addWidget(options_group)
 
         vn_group = QGroupBox('Visual Novel Mode')
@@ -1393,6 +1403,7 @@ class _TestPanel(QWidget):
             'auto_scroll': self._auto_scroll.isChecked(),
             'include_first_message': self._include_first.isChecked(),
             'example_placement': self._example_placement.currentData(),
+            'style_variation': self._style_variation.isChecked(),
             'view_mode': self._view_mode.currentData(),
             'vn_image_source': self._vn_image_source.currentData(),
             'vn_backdrop_pool': self._vn_backdrop_pool.currentData(),
