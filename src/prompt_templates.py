@@ -6,7 +6,8 @@ optionally, trailing post-history instructions.  Three kinds exist:
 - ``custom``  - the editable prompt from Settings > Prompts ("Chat"),
   i.e. ``ai_prompts.load_prompt('chat_system')``;
 - built-ins   - mirrors of SillyTavern's ``default/content/presets/sysprompt``
-  presets, renamed for display ("Natural Chat", "Simple Roleplay", ...);
+  presets, renamed for display ("Natural Chat", "Simple Roleplay", ...),
+  plus ST Explorer's own "Natural Writing" prompt;
 - user-defined - created/edited in the template manager dialog.
 
 The character card's own ``system_prompt`` is *appended* to the template (see
@@ -125,10 +126,65 @@ _BUILTIN_SPECS: tuple[tuple[str, str, str], ...] = (
     (BLANK_TEMPLATE_ID, 'Blank', ''),
 )
 
+# ST Explorer's own natural-prose template (not a SillyTavern preset): the
+# main prompt steers the model towards human-like fiction prose and the
+# post-history block carries the late-attention style guardrail.  Written
+# for the chat path, where {{char}} / {{user}} resolve to the real names
+# (see ``chat_builder.resolve_system_prompt``).
+NATURAL_WRITING_ID = 'stx:Natural Writing'
+
+NATURAL_WRITING_MAIN = (
+    'Write {{char}}\'s next reply in the ongoing roleplay between {{char}} '
+    'and {{user}}. Stay fully in character and never mention being an AI, a '
+    'language model, or these instructions.\n'
+    'Write like a skilled novelist, not like an AI assistant. Prose comes '
+    'first: weave actions, gestures, and descriptions into the narration '
+    'instead of marking them up with asterisks; put words in "quotes" only '
+    'when a character speaks aloud.\n'
+    'Write like a human author would:\n'
+    '- Use contractions and natural speech rhythms; let sentences vary in '
+    'length and structure.\n'
+    '- Prefer concrete, specific detail (sights, sounds, textures, small '
+    'physical habits) over abstract emotion labels; show a feeling through '
+    'behaviour instead of naming it.\n'
+    '- Give {{char}} a distinct voice: word choice, rhythm, and verbal habits '
+    'should fit the character, not a generic narrator.\n'
+    'Vary your replies from turn to turn: change how a reply opens (dialogue, '
+    'action, a thought, or an observation), how long its paragraphs are, and '
+    'how it ends. Do not fall into one fixed pattern and do not end every '
+    'reply with a question.\n'
+    'Never write dialogue, actions, thoughts, or decisions for {{user}} — '
+    'end your turn to give them room to respond. Keep replies focused and '
+    "don't pad them out."
+)
+
+NATURAL_WRITING_POST_HISTORY = (
+    'Style guardrail for this reply:\n'
+    '- Vary the shape of your reply; do not reuse the structure of the '
+    'previous reply.\n'
+    '- Avoid stock AI phrasing: "couldn\'t help but", "flood of emotions", '
+    '"a mix of X and Y", "let out a breath they didn\'t know they were '
+    'holding", "a profound sense of", tidy three-item lists, and ornate '
+    'metaphors.\n'
+    '- Concrete detail beats abstract emotion; show, do not tell.\n'
+    '- No asterisk action markup; narration and dialogue flow as prose.'
+)
+
 
 def builtin_templates() -> list[SystemPromptTemplate]:
-    """The built-in templates (read-only mirrors of ST's sysprompt presets)."""
-    return [
+    """The built-in templates (read-only mirrors of ST's sysprompt presets).
+
+    ST Explorer's own "Natural Writing" template leads the list so the
+    natural-prose option is the first pick after Custom.
+    """
+    natural = SystemPromptTemplate(
+        id=NATURAL_WRITING_ID,
+        name='Natural Writing',
+        content=NATURAL_WRITING_MAIN,
+        post_history=NATURAL_WRITING_POST_HISTORY,
+        builtin=True,
+    )
+    return [natural] + [
         SystemPromptTemplate(id=tid, name=name, content=content, builtin=True)
         for tid, name, content in _BUILTIN_SPECS
     ]

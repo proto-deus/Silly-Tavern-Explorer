@@ -521,6 +521,10 @@ DEFAULT_TEST_SETTINGS: dict = {
     # 'system' (SillyTavern-style labelled block in the system prompt),
     # 'post_history' (block after the history), or 'history' (real turns).
     'example_placement': 'system',
+    # Rotate a small per-reply style directive (opening, rhythm, focus) into
+    # the trailing instructions so consecutive replies do not follow the
+    # same structure.
+    'style_variation': True,
     # Test-tab presentation: 'chat' is the classic scrolling conversation,
     # 'visual_novel' puts a gallery backdrop behind a smaller chat window.
     'view_mode': 'chat',
