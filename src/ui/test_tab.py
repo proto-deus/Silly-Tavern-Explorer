@@ -85,6 +85,7 @@ from src.settings_manager import (
     save_active_sampling,
     save_test_settings,
 )
+from src.style_cues import StyleCuePicker
 from src.token_counter import count_tokens
 from src.ui.spell_check import SpellCheckTextEdit
 from src.ui.styles import ui_font_px
@@ -658,6 +659,12 @@ class TestTab(QWidget):
         self._summarized_through = 0
         # Seed bump applied per regeneration so fixed seeds still vary.
         self._regen_bump = 0
+        # Per-reply style cue rotation (Test settings 'style_variation'):
+        # one short directive per reply so consecutive replies do not fall
+        # into the same structure.  The picker peeks/consumes so the Context
+        # Inspector previews exactly the note the next request will send.
+        self._style_variation = True
+        self._style_picker = StyleCuePicker()
         # Alternate responses (swipes): while a regenerate/try-again is in
         # flight, _regen_tried holds every previously generated text for the
         # slot and _regen_replaced stashes the removed message dict so a
@@ -732,6 +739,12 @@ class TestTab(QWidget):
         self._example_placement = (
             placement if placement in ('system', 'post_history', 'history') else 'system'
         )
+        self._style_variation = bool(settings.get('style_variation', True))
+        check = getattr(self, '_vary_check', None)
+        if check is not None and check.isChecked() != self._style_variation:
+            check.blockSignals(True)
+            check.setChecked(self._style_variation)
+            check.blockSignals(False)
         view = settings.get('view_mode', 'chat')
         self._view_mode = view if view in ('chat', 'visual_novel') else 'chat'
 
@@ -859,6 +872,28 @@ class TestTab(QWidget):
             source, self._user_name,
             self._card.name if self._card else '', self._custom_macros,
         )
+
+    def _style_note(self, consume: bool = False) -> str:
+        """Rotating per-reply style directive ('' = none).
+
+        The rotation advances when *consume* is set (a generation starts);
+        without it the picker peeks, so the Context Inspector previews
+        exactly the note the next request will send.
+        """
+        if not self._style_variation or self._card is None:
+            return ''
+        cue = self._style_picker.next() if consume else self._style_picker.peek()
+        text = substitute_macros(
+            cue, self._user_name, self._card.name, self._custom_macros,
+        )
+        return f'Style note for this reply only: {text}'
+
+    def _on_vary_toggled(self, on: bool) -> None:
+        """Persist the style-variation toggle (same write-through as view mode)."""
+        self._style_variation = bool(on)
+        settings = load_test_settings()
+        settings['style_variation'] = self._style_variation
+        save_test_settings(settings)
 
     def _effective_preset(self) -> APIPreset:
         """Preset for the next chat request: per-chat overrides + seed bump."""
@@ -1153,6 +1188,17 @@ class TestTab(QWidget):
         self._minp_override.valueChanged.connect(self._on_sampling_changed)
         settings_row.addWidget(self._minp_override)
         self._refresh_min_p_tooltip()
+        self._vary_check = QCheckBox('Vary')
+        self._vary_check.setChecked(self._style_variation)
+        self._vary_check.setToolTip(
+            'Rotate a small style directive into each reply (opening, '
+            'rhythm, focus) so consecutive messages do not follow the same '
+            'structure.\n'
+            'The directive for the next reply is shown in the Context '
+            'Inspector.'
+        )
+        self._vary_check.toggled.connect(self._on_vary_toggled)
+        settings_row.addWidget(self._vary_check)
         settings_row.addStretch()
         right_layout.addLayout(settings_row)
 
@@ -2061,6 +2107,10 @@ class TestTab(QWidget):
         self._summarize_evicted(system, api_history, injections)
         ctx_template = self._ctx_template()
         jailbreak = self._jailbreak_text()
+        if mode == 'assistant':
+            note = self._style_note(consume=True)
+            if note:
+                jailbreak = f'{jailbreak}\n\n{note}' if jailbreak.strip() else note
         mode_prompt = self._mode_prompt(mode)
         if mode_prompt:
             jailbreak = f'{jailbreak}\n\n{mode_prompt}' if jailbreak.strip() else mode_prompt
@@ -2723,6 +2773,11 @@ class TestTab(QWidget):
         # from the argument, not from the stored value: the Context
         # Inspector previews the *edited* text before it is applied.
         rendered_jailbreak = self._jailbreak_text(jailbreak)
+        note = self._style_note(consume=False)
+        if note:
+            rendered_jailbreak = (
+                f'{rendered_jailbreak}\n\n{note}' if rendered_jailbreak.strip() else note
+            )
         if rendered_jailbreak.strip():
             rendered_jailbreak = context_templates.render_jailbreak(
                 ctx_template, rendered_jailbreak,
