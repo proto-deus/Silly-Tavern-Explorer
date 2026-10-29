@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from src import ai_prompts
 from src.prompt_templates import (
     CUSTOM_TEMPLATE_ID,
     SystemPromptTemplate,
@@ -30,10 +31,10 @@ from src.ui.spell_check import SpellCheckPlainTextEdit
 class SystemTemplateDialog(QDialog):
     """Manage the system prompt templates offered by the Test tab.
 
-    Lists the "Custom" prompt (edited in Settings > Prompts > Chat), the
-    built-in SillyTavern-style presets, and user-defined templates.  Built-ins
-    are read-only - Duplicate creates an editable copy.  User templates are
-    persisted on accept.
+    Lists the "Custom" prompt (backed by the editable ``chat_system``
+    template), the built-in SillyTavern-style presets, and user-defined
+    templates.  Built-ins are read-only - Duplicate creates an editable
+    copy.  User templates and the Custom prompt are persisted on accept.
     """
 
     def __init__(self, parent: QWidget | None = None):
@@ -83,7 +84,17 @@ class SystemTemplateDialog(QDialog):
         self._name = QLineEdit()
         self._name.textEdited.connect(self._sync_current)
         right.addWidget(self._name)
-        right.addWidget(QLabel('System prompt:'))
+        content_label_row = QHBoxLayout()
+        content_label_row.addWidget(QLabel('System prompt:'))
+        content_label_row.addStretch()
+        self._reset_btn = QPushButton('Reset to Default')
+        self._reset_btn.setToolTip(
+            'Restore the built-in Custom prompt.\n'
+            'The change is only written when the dialog is saved.'
+        )
+        self._reset_btn.clicked.connect(self._on_reset_custom)
+        content_label_row.addWidget(self._reset_btn)
+        right.addLayout(content_label_row)
         self._content = SpellCheckPlainTextEdit()
         self._content.setPlaceholderText(
             "e.g. You're {{char}} in this fictional roleplay with {{user}}."
@@ -127,6 +138,10 @@ class SystemTemplateDialog(QDialog):
 
     @staticmethod
     def _is_editable(tpl: SystemPromptTemplate) -> bool:
+        return not tpl.builtin or tpl.id == CUSTOM_TEMPLATE_ID
+
+    @staticmethod
+    def _is_deletable(tpl: SystemPromptTemplate) -> bool:
         return not tpl.builtin
 
     def _on_row_changed(self, row: int) -> None:
@@ -142,14 +157,25 @@ class SystemTemplateDialog(QDialog):
         self._loading = False
 
         editable = self._is_editable(tpl)
-        self._name.setReadOnly(not editable)
+        deletable = self._is_deletable(tpl)
+        self._name.setReadOnly(not deletable)
         self._content.setReadOnly(not editable)
-        self._post_history.setReadOnly(not editable)
-        self._delete_btn.setEnabled(editable)
+        self._post_history.setReadOnly(
+            not editable or tpl.id == CUSTOM_TEMPLATE_ID
+        )
+        self._delete_btn.setEnabled(deletable)
+        self._reset_btn.setVisible(tpl.id == CUSTOM_TEMPLATE_ID)
         if tpl.id == CUSTOM_TEMPLATE_ID:
+            placeholders = ', '.join(
+                '{' + p + '}'
+                for p in ai_prompts.PLACEHOLDERS.get('chat_system', ())
+            )
             self._note.setText(
-                'The "Custom" system prompt is edited in Settings > Prompts '
-                '("Chat"), shared with the other AI prompts.'
+                'The "Custom" prompt is the chat\'s main prompt when the '
+                'System prompt dropdown is set to Custom. Card placeholders '
+                f'({placeholders}) and {{user}} / {{char}} macros are '
+                'substituted at send time. Post-history instructions are '
+                'not supported for Custom.'
             )
         elif tpl.builtin:
             self._note.setText(
@@ -168,16 +194,34 @@ class SystemTemplateDialog(QDialog):
         tpl = self._templates[row]
         if not self._is_editable(tpl):
             return
-        self._templates[row] = SystemPromptTemplate(
-            id=tpl.id,
-            name=self._name.text().strip() or 'Template',
-            content=self._content.toPlainText(),
-            post_history=self._post_history.toPlainText(),
-            builtin=False,
-        )
+        if tpl.id == CUSTOM_TEMPLATE_ID:
+            self._templates[row] = SystemPromptTemplate(
+                id=CUSTOM_TEMPLATE_ID,
+                name='Custom',
+                content=self._content.toPlainText(),
+                post_history='',
+                builtin=True,
+            )
+        else:
+            self._templates[row] = SystemPromptTemplate(
+                id=tpl.id,
+                name=self._name.text().strip() or 'Template',
+                content=self._content.toPlainText(),
+                post_history=self._post_history.toPlainText(),
+                builtin=False,
+            )
         self._loading = True
         self._list.item(row).setText(self._label_for(self._templates[row]))
         self._loading = False
+
+    def _on_reset_custom(self) -> None:
+        """Restore the built-in Custom prompt text (pending Save)."""
+        row = self._list.currentRow()
+        if not (0 <= row < len(self._templates)):
+            return
+        if self._templates[row].id != CUSTOM_TEMPLATE_ID:
+            return
+        self._content.setPlainText(ai_prompts.default_prompt('chat_system'))
 
     def _add_user_template(self, tpl: SystemPromptTemplate, select: bool = True) -> None:
         self._templates.append(tpl)
@@ -215,7 +259,7 @@ class SystemTemplateDialog(QDialog):
         if not (0 <= row < len(self._templates)):
             return
         tpl = self._templates[row]
-        if not self._is_editable(tpl):
+        if not self._is_deletable(tpl):
             return
         answer = QMessageBox.question(
             self, 'Delete Template',
@@ -231,4 +275,8 @@ class SystemTemplateDialog(QDialog):
 
     def _save(self) -> None:
         save_user_templates([t for t in self._templates if not t.builtin])
+        for tpl in self._templates:
+            if tpl.id == CUSTOM_TEMPLATE_ID:
+                ai_prompts.save_prompt('chat_system', tpl.content)
+                break
         self.accept()

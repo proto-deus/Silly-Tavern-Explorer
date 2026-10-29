@@ -8,12 +8,10 @@ combo box.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QTextOption
 from PyQt6.QtWidgets import (
-    QHBoxLayout,
     QLabel,
     QPlainTextEdit,
-    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -88,28 +86,16 @@ class _PromptTab(QWidget):
         self._warning.setVisible(False)
         layout.addWidget(self._warning)
 
-        btn_row = QHBoxLayout()
-        reset_btn = QPushButton('Reset to Default')
-        reset_btn.setToolTip(
-            'Restore the built-in template.\n'
-            'The change is only written when the settings are saved.'
+        # Read-only word-wrapped box instead of a label: long previews get
+        # scrollbars instead of stretching the settings page.
+        self._preview_box = QPlainTextEdit()
+        self._preview_box.setReadOnly(True)
+        self._preview_box.setWordWrapMode(QTextOption.WrapMode.WordWrap)
+        self._preview_box.setStyleSheet(
+            'QPlainTextEdit { color: #b0b0b0; background-color: #222; '
+            'border: none; border-radius: 4px; padding: 6px; }'
         )
-        reset_btn.clicked.connect(self._reset)
-        btn_row.addWidget(reset_btn)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        self._preview_label = QLabel('')
-        self._preview_label.setWordWrap(True)
-        self._preview_label.setTextFormat(Qt.TextFormat.PlainText)
-        self._preview_label.setStyleSheet(
-            'color: #b0b0b0; background-color: #222; '
-            'border-radius: 4px; padding: 6px;'
-        )
-        self._preview_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse,
-        )
-        layout.addWidget(self._preview_label, 1)
+        layout.addWidget(self._preview_box, 1)
 
         self._refresh()
 
@@ -124,7 +110,7 @@ class _PromptTab(QWidget):
             return 'This template has no placeholders.'
         return 'Placeholders: ' + ', '.join('{' + p + '}' for p in allowed)
 
-    def _reset(self) -> None:
+    def reset_to_default(self) -> None:
         """Restore the built-in templates in the editors.
 
         Nothing is written to the settings here: the dialog saves every
@@ -228,9 +214,6 @@ class _PromptTab(QWidget):
         if 'continue_user' in templates:
             user_p = _preview_mode_prompt(templates['continue_user'])
             return [f'--- User ---\n{user_p}']
-        if 'chat_system' in templates:
-            sys_p = ai_prompts.build_chat_system(_SAMPLE_CARD, templates)
-            return [f'--- System ---\n{sys_p}']
         return []
 
     def _preview(self) -> None:
@@ -238,7 +221,7 @@ class _PromptTab(QWidget):
         parts = self._build_preview(templates)
         text = '\n\n'.join(parts)
         if not text:
-            self._preview_label.setText('(no preview for this template)')
+            self._preview_box.setPlainText('(no preview for this template)')
             return
         tokens = 0
         try:
@@ -247,7 +230,7 @@ class _PromptTab(QWidget):
         except Exception:
             tokens = 0
         cost = f'\n\n[~{tokens:,} tokens]' if tokens else ''
-        self._preview_label.setText(text + cost)
+        self._preview_box.setPlainText(text + cost)
 
     def get_templates(self) -> dict[str, str]:
         return {key: edit.toPlainText() for key, edit in self._edits.items()}

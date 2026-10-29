@@ -986,15 +986,14 @@ class _PromptsPanel(QWidget):
             "Main prompt used for Test chats: the selected system prompt is "
             "the first system block, and the character's own system prompt is "
             "appended after it.\n"
-            'The "Custom" entry is the editable Chat prompt below.'
+            'The "Custom" entry is edited via Manage System Prompts...'
         )
         self._refresh_template_combo()
         template_row.addWidget(self._template_combo)
         manage_btn = QPushButton('Manage System Prompts...')
         manage_btn.setToolTip(
-            'Create, edit, or delete named system prompts\n'
-            '(Natural Chat, Simple Roleplay, ...) and their post-history '
-            'instructions.'
+            'Create, edit, or delete system prompts (Custom, Natural Chat, '
+            'Simple Roleplay, ...) and their post-history instructions.'
         )
         manage_btn.clicked.connect(self._on_manage_templates)
         template_row.addWidget(manage_btn)
@@ -1046,7 +1045,6 @@ class _PromptsPanel(QWidget):
         self._stack = QStackedWidget()
         prompt_groups = [
             [
-                ('Chat', ['chat_system']),
                 ('Impersonate', ['impersonate_user', 'continue_user']),
             ],
             [
