@@ -6,7 +6,7 @@ import traceback
 
 import requests
 from PyQt6.QtCore import QThread, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QStandardItemModel
 from PyQt6.QtWidgets import (
     QCheckBox,
     QColorDialog,
@@ -975,6 +975,9 @@ class _PromptsPanel(QWidget):
 
         layout = QVBoxLayout(self)
 
+        framing_group = QGroupBox('Chat Framing')
+        framing_layout = QVBoxLayout(framing_group)
+
         template_row = QHBoxLayout()
         template_row.addWidget(QLabel('System prompt:'))
         self._template_combo = QComboBox()
@@ -996,7 +999,7 @@ class _PromptsPanel(QWidget):
         manage_btn.clicked.connect(self._on_manage_templates)
         template_row.addWidget(manage_btn)
         template_row.addStretch()
-        layout.addLayout(template_row)
+        framing_layout.addLayout(template_row)
 
         context_row = QHBoxLayout()
         context_row.addWidget(QLabel('Context template:'))
@@ -1018,38 +1021,81 @@ class _PromptsPanel(QWidget):
         manage_ctx_btn.clicked.connect(self._on_manage_context_templates)
         context_row.addWidget(manage_ctx_btn)
         context_row.addStretch()
-        layout.addLayout(context_row)
+        framing_layout.addLayout(context_row)
+
+        layout.addWidget(framing_group)
+
+        editor_group = QGroupBox('Prompt Templates')
+        editor_layout = QVBoxLayout(editor_group)
 
         selector_row = QHBoxLayout()
         selector_row.addWidget(QLabel('Edit prompt:'))
         self._prompt_combo = QComboBox()
         self._prompt_combo.setMinimumWidth(180)
         selector_row.addWidget(self._prompt_combo)
+        self._reset_page_btn = QPushButton('Reset')
+        self._reset_page_btn.setToolTip(
+            'Restore the built-in templates for the selected prompt page.\n'
+            'The change is only written when the settings are saved.'
+        )
+        self._reset_page_btn.clicked.connect(self.reset_current_page)
+        selector_row.addWidget(self._reset_page_btn)
         selector_row.addStretch()
-        layout.addLayout(selector_row)
+        editor_layout.addLayout(selector_row)
 
         self._stack = QStackedWidget()
-        prompts = [
-            ('Tags', ['tags_system', 'tags_user']),
-            ('Missing Tags', ['missing_tags_system', 'missing_tags_user']),
-            ('Summary', ['summary_system', 'summary_user']),
-            ('Alt Greetings', ['alt_greetings_system', 'alt_greetings_user']),
-            ('Fill Fields', ['fill_system', 'fill_user']),
-            ('Wizard', ['wizard_system', 'wizard_user']),
-            ('Chat', ['chat_system']),
-            ('Character', ['character_system', 'character_user']),
-            ('Impersonate', ['impersonate_user', 'continue_user']),
-            ('Memory', ['memory_summary_system', 'memory_summary_user']),
-            ('Attributes', ['attribute_update_system', 'attribute_update_user']),
-            ('Expression', ['expression_classify_system', 'expression_classify_user']),
-            ('Lorebook', ['lorebook_system', 'lorebook_user']),
-            ('Lorebook Entry', ['lorebook_entry_system', 'lorebook_entry_user']),
+        prompt_groups = [
+            [
+                ('Chat', ['chat_system']),
+                ('Impersonate', ['impersonate_user', 'continue_user']),
+            ],
+            [
+                ('Character', ['character_system', 'character_user']),
+                ('Wizard', ['wizard_system', 'wizard_user']),
+                ('Fill Fields', ['fill_system', 'fill_user']),
+                ('Tags', ['tags_system', 'tags_user']),
+                ('Missing Tags', ['missing_tags_system', 'missing_tags_user']),
+                ('Alt Greetings', ['alt_greetings_system', 'alt_greetings_user']),
+            ],
+            [
+                ('Summary', ['summary_system', 'summary_user']),
+                ('Memory', ['memory_summary_system', 'memory_summary_user']),
+                ('Attributes', ['attribute_update_system', 'attribute_update_user']),
+                ('Expression', ['expression_classify_system', 'expression_classify_user']),
+            ],
+            [
+                ('Lorebook', ['lorebook_system', 'lorebook_user']),
+                ('Lorebook Entry', ['lorebook_entry_system', 'lorebook_entry_user']),
+            ],
         ]
-        for name, keys in prompts:
-            self._prompt_combo.addItem(name)
-            self._stack.addWidget(_PromptTab(name, keys))
-        self._prompt_combo.currentIndexChanged.connect(self._stack.setCurrentIndex)
-        layout.addWidget(self._stack)
+        for index, pages in enumerate(prompt_groups):
+            if index:
+                self._insert_prompt_separator()
+            for name, keys in pages:
+                self._prompt_combo.addItem(name, self._stack.count())
+                self._stack.addWidget(_PromptTab(name, keys))
+        self._prompt_combo.currentIndexChanged.connect(self._on_prompt_selected)
+        editor_layout.addWidget(self._stack)
+        layout.addWidget(editor_group)
+
+    def _insert_prompt_separator(self) -> None:
+        """Insert a non-selectable divider between the prompt groups."""
+        model = self._prompt_combo.model()
+        self._prompt_combo.insertSeparator(self._prompt_combo.count())
+        if isinstance(model, QStandardItemModel):
+            item = model.item(self._prompt_combo.count() - 1)
+            if item is not None:
+                item.setEnabled(False)
+
+    def _on_prompt_selected(self, index: int) -> None:
+        """Switch to the page stored on the combo item (separators skip)."""
+        stack_index = self._prompt_combo.itemData(index)
+        if stack_index is not None:
+            self._stack.setCurrentIndex(int(stack_index))
+
+    def reset_current_page(self) -> None:
+        """Restore the built-in templates for the page shown in the stack."""
+        self._stack.currentWidget().reset_to_default()
 
     def _refresh_template_combo(self) -> None:
         from src.prompt_templates import active_template_id, all_templates
@@ -1663,15 +1709,62 @@ class SettingsDialog(QDialog):
         self._tabs.addTab(self._encryption_panel, 'Encryption')
         layout.addWidget(self._tabs)
 
+        footer_row = QHBoxLayout()
+        self._reset_all_btn = QPushButton('Reset All Settings...')
+        self._reset_all_btn.setToolTip(
+            'Restore every setting to its built-in default: API providers '
+            'and keys, LLM parameters, macros and personas, prompt '
+            'templates, Test-chat settings, and app behaviour (spell check, '
+            'logging, font size).\n'
+            'Asks for confirmation; the library itself is not touched.'
+        )
+        self._reset_all_btn.clicked.connect(self._reset_all)
+        footer_row.addWidget(self._reset_all_btn)
+        footer_row.addStretch()
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel,
         )
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        footer_row.addWidget(buttons)
+        layout.addLayout(footer_row)
 
         self._api_panel.provider_changed.connect(self._on_provider_changed)
         self._llm_panel.set_provider(active)
+
+    def _reset_all(self) -> None:
+        """Confirm, then immediately restore every setting to its default."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle('Reset All Settings')
+        box.setText('Restore every setting to its built-in default?')
+        box.setInformativeText(
+            'This immediately restores: API providers, API keys and all '
+            'LLM sampling parameters; the user name, custom macros and '
+            'personas; all AI prompt templates; user-created system and '
+            'context templates and the active selections; Test-chat '
+            'settings; and spell check, logging and the font size.\n\n'
+            'Your library (cards, chats, gallery) and encryption are not '
+            'touched. This cannot be undone.'
+        )
+        reset_btn = box.addButton(
+            'Reset Everything', QMessageBox.ButtonRole.AcceptRole,
+        )
+        cancel_btn = box.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.exec()
+        if box.clickedButton() is not reset_btn:
+            return
+        from src.settings_manager import (
+            apply_logging_enabled,
+            load_logging_enabled,
+            reset_all_settings,
+        )
+        reset_all_settings()
+        apply_logging_enabled(load_logging_enabled())
+        self._api_panel.cleanup()
+        self.settings_changed.emit()
+        self.accept()
 
     def _on_provider_changed(self, new_name: str) -> None:
         if not new_name:
