@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import traceback
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -671,6 +672,11 @@ class TestTab(QWidget):
         # failed/cancelled run can put it back untouched.
         self._regen_tried: list[str] | None = None
         self._regen_replaced: tuple[int, dict] | None = None
+        # The generation to re-run when the error row's Retry button is
+        # pressed (captured at start, consumed once by the error handler)
+        # and the inline error row widget itself.
+        self._failed_retry: Callable[[], None] | None = None
+        self._error_row: QWidget | None = None
         # Standalone lorebooks injected alongside the card's character book.
         self._active_lore_names: list[str] = load_active_lorebooks()
         self._extra_books: list[CharacterBook] = []
@@ -1913,14 +1919,53 @@ class TestTab(QWidget):
 
             QTimer.singleShot(0, _restore)
 
-    def _append_error(self, text: str) -> None:
+    def _append_error(self, text: str,
+                      retry: Callable[[], None] | None = None) -> None:
+        """Show a failed request as an inline error row (replaces any old one).
+
+        *retry* is the generation that failed, captured at start; it adds a
+        Retry button so the user can run it again without resending the last
+        message (or retyping it — the conversation is untouched by the error).
+        """
+        self._clear_error_row()
         short = text.splitlines()[0] if text else 'Unknown error'
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
         label = QLabel(
             f'<i><span style="color:#ff6666">Error: {html.escape(short)}</span></i>'
         )
         label.setWordWrap(True)
-        self._bubble_layout.insertWidget(self._bubble_layout.count() - 1, label)
+        h.addWidget(label, 1)
+        if retry is not None:
+            self._failed_retry = retry
+            btn = QPushButton('Retry')
+            btn.setToolTip('Run the failed generation again.')
+            btn.clicked.connect(self._on_retry_failed)
+            h.addWidget(btn)
+        self._error_row = row
+        self._bubble_layout.insertWidget(self._bubble_layout.count() - 1, row)
         self._maybe_scroll_to_bottom()
+
+    def _clear_error_row(self) -> None:
+        row = self._error_row
+        self._error_row = None
+        if row is None:
+            return
+        if _widget_alive(row):
+            self._bubble_layout.removeWidget(row)
+            row.setParent(None)
+        row.deleteLater()
+
+    def _on_retry_failed(self) -> None:
+        """Re-run the generation that produced the visible error row."""
+        if self._is_generating():
+            return
+        retry = self._failed_retry
+        self._failed_retry = None
+        self._clear_error_row()
+        if retry is not None:
+            retry()
 
     def _conversation_text(self, messages: list[dict] | None = None) -> str:
         msgs = self._messages if messages is None else messages
@@ -2065,6 +2110,12 @@ class TestTab(QWidget):
         self._start_generation(mode='continue')
 
     def _start_generation(self, mode: str = 'assistant') -> None:
+        # A new attempt supersedes the previous failure's error row and
+        # retry: the row is only valid until something else starts.
+        self._clear_error_row()
+        self._failed_retry = (
+            lambda mode=mode: self._start_generation(mode=mode)
+        )
         preset = self._effective_preset()
         client = AIClient(preset)
         self._generating = True
@@ -2270,9 +2321,12 @@ class TestTab(QWidget):
 
     @pyqtSlot(str)
     def _on_error(self, error: str) -> None:
+        # _finish_generation resets the response mode and the retry state,
+        # so what the failed attempt was has to be captured first.
+        retry = self._failed_retry
         self._finish_generation()
         self._render_history()
-        self._append_error(error)
+        self._append_error(error, retry=retry)
         logger.warning("Test chat error: %s", error)
 
     def _restore_interrupted_response(self) -> bool:
@@ -2295,6 +2349,9 @@ class TestTab(QWidget):
     def _finish_generation(self) -> None:
         self._generating = False
         self._response_mode = 'assistant'
+        # The retry belongs to the attempt that just ended (success, cancel
+        # or error — _on_error captures it before calling this).
+        self._failed_retry = None
         worker = self._worker
         self._worker = None
         if worker is not None and self._worker_is_alive(worker):
@@ -2503,6 +2560,13 @@ class TestTab(QWidget):
         self._remove_memories_from(index)
         self._render_history()
         self._start_generation()
+        # A failed regeneration retries the regeneration itself (not a plain
+        # send): the slot's message is back in place by then, at the same
+        # index, so this is exactly "press Regenerate again".
+        self._failed_retry = (
+            lambda index=index, keep_tries=keep_tries:
+            self._start_regen(index, keep_tries=keep_tries)
+        )
 
     def _on_variant_back(self, index: int) -> None:
         self._navigate_variant(index, -1)
