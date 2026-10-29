@@ -205,6 +205,33 @@ def set_value(key: str, value: Any) -> bool:
     return save_config(data)
 
 
+def remove_value(key: str) -> bool:
+    """Remove the dotted *key* from the config file.
+
+    Args:
+        key: A dotted key such as ``'ui.font_size'``.
+
+    Returns:
+        True when the file was rewritten, False when the key (or its
+        parent table) was already absent or the file could not be saved.
+    """
+    parts = [part.strip() for part in str(key or '').split('.') if part.strip()]
+    if not parts:
+        logger.warning('Refusing to remove an empty config key')
+        return False
+    data = load_config()
+    node = data
+    for part in parts[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            return False
+        node = child
+    if parts[-1] not in node:
+        return False
+    del node[parts[-1]]
+    return save_config(data)
+
+
 def config_overrides() -> dict[str, Any]:
     """The effective values of the known overridable settings.
 

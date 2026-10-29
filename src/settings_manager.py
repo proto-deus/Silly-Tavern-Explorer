@@ -1396,3 +1396,44 @@ def _decrypt_dpapi(hex_str: str) -> Optional[str]:
     except Exception as e:
         logger.warning("DPAPI decryption failed: %s", e)
     return None
+
+
+def reset_all_settings() -> None:
+    """Restore every Settings-dialog-managed setting to its built-in default.
+
+    The stored overrides are removed so the ``load_*`` helpers fall back to
+    their defaults: the provider connections (base URLs, models, API keys,
+    model-list caches) and all LLM sampling parameters, the user name,
+    custom macros and user personas, every AI prompt template override,
+    the user-created system and context templates together with the active
+    selections, the Test-tab settings, and the App toggles (spell check,
+    logging, font size - including the portable-config font override).
+
+    Deliberately untouched: library data (cards, chats, gallery), the
+    encryption vault, the UI theme, window layout, the SillyTavern paths,
+    the lorebook selections, and per-character card settings.
+    """
+    s = _get_settings()
+    s.remove('api')
+    s.remove('macros')
+    s.remove('ai/prompts')
+    s.remove(_PERSONAS_KEY)
+    s.remove(_ACTIVE_PERSONA_KEY)
+    s.remove(_LEGACY_PERSONA_KEY)
+    s.remove(_SYSTEM_TEMPLATES_KEY)
+    s.remove(_ACTIVE_SYSTEM_TEMPLATE_KEY)
+    s.remove(_CONTEXT_TEMPLATES_KEY)
+    s.remove(_ACTIVE_CONTEXT_TEMPLATE_KEY)
+    s.remove('test/settings')
+    s.remove('ui/spellcheck_enabled')
+    s.remove('logging/enabled')
+    s.remove('ui/font_size')
+    try:
+        from src.portable_config import remove_value
+        remove_value('ui.font_size')
+    except Exception:
+        logger.debug("Could not clear the portable font override", exc_info=True)
+    # The wiped providers no longer have unreadable keys; stale warnings
+    # would otherwise block re-saving a fresh key for them.
+    clear_undecryptable_api_key_providers()
+    logger.info('All settings were reset to their built-in defaults')
